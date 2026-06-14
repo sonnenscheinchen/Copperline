@@ -1,0 +1,63 @@
+# MyST project configuration for the Copperline documentation.
+# Build HTML with `myst build --html` and PDF with `myst build --pdf`
+# (the PDF export renders through Typst; see docs/README.md for the
+# required tools).
+version: 1
+project:
+  id: copperline-docs
+  title: Copperline
+  description: A cycle-driven Amiga emulator in Rust
+  keywords: [amiga, emulator, ocs, ecs, rust]
+  authors:
+    - name: Andrew Hutchings
+  github: https://github.com/LinuxJedi/Copperline
+  toc:
+    - file: index.md
+    - title: User guide
+      children:
+        - file: guide/getting-started.md
+        - file: guide/configuration.md
+        - file: guide/ui.md
+        - file: guide/headless.md
+    - title: Extending
+      children:
+        - file: zorro.md
+    - title: Debugging
+      children:
+        - file: debugger/window.md
+        - file: debugger/headless.md
+    - title: Internals
+      children:
+        - file: internals/architecture.md
+        - file: internals/timing.md
+        - file: internals/chipset.md
+        - file: internals/video.md
+        - file: internals/cpu.md
+        - file: internals/peripherals.md
+        - file: internals/savestate.md
+        - file: internals/reference-docs.md
+  exports:
+    - format: pdf
+      template: lapreprint-typst
+      output: _build/exports/copperline.pdf
+      articles:
+        - index.md
+        - guide/getting-started.md
+        - guide/configuration.md
+        - guide/ui.md
+        - guide/headless.md
+        - zorro.md
+        - debugger/window.md
+        - debugger/headless.md
+        - internals/architecture.md
+        - internals/timing.md
+        - internals/chipset.md
+        - internals/video.md
+        - internals/cpu.md
+        - internals/peripherals.md
+        - internals/savestate.md
+        - internals/reference-docs.md
+site:
+  template: book-theme
+  options:
+    hide_authors: true

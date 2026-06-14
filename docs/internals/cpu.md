@@ -1,0 +1,107 @@
+# CPU integration
+
+## The wrapper and the bus adapter
+
+`M68kMachine` (`src/cpu.rs`) wraps the vendored pure-Rust `m68k` core
+(`vendor/m68k/`). The core sees
+the machine through an adapter implementing its `AddressBus` trait, so
+every CPU-visible access -- RAM, ROM, custom registers, CIA, RTC,
+autoconfig, Gayle, Akiko -- routes into the shared `Bus` and is billed in
+colour clocks:
+
+- Chip and slow RAM go through chip-bus arbitration
+  (`grant_cpu_bus_access`) and genuinely wait for free slots.
+- Fast RAM, ROM, and other external-bus targets are billed at the CPU
+  clock (`cpu_external_access`), scaled by `cpu_clocks_per_cck` with
+  sub-CCK carry so accelerated clocks bill fractional costs exactly.
+- Addresses are masked to the model's bus width: 24-bit for
+  68000/68EC020, 32-bit for 68020/030/040.
+
+Selectable models: 68000, 68EC020, 68020, 68030, 68040. `[cpu] fpu`
+fits a 68881/68882 to any 020/030 (and is on by default for the 68040,
+whose FPU is on-die): the vendored core executes the 6888x instruction
+set in f64 precision -- arithmetic, transcendentals, FMOVE/FMOVEM in
+every operand format except packed decimal, FBcc/FScc/FDBcc/FTRAPcc,
+the constant ROM, control registers, and FSAVE/FRESTORE state frames
+(NULL after reset, 68881-style IDLE once touched), which is what
+Kickstart's detection and per-task FPU context switching exercise. The
+68000's per-instruction cycle counts in the vendored core have been
+corrected against the SingleStepTests corpus to ~1% aggregate accuracy
+(see `vendor/m68k/CYCLE_TIMING_GAP.md`), which is what makes
+cycle-budgeted pacing trustworthy.
+
+## Prefetch
+
+The 68000's two-word instruction prefetch queue (IRD/IRC) is modelled in
+the vendored core (`prefetch_queue` in `vendor/m68k/src/core/cpu.rs`): the
+next opcode is fetched before the current instruction finishes, so
+self-modifying code that overwrites the *next* instruction executes the
+stale pre-write word (real MC68000 Class 1 SMC behaviour), while a taken
+branch flushes and refills the stream from the target. The queue lives in
+the backend core rather than a Copperline-side bus cache, because correct
+flushing depends on the CPU's own control flow, exceptions, and
+interrupts. It is gated to the 68000 (`prefetch_enabled`); 68010+ fetch
+directly at PC through the bus adapter. Chip-RAM probes pin both cases:
+`cpu_prefetch_probe_documents_self_modified_next_opcode_behavior` (stale
+fall-through) and
+`cpu_prefetch_probe_branch_refetches_self_modified_chip_ram_target`
+(branch refetch).
+
+## Caches
+
+By default no cache is modelled on any CPU: CACR/CAAR are stored, and the
+cache-control instructions are privileged no-ops, so self-modifying code
+always executes fresh bytes (the safe direction). The opt-in `[cpu]
+icache`/`dcache` models (020/030) exist for accelerator-style
+configurations; the data cache only covers expansion RAM/ROM because chip
+and slow RAM are DMA-visible and cache-inhibited, as on real machines.
+
+## 68020+ timing
+
+The 68000/68010 cycle counts are validated against the
+[SingleStepTests](https://github.com/SingleStepTests) (TomHarte) corpus,
+but **no equivalent vectors exist for the 68020, 68030, or 68040** -- the
+project publishes cycle-accurate vectors for the 68000 only. That is not
+an oversight: the 020+ parts have an instruction cache, a three-stage
+pipeline, and dynamic bus sizing, so there is no single cycle-exact count
+per instruction and therefore no widely-trusted reference to generate
+vectors from.
+
+Copperline handles this by approximation rather than precision.
+`scale_cycles_for_cpu_type` (`vendor/m68k/src/core/cpu.rs`) derives 020+
+timing from the corrected 68000 counts: the pipeline and cache make most
+instructions cost roughly half their 68000 cycles, with a two-cycle
+floor, and memory-bound work is dominated by the host bus model anyway.
+The scaling is calibrated against a cycle-exact A1200 reference (FS-UAE)
+using the `timing-test/` ADF. This is good enough because Copperline
+paces to wall-clock time and models the CPU:chipset clock ratio and
+chip-bus arbitration exactly; per-instruction 020 cycles matter far less
+than those for Amiga software, which is overwhelmingly 68000. The
+68000/68010 paths are left untouched so the TomHarte-validated timing is
+never disturbed. If 020+ accuracy ever becomes a real requirement, the
+Motorola 68020/030 user-manual timing tables or differential testing
+against Moira/Musashi are the realistic sources.
+
+On the A1200 the 020 chip-bus timing is calibrated against a cycle-exact
+FS-UAE A1200 (the 5/8 scaling above, a 32-bit Alice chip-bus data path, and
+a two-entry longword fetch latch). Three residuals remain: writes are
+posted as a full bus slot (no write-buffer overlap), per-frame throughput
+runs ~0.6 of the reference, and the cycle model does not reflect
+instruction-cache hit/miss timing -- so software that depends on CACR
+cache-on/off *timing* will diverge. MMU-dependent 030/040 accelerator
+setups are a non-goal.
+
+## Interrupts and STOP
+
+Paula's INTENA/INTREQ levels are delivered as M68K autovectors through the
+modelled recognition latency described in [](timing). When the CPU
+executes `STOP`, the frame loop fast-forwards device time to the next
+event that can raise an interrupt instead of spinning -- behaviour the
+debugger's Step control inherits.
+
+## Exceptions
+
+If the guest triggers something unimplemented (an exotic custom-register
+edge case, say), the CPU may halt with an `EXCEPTION`. This is non-fatal:
+the window stays alive showing the last framebuffer, and the debugger can
+inspect the halted state.

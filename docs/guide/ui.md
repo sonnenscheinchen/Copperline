@@ -1,0 +1,207 @@
+# The window, status bar, and menus
+
+Copperline opens a single window: the emulated display presented at a
+TV-like 4:3 aspect ratio, above a status bar with the machine's controls.
+The window scales continuously when resized.
+
+## Keyboard shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `Cmd+Q` | Quit |
+| `Cmd+S` | Save a screenshot (`copperline-screenshot-<unix-ts>.png` in the working directory; the on-screen confirmation overlay is not part of the saved image) |
+| `Cmd+R` | Start / stop a video-with-audio recording (below) |
+| `Cmd+Shift+R` | Start / stop an input recording (below) |
+| `Cmd+Shift+S` | Save a state (`copperline-state-<unix-ts>.clstate` in the working directory) |
+| `Cmd+Shift+L` | Load a save state from a file dialog |
+| `Cmd+D` | Swap to the next disk in a drive's configured playlist |
+| `Cmd+G` | Capture / release the host mouse (clicking the display also captures) |
+| `Cmd+B` | Open the [debugger window](../debugger/window) |
+| `Esc` | Close an open menu or overlay window; otherwise passed through to the Amiga |
+| `Ctrl+Amiga+Amiga` | Keyboard reset (warm reboot) |
+
+On Linux/Windows the Super/Windows key plays the role of `Cmd`. Host
+modifiers map onto the Amiga keyboard: Alt becomes Amiga Alt, Cmd/Super
+becomes the left/right Amiga keys, and Ctrl becomes Amiga Ctrl, so
+`Ctrl+Amiga+Amiga` is typed naturally.
+
+All other keys are sent to the emulated machine through the real path: a
+bit-timed keyboard-MCU model clocks each transition into CIA-A's serial
+register over the emulated KCLK/KDAT lines, with the real handshake,
+power-up stream, and recovery protocol -- so even software that talks to
+the keyboard hardware directly behaves. `Ctrl+Amiga+Amiga` runs the
+authentic reset protocol (reset warning, then KCLK held low), so the
+reboot lands a fraction of a second after the chord, as on real hardware.
+
+## Status bar
+
+The status bar (44 pixels below the display) holds, left to right:
+
+- **LED block.** PWR and FDD always; a green HDD activity LED on Gayle IDE
+  machines (A600/A1200); a blue CD activity LED on CDTV/CD32 that lights
+  while the drive reads data or plays CD audio. A small digital counter
+  shows the current floppy track.
+- **Per-drive floppy controls.** Every connected drive gets a disk button
+  (marked with the drive number) that opens a file dialog -- multi-select
+  several images to queue a swap playlist for that drive -- plus a swap
+  button that cycles to the next queued disk and an eject button. Swap and
+  eject grey out when there is nothing to swap to or eject. With three or
+  four drives the clusters stack two-up.
+- **CD controls** on CDTV/CD32 machines: a CD button that loads (or swaps)
+  a cue sheet with the proper media-change notification, and a CD eject
+  button. These do not appear on machines without a CD drive.
+- **Camera button**: saves a screenshot (same as `Cmd+S`).
+- **Hamburger menu button**: opens the pop-up menu (below).
+- **Volume slider**: drag, or scroll the mouse wheel over it for 5% steps.
+- **Pause / power / reboot buttons.** Pause freezes emulation while staying
+  powered; power cold-boots (clears RAM) or powers off back to the test
+  screen; reboot is a warm reset.
+
+## Menu and overlay windows
+
+```{figure} ../images/ui-preview-menu.png
+:alt: The pop-up menu
+:width: 75%
+
+The pop-up menu opened from the status bar.
+```
+
+The menu opens overlay windows drawn over the display. While one is open,
+key presses and display clicks stay in the window instead of reaching the
+Amiga; `Esc` closes it.
+
+- **Debugger** (also `Cmd+B`): pauses the machine and opens the five-tab
+  debugger; see [](../debugger/window).
+- **Calibrate Gamepad...**: the guided calibration flow, described below.
+- **Warp Speed**: runs the emulator unpaced, as fast as the host allows.
+  Toggling back re-anchors real-time pacing cleanly.
+- **Record Video** (also `Cmd+R`): starts a video-with-audio recording;
+  the same item (or `Cmd+R` again) stops it. See below.
+- **Record Input** (also `Cmd+Shift+R`): records every input event that
+  reaches the emulated machine; stopping writes a script file that
+  `--script` replays deterministically. See below.
+- **Save State** (also `Cmd+Shift+S`) and **Load State...** (also
+  `Cmd+Shift+L`): snapshot the whole emulated machine to a file, or
+  restore one and continue from exactly that point. See below.
+- **Keyboard Shortcuts**: the shortcut reference.
+- **About**: app version plus a summary of the emulated machine.
+
+```{figure} ../images/ui-preview-shortcuts.png
+:alt: The keyboard shortcuts window
+:width: 75%
+
+The Keyboard Shortcuts window.
+```
+
+## Recording video
+
+`Cmd+R` (or the menu's "Record Video") starts capturing the emulated
+display and sound to `copperline-video-<unix-ts>.avi` in the working
+directory; pressing it again stops and finalizes the file. A red REC
+badge sits in the display's top-right corner while a recording runs --
+like the screenshot overlay, the badge, status bar, and menus are never
+part of the captured video.
+
+The file is an AVI with lossless ZMBV video (the DOSBox capture codec:
+zlib-compressed keyframes plus frame deltas, which keeps typical Amiga
+output to a few MB per minute) and uncompressed 16-bit stereo PCM audio
+at 44.1 kHz. It plays directly in VLC, mpv, and anything else built on
+ffmpeg; for other players, transcode with
+`ffmpeg -i copperline-video-<ts>.avi out.mp4`.
+
+Frames and audio are captured on the emulated timeline, not the host
+clock: the recording stays in sync even when the host stutters, and a
+capture made under Warp Speed plays back at normal speed. The audio
+track is tapped before the status bar's volume slider, so recordings
+keep full level regardless of the live output volume. Pausing (or
+powering off) suspends the capture; recording resumes when emulation
+continues.
+
+## Recording input
+
+`Cmd+Shift+R` (or the menu's "Record Input") starts logging every input
+event that reaches the emulated machine -- key presses with their hold
+times, mouse buttons and motion, port-2 joystick / CD32-pad controls,
+and floppy inserts -- each stamped with its emulated time. Pressing it
+again stops the recording and writes
+`copperline-input-<unix-ts>.clscript` in the working directory: a plain
+text file of scripted-input directives that
+`copperline --script FILE` replays exactly, because the core is
+deterministic and the events re-fire at the same emulated timestamps.
+
+This is the direct way to turn "I can reproduce it by hand" into a
+regression: play the sequence once while recording, then keep the script
+(optionally together with a [save state](#save-states) to skip the
+lead-in) as a deterministic, shareable reproduction. The format and the
+headless `--record-input` variant are described in
+[](headless.md#input-recording-and-script-files).
+
+(save-states)=
+## Save states
+
+`Cmd+Shift+S` (or the menu's "Save State") writes a snapshot of the whole
+emulated machine to `copperline-state-<unix-ts>.clstate` in the working
+directory: CPU, chip/slow/fast RAM, ROM, the full chipset and CIA state,
+floppy images (including unsaved in-memory changes), expansion boards,
+and CD/NVRAM state. `Cmd+Shift+L` (or "Load State...") restores one; the
+machine continues from exactly the saved point, byte-for-byte -- the core
+is deterministic, so a resumed run is indistinguishable from one that was
+never interrupted.
+
+States are taken at emulated-frame boundaries and are versioned: a file
+from an older, incompatible build is refused with a clear message rather
+than producing a corrupt machine. Two caveats:
+
+- Hard-drive images (HDF files) are referenced by path, not embedded.
+  The state reopens the same file on load, so guest writes made to the
+  hard drive *after* the snapshot are still visible after restoring --
+  treat a state as a CPU/chipset snapshot, not a disk backup. In-memory
+  volumes (directory-as-HDD) and floppy images are embedded whole.
+- CD images are likewise reopened by path; keep the cue/bin where it was.
+
+The headless flags `--save-state-after SECS PATH` and `--load-state PATH`
+script the same feature for [debugging workflows](headless.md): snapshot a
+long-running program just before the scene under investigation once, then
+iterate from the state in seconds instead of re-emulating minutes. The
+file format and what exactly is (and is not) captured are specified in
+[the internals chapter](../internals/savestate.md).
+
+## Mouse and joystick
+
+The mouse lives on port 1 and feeds the JOY0DAT counters. Click the display
+(or press `Cmd+G`) to capture the host mouse; `Cmd+G` releases it. While an
+overlay window is open, host cursor motion is not fed to the emulated
+mouse.
+
+A USB gamepad drives the emulated port-2 digital joystick: directions
+through JOY1DAT, fire through /FIR1, and a second button through
+POT1Y/POTGOR. On a CD32 machine the pad speaks the CD32 serial button
+protocol instead, including the red/blue/green/yellow and transport
+buttons. Mouse and gamepad coexist because they use different ports.
+
+## Gamepad calibration
+
+Pads are read through raw `gilrs` events with no controller database, so
+each controller is calibrated once: push each control when prompted. This
+records raw axis/button codes and directions, which makes any pad work
+regardless of database coverage and handles inverted or odd axis layouts
+automatically.
+
+```{figure} ../images/ui-preview-calibration.png
+:alt: The gamepad calibration window
+:width: 75%
+
+The calibration window mid-flow. Skip covers pads without the CD32 extras.
+```
+
+Run it either from the menu ("Calibrate Gamepad...") -- which ends with a
+live test of the finished bindings and a Save button that makes them live
+immediately -- or from the terminal with `copperline --calibrate-gamepad`.
+The steps are the four directions, fire (CD32 red), button 2 (CD32 blue),
+and the optional CD32 green/yellow/play/rewind/forward buttons; every step
+waits for the pad to return to neutral before sampling, so a held control
+cannot bleed into the next binding.
+
+Calibrations are saved per controller UUID in
+`~/.config/copperline/gamepads.toml` (`$XDG_CONFIG_HOME` respected;
+`%APPDATA%\copperline\` on Windows).

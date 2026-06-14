@@ -1,0 +1,41 @@
+/target
+
+# Local AI-assistant instruction files: kept locally, not part of the repo.
+/AGENTS.md
+/CLAUDE.md
+
+# Local test assets: ROMs and disk/hard-disk images are never committed
+# (see tests/README.md). Patterns are case-insensitive because dumps arrive
+# as .adf/.ADF, .dms/.DMS, etc.
+*.[Rr][Oo][Mm]
+*.[Aa][Dd][Ff]
+*.[Aa][Dd][Zz]
+*.[Dd][Mm][Ss]
+*.[Hh][Dd][Ff]
+*.[Ss][Cc][Pp]
+# Split EPROM dumps (e.g. the A2091 SCSI boot ROM: foo.U12 / foo.U13).
+*.[Uu][0-9]
+*.[Uu][0-9][0-9]
+# Local asset directory for the ignored integration tests.
+/test-assets/
+
+# Vendored m68k crate: ignore build output and the large SingleStepTests /
+# Musashi fixture submodules (fetched separately, never committed).
+/vendor/m68k/target
+/vendor/m68k/Cargo.lock
+/vendor/m68k/tests/fixtures/m68000
+/vendor/m68k/tests/fixtures/Musashi
+# CD images (cue/bin) are local assets, never committed.
+*.[Cc][Uu][Ee]
+*.[Bb][Ii][Nn]
+*.[Ii][Ss][Oo]
+
+# Local run artifacts (screenshots, recordings, save states, input scripts).
+copperline-screenshot-*.png
+copperline-video-*.avi
+*.clstate
+*.clscript
+.DS_Store
+
+# MyST documentation build output (see docs/README.md).
+/docs/_build

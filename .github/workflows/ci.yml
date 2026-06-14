@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: Build, test, lint
+    # Copperline is developed and tested on macOS; the Linux and Windows
+    # paths are not yet verified, so CI runs on macOS to match. The runner's
+    # Metal stack also makes the headless render path (the smoke job below)
+    # reliable. Linux/Windows jobs can be added once those paths are verified.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        # Not --all: that would reach into the vendored MIT m68k crate, which
+        # keeps its own formatting.
+        run: cargo fmt --check
+      - name: Clippy
+        # Hold the binary, tests, examples, and diagnostic feature gates to
+        # the same warning-clean standard used for release checks.
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Build (release)
+        run: cargo build --release --locked
+      - name: Unit tests
+        # The integration tests under tests/ are #[ignore]d and need local
+        # ROM/disk assets, so they are intentionally not run here; this is
+        # the asset-free unit suite, which also proves a clean checkout
+        # builds and tests without the gitignored vendor fixtures.
+        run: cargo test --release --locked
+
+  docs:
+    name: Docs build (HTML + PDF)
+    # Independent of the Rust build: catches MyST/cross-reference breakage
+    # (e.g. duplicate labels that only collide in the single-document PDF).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install MyST CLI
+        run: npm install -g mystmd
+      - name: Install Typst (PDF renderer)
+        # MyST shells out to Typst for PDF export; brew matches docs/README.md.
+        run: brew install typst
+      - name: Build HTML
+        working-directory: docs
+        run: myst build --html --ci --strict --check-links
+      - name: Build PDF
+        working-directory: docs
+        # The PDF export merges every chapter into one document, so it is the
+        # build that surfaces duplicate-label and cross-reference errors.
+        # Assert the artifact exists and is non-empty so the job fails even if
+        # the CLI ever returns success on a partial render.
+        run: |
+          myst build --pdf --ci --strict
+          test -s _build/exports/copperline.pdf
+      - name: Upload PDF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: copperline-docs-pdf
+          path: docs/_build/exports/copperline.pdf
+          if-no-files-found: ignore
+
+  diagrom-smoke:
+    name: DiagROM boot smoke
+    needs: build-test
+    runs-on: macos-latest
+    # Opt-in. DiagROM is freely redistributable but not committed, so CI
+    # fetches it at run time. Set the DIAGROM_URL repository variable to a
+    # direct URL for the DiagROM ROM image to enable this job; until then it
+    # is skipped.
+    if: ${{ vars.DIAGROM_URL != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo build --release --locked
+      - name: Fetch DiagROM
+        run: curl -fsSL "${{ vars.DIAGROM_URL }}" -o diagrom.rom
+      - name: Boot smoke (headless screenshot)
+        # No config and no positional ROM: the built-in defaults point at
+        # ./diagrom.rom, so this boots DiagROM, renders a frame after 6
+        # emulated seconds, and exits. A non-empty PNG means it booted
+        # without halting.
+        run: |
+          ./target/release/copperline --noaudio --screenshot-after 6 diag.png
+          test -s diag.png
+      - name: Upload boot screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagrom-boot
+          path: diag.png
+          if-no-files-found: ignore

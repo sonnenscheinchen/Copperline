@@ -1,0 +1,92 @@
+# Vendored m68k core
+
+Vendored from https://github.com/benletchford/m68k-rs
+Commit: 50d1f63 (published as crates.io `m68k` 0.1.5), MIT licensed.
+Fetched: 2026-05-31.
+
+Copperline depends on this via a path dependency (`m68k = { path = "vendor/m68k" }`)
+so we can give it accurate MC68000 cycle timing + a prefetch queue. See
+`CYCLE_TIMING_GAP.md` for the measured baseline gap and the fix plan.
+
+## Local changes vs upstream 50d1f63
+
+- `tests/singlestep_m68000_v1_tests.rs`: capture the fixtures' cycle `length`
+  and bus `transactions` (upstream parsed but discarded them) and add
+  `cycle_gap_report` (an `#[ignore]`d measurement of the cycle / bus-access gap).
+- `src/core/instructions/shift_rotate.rs`: long register shift/rotate base is 8
+  (was 6), gated to the 68000.
+- Part D (cycle counts): per-instruction-class cycle-total fixes across
+  `decode.rs` / `instructions/*.rs`, gated to the 68000 (48.3% -> 0.9%
+  mismatch, totals ratio 0.999).
+- Part E (cycle-exact core, all gated to `CpuType::M68000`):
+  - `tests/singlestep_m68000_v1_tests.rs`: full per-transaction parsing
+    (FixtureAccess: direction/address/data/strobes/cycle offset), a
+    RecordingBus test double, and two more `#[ignore]`d reports:
+    `access_sequence_gap_report` (prefetch-model scoreboard) and
+    `access_timing_gap_report` (sync-timing scoreboard).
+  - `src/core/cpu.rs`: real 2-word prefetch queue (IRC/IRD) with
+    consume/top-up/invalidate operations; 68000 bus-order helpers
+    (read_long_predec_68000, write_long_mm_interleaved_68000);
+    `internal_cycles()`/`flush_sync()` intra-instruction clock reporting.
+  - `src/core/memory.rs`: `AddressBus::sync(cpu_clocks)` default no-op trait
+    method -- hosts receive internal (non-bus) clocks immediately before
+    each bus access (Moira-style).
+  - `src/core/ea.rs`, `execute.rs`, `decode.rs`, `exceptions.rs`,
+    `instructions/*.rs`: prefetch-queue fetch paths, flow-change refills,
+    microcode bus-order quirks (exception stacking order, RMW write order,
+    MOVEM extra read, CLR/Scc read-before-write, ...), and per-class
+    internal-cycle placement.
+  - Final numbers: access sequences 99.9% fixture-exact, per-access timing
+    99.6% exact, cycle totals 0.999. See CYCLE_TIMING_GAP.md "Part E".
+
+## Upstream review (post-0.1.5, reviewed 2026-06-09)
+
+Reviewed upstream `benletchford/m68k-rs` through `9f5dab4` (8 commits past the
+`50d1f63` fork point). Findings:
+
+- The substantive upstream work is a **trace JIT** (`src/core/trace_jit.rs`)
+  and an **opcode cache** (`src/core/op_cache.rs`) plus the supporting
+  execute/decode/cpu refactor (a *conditional* rollback snapshot gated by
+  `needs_rollback_snapshot`, `DecodedSimpleOp` fast paths, trace recording).
+  This is a pure throughput optimization and is **deliberately not merged**: it
+  reorders and elides the per-instruction fetch/prefetch/internal-cycle work
+  that the local Part D/E changes rely on for cycle-exact MC68000 timing, which
+  is the entire reason for this fork. Merging it would regress the 99.6-99.9%
+  fixture-exact timing for a speed-up Copperline does not need (the host already
+  paces to wall-clock time).
+- The remaining upstream diffs are Clippy/formatting cleanups, `Cargo.toml`/
+  `Cargo.lock` version bumps, and microbenchmarks -- no instruction-semantics
+  or cycle-timing bug fixes to port.
+- One genuinely useful item was taken: the post-fork regression test
+  `test_odd_pc_fetch_after_register_only_instruction_does_not_restore_stale_snapshot`
+  (guards the conditional-rollback optimization against leaking stale register
+  state on a faulting opcode fetch). It is ported into
+  `tests/unaligned_fetch_tests.rs`; the vendored cycle-exact core passes it,
+  confirming the always-snapshot path here is already correct.
+
+## Fixtures (not committed -- large)
+
+The SingleStepTests `m68000` set (~182M) is gitignored. To run the harness /
+gap report, fetch it once:
+
+```sh
+git clone --depth 1 https://github.com/SingleStepTests/m68000 /tmp/sst-m68000
+mkdir -p vendor/m68k/tests/fixtures/m68000
+cp -R /tmp/sst-m68000/v1 vendor/m68k/tests/fixtures/m68000/
+```
+
+Then, from `vendor/m68k`:
+
+```sh
+# functional (final-state) suite
+cargo test --release --test singlestep_m68000_v1_tests
+# cycle / bus-access gap report
+cargo test --release --test singlestep_m68000_v1_tests cycle_gap_report -- --ignored --nocapture
+# access-sequence gap report (prefetch-model scoreboard)
+cargo test --release --test singlestep_m68000_v1_tests access_sequence_gap_report -- --ignored --nocapture
+# per-access timing gap report (sync-timing scoreboard)
+cargo test --release --test singlestep_m68000_v1_tests access_timing_gap_report -- --ignored --nocapture
+```
+
+Set `M68K_GAP_FILE=<file>.json.bin` with the sequence report to dump the first
+few mismatching cases of that file with both access streams side by side.

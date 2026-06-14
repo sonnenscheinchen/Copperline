@@ -1,0 +1,184 @@
+# Copperline configuration. Copy this to `copperline.toml` (next to the
+# executable, or in the working directory) or pass it explicitly with
+# `--config path/to/file.toml`. Any field can be omitted; missing
+# fields fall back to the defaults shown here.
+
+# ROM image to load. Must be exactly 512 KiB.
+rom = "diagrom.rom"
+
+[emulation]
+# Execution pacing. "real" is the only timing model: the CPU, chipset,
+# CIA, audio, floppy, and chip-bus timing all advance on one deterministic
+# clock that approximates a stock PAL Amiga 68000. ("turbo" is accepted as
+# a deprecated alias for "real".) Use --noaudio for silent runs, or
+# --audio-wav for emulated-time WAV capture.
+speed = "real"
+# Whether the machine is powered on at launch. When false, the emulator
+# sits powered off showing a test screen until you click the power button
+# on the status bar -- useful for arming video capture first. The power
+# button cold-boots the machine (clears RAM); powering off returns it to
+# that cold test-screen state.
+power_on = true
+# Real-mode pacing budget. "cycles" (default) clocks the CPU by each
+# instruction's actual m68k cycle cost plus chip-bus waits, matching real
+# 68000 speed (the core's 68000 cycle counts are now accurate).
+# "instructions" uses a flat COPPERLINE_REAL_CPU_CPI (default 4.0)
+# cycles/instruction quota per frame -- cheaper but runs the CPU faster
+# than hardware. The COPPERLINE_REAL_PACING_BUDGET env var overrides this for
+# one run.
+pacing_budget = "cycles"
+
+[cpu]
+# CPU type. One of: 68000, 68EC020, 68020, 68030, 68040.
+# 68EC020 uses the 68020 instruction set with a 24-bit external address bus.
+model = "68000"
+# FPU (68881/68882 coprocessor; on-die on the full 68040). Needs a
+# 68020 or later -- a 68000 cannot drive one. The 68040 enables it by
+# default; on other 020+ CPUs opt in here.
+# fpu = true
+# CPU clock in MHz. Defaults to the model's stock speed (68000 ~7.09,
+# 020 ~14, 030/040 ~25). The chipset and pacing model the CPU as a whole
+# multiple of the colour clock, so the effective clock is rounded to the
+# nearest multiple. Fast RAM runs at the CPU clock; chip and slow/trapdoor
+# RAM stay chip-bus bound.
+# clock_mhz = 14.0
+# Model the on-chip caches (CACR-controlled, cleared through MOVEC like
+# real silicon). Off by default: the calibrated 020 timing assumes no
+# cache model, so enabling them makes chip-RAM-resident code faster.
+# icache needs a 68020/68EC020/68030; dcache needs a 68030 (and only
+# caches expansion RAM/ROM -- chip and slow RAM are cache-inhibited
+# because DMA writes them, as on real Amigas).
+# icache = true
+# dcache = true
+
+# Optional machine profile: a validated bundle of chipset revisions, CPU,
+# memory sizes, RTC presence, and gate array. Explicit [cpu]/[chipset]/
+# [memory] sections still override the profile defaults. Without this
+# section the legacy A500-like defaults apply.
+# [machine]
+# model = "A600"        # A500 | A500Plus | A600 | A1200 | CDTV | CD32
+# rtc = true            # $DC0000 RTC fitted (base A600 shipped without)
+
+# Extended ROM image for CDTV/CD32 machines: a 256 KiB image maps at
+# $F00000 (CDTV), a 512 KiB image at $E00000 (CD32). The CDTV profile
+# boots its startup screen with this plus a Kickstart 1.3 rom; the CD32
+# boot path additionally needs the CD32 Kickstart 3.1 (rev 40.60) as the
+# main rom.
+# extended_rom = "cdtv-extended.rom"
+
+# CD image (BIN/CUE, single- or multi-file; MODE1/2048, MODE1/2352,
+# and AUDIO tracks), mounted on the machine's CD controller (CD32
+# Akiko or CDTV DMAC). insert_delay inserts the disc that many
+# emulated seconds after power-on instead of at boot: some CDTV discs
+# (e.g. Xenon II) only boot when inserted after the boot screen, on
+# real hardware too.
+# [cd]
+# image = "game.cue"
+# insert_delay = 20.0
+# CD32 NVRAM (save game EEPROM) backing file; defaults to
+# "cd32-nvram.bin" on CD32 machines.
+# nvram = "cd32-nvram.bin"
+
+[memory]
+# Chip RAM. Accepts a number with optional unit (K, KB, M, MB).
+# Must be a multiple of 4 KiB.
+#   OCS: max 512K
+#   ECS: max 2M
+#   AGA: max 2M
+chip = "512K"
+
+# Fast RAM mapped at $00200000 and exposed as a Zorro II autoconfig
+# memory board so Kickstart adds it to Exec's free memory list.
+# Must be 0 or a Zorro II board size: 64K, 128K, 256K, 512K, 1M,
+# 2M, 4M, or 8M.
+# Set to 0 to disable.
+fast = "0"
+
+# A500 trapdoor/fake-fast RAM mapped at $00C00000. Some OCS demos probe
+# this address directly instead of using Zorro II autoconfig memory.
+# Set to 0 to disable.
+slow = "0"
+
+# Zorro III autoconfig RAM. Kickstart assigns the base address (usually
+# $40000000). Needs a CPU with a 32-bit address bus (68020/68030/68040;
+# not the 24-bit 68000/68EC020). Must be 0 or a power of two from 64K
+# to 1G.
+# z3 = "16M"
+
+# Additional Zorro boards described by TOML metadata files, configured
+# in file order after the built-in [memory] fast/z3 boards. The metadata
+# file carries the autoconfig identity (see src/zorro.rs for the schema):
+#   name = "MegaRAM"
+#   zorro = 3            # 2 or 3
+#   type = "ram"         # board backing; only "ram" so far
+#   size = "64M"
+#   manufacturer = 0x07DB
+#   product = 0x20
+# [[zorro]]
+# metadata = "boards/megaram.toml"
+
+# A2091 SCSI controller: a Zorro II board with up to seven drives, on any
+# machine model. Preferred over [ide] for multiple disks: the board's own
+# boot ROM carries scsi.device and autoboots on Kickstart 1.3+, so it does
+# not depend on the Kickstart IDE driver (which only probes the master on
+# stock 3.1). Needs an A590/A2091 boot ROM image (6.6+, 16K/32K; rom_odd
+# takes the odd half of split even/odd EPROM dumps). Drive paths accept
+# the same images as [ide]: RDB HDFs, bare partition hardfiles, or host
+# directories.
+# [scsi]
+# rom = "a2091-v6.6.rom"
+# unit0 = "workbench.hdf"
+# unit1 = "data.hdf"
+
+[chipset]
+# Display chipset revision preset. One of: OCS, ECS, AGA -- all three
+# are implemented (remaining edge-case gaps are noted in
+# docs/internals/chipset.md). The preset picks matching chips:
+# OCS = OCS Agnus + OCS Denise, ECS = ECS Agnus (8372A, or 8375 with
+# >1M chip RAM) + ECS Denise 8373, AGA = Alice + Lisa.
+revision = "OCS"
+# Optional per-chip overrides on top of the preset, for mixed machines
+# that really shipped (e.g. a late A500: ECS Agnus + OCS Denise).
+#   agnus  = "OCS" | "8370" | "8371" | "8372" | "8372A" | "8375"
+#   denise = "OCS" | "8362" | "ECS" | "8373"
+# agnus = "8372A"
+# denise = "OCS"
+# Video timing standard. One of: PAL, NTSC.
+video = "PAL"
+
+# Gayle IDE hard-disk images (A600/A1200 machine profiles only). Raw flat
+# HDF images opened read/write; both full images with their own RDB and
+# bare partition hardfiles (boot block "DOS\x..", size a multiple of
+# 256 KiB) work - the latter get a synthesized RDB on the fly. A path may
+# also name a host directory, mounted as an in-memory FFS volume (guest
+# writes are not synced back to the host).
+# [ide]
+# master = "workbench.hdf"
+# slave = "data.hdf"
+
+# Presentation options. overscan: "tv" (default; mask deep overscan like
+# a CRT bezel) or "full". phosphor: CRT persistence fraction (0.0-0.95,
+# default 0.0): fuses field-rate flicker/dither like a real tube at the
+# cost of a slight motion trail.
+# [display]
+# overscan = "tv"
+# phosphor = 0.4
+
+[audio]
+# Synthesized floppy-drive sound effects: motor hum with spin-up/down,
+# head-step clicks for seeks (including the classic empty-drive click),
+# and a faint hiss while disk DMA is transferring. Generated from
+# scratch, not sampled. Mixed into the normal audio output, so they
+# need live audio (or --audio-wav) to be heard.
+floppy_sounds = true
+# Drive sound level, 0-100, relative to Paula's output.
+floppy_sounds_volume = 100
+
+# Optional floppy drives. Missing [floppy.dfN] tables mean no disk in
+# that drive. Standard 901120-byte DD ADF images and DMS archives are
+# supported. DMS archives are decoded to ADF data at load time and are
+# always treated as write-protected.
+#
+# [floppy.df0]
+# path = "Workbench.adf"
+# write_protected = true

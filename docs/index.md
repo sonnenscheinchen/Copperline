@@ -1,0 +1,59 @@
+---
+abstract: |
+  Copperline is a cycle-driven Commodore Amiga emulator (OCS, ECS, and
+  AGA) written in Rust. This document covers using the emulator,
+  configuring machines from the A500 to the CD32, describing Zorro
+  expansion boards, the interactive and headless debuggers, and the
+  internal architecture: the per-colour-clock chip-bus timing model, the
+  chipset modules, and the beam-event-replay video pipeline.
+---
+
+# Copperline
+
+Copperline is a cycle-driven Commodore Amiga emulator (OCS, ECS, and AGA)
+written in Rust. It models the hardware -- the 68000-family CPU, Agnus,
+Denise, Paula, the CIAs, the floppy subsystem, and the chip bus that ties
+them together -- rather than patching around individual software titles. The
+chip bus is arbitrated per colour clock, the Copper and blitter are scheduled
+per DMA slot with the hardware bus sequences, and 68000
+interrupt-recognition latency is modelled. That timing discipline is what
+lets it run the current cycle-sensitive OCS and AGA regression set, as well
+as Kickstart, Workbench, games, and CDTV/CD32 titles.
+
+```{figure} images/state-of-the-art.png
+:alt: Spaceballs' State of the Art running in Copperline
+:width: 85%
+
+Spaceballs' *State of the Art* (1992), a cycle-exact OCS stress test,
+running in Copperline.
+```
+
+## Where to start
+
+- [](guide/getting-started) -- build the emulator and boot your first
+  machine.
+- [](guide/configuration) -- the `copperline.toml` reference: machine
+  profiles (A500 through CD32), CPU, memory, chipset, floppy, IDE, and CD
+  options.
+- [](guide/ui) -- the window, status bar, keyboard shortcuts, menus, and
+  gamepad calibration.
+- [](guide/headless) -- scripted, deterministic runs: screenshots, frame
+  dumps, scripted input, and WAV capture.
+- [](zorro) -- describing additional Zorro II/III expansion boards in
+  TOML metadata files.
+- [](debugger/window) and [](debugger/headless) -- the interactive
+  debugger window and the environment-driven headless debugger.
+- [](internals/architecture) -- how the emulator works inside, for
+  contributors.
+
+## Design principles
+
+Two rules shape every change in Copperline:
+
+1. **Hardware first.** There are no branches keyed to game, demo, ROM, or
+   file names. Compatibility problems are fixed by modelling the underlying
+   chip behaviour; software titles appear only as regression examples.
+2. **Determinism.** The emulated core is deterministic and independent of
+   the host: a headless unthrottled run and a real-time windowed run produce
+   the same emulated result when given the same inputs and media. Headless
+   captures are reproducible by construction.

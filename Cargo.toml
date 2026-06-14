@@ -1,0 +1,59 @@
+[package]
+name = "copperline"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "GPL-3.0-or-later"
+description = "A cycle-driven Amiga emulator written in Rust"
+readme = "README.md"
+repository = "https://github.com/LinuxJedi/Copperline"
+keywords = ["amiga", "emulator", "m68k"]
+categories = ["emulators"]
+publish = false
+
+[features]
+display-plan-trace = []
+# Local investigation switches that deliberately alter timing or rendering.
+# Normal builds keep these environment-variable overrides inert so release
+# behavior is hardware-derived and reproducible.
+internal-diagnostics = []
+
+[dependencies]
+m68k = { version = "=0.1.5", path = "vendor/m68k" }
+pixels = "0.17"
+winit = "0.30"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5"
+bincode = "1"
+toml = "0.8"
+png = "0.17"
+flate2 = "1"
+cpal = "0.15"
+ringbuf = "0.4"
+hound = "3.5"
+rfd = "0.17.2"
+gilrs = "0.11"
+
+# macOS dock icon: winit's with_window_icon is a no-op on macOS, so the dock
+# icon must be set at runtime via NSApplication. These objc2 versions match the
+# ones rfd already pulls in, so they add no new crate copies to the build.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSData"] }
+
+[lints.clippy]
+# Chipset pipeline functions take per-signal argument lists that mirror the
+# hardware; bundling them into structs would obscure the data flow.
+too_many_arguments = "allow"
+# Indexed loops over fixed-size register banks (bitplanes, sprites, audio
+# channels) keep the channel number visible and often index several parallel
+# arrays; iterator rewrites obscure that.
+needless_range_loop = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

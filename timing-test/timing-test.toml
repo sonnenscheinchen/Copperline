@@ -1,0 +1,22 @@
+# Copperline config for the cross-emulator timing test ADF.
+# OCS PAL, 512K chip + 512K slow (trapdoor) RAM.
+rom = "../kickstart205.rom"
+
+[emulation]
+speed = "real"
+
+[cpu]
+model = "68000"
+fpu = false
+
+[memory]
+chip = "512K"
+slow = "512K"
+
+[chipset]
+revision = "OCS"
+video = "PAL"
+
+[floppy.df0]
+path = "timing-test.adf"
+write_protected = true

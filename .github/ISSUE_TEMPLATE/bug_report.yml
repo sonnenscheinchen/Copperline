@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a hardware-behaviour or host integration problem.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not attach copyrighted ROMs, disks, hard-disk images, CD images, or other third-party assets. Naming the software used to reproduce a problem is fine.
+  - type: input
+    id: version
+    attributes:
+      label: Copperline version
+      description: Commit hash, tag, or branch.
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host system
+      description: Operating system, CPU, and GPU if relevant.
+      placeholder: macOS 15, Apple M5 Pro
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Machine/configuration
+      description: Machine model, chipset, CPU, memory, and attached device types. Omit private paths.
+      render: toml
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Exact steps from a clean launch. Name software if needed, but do not upload the image.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected hardware behaviour
+      description: What real hardware or another reference emulator does.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What Copperline does instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or debugger output
+      description: Paste short excerpts only; remove local paths if needed.
+      render: text

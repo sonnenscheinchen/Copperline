@@ -1,0 +1,7 @@
+[fs-uae]
+amiga_model = A500
+kickstart_file = $CONFIG/../kickstart205.rom
+floppy_drive_0 = $CONFIG/timing-test.adf
+slow_memory = 512
+fast_memory = 0
+serial_port = tcp://127.0.0.1:1234
