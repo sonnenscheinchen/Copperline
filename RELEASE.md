@@ -48,6 +48,28 @@ myst build --pdf --ci --strict
 test -s _build/exports/copperline.pdf
 ```
 
+## Homebrew formula
+
+This repository is its own Homebrew tap (`Formula/copperline.rb`). After
+tagging a release, update the formula so `brew install copperline` picks up
+the new version:
+
+```sh
+VER=X.Y.Z
+curl -fsSL "https://github.com/LinuxJedi/Copperline/archive/refs/tags/v$VER.tar.gz" | shasum -a 256
+```
+
+Set `url` to the `v$VER.tar.gz` tarball and `sha256` to the printed digest.
+Smoke-test the formula locally before pushing:
+
+```sh
+brew install --build-from-source ./Formula/copperline.rb
+brew test copperline
+brew audit --strict --formula ./Formula/copperline.rb
+```
+
+## Crate packaging
+
 `cargo package --no-verify --offline` can be used to inspect the source
 archive layout after the dependencies are cached. Do not use full package
 verification as a release gate until the vendored `m68k` path dependency has

@@ -58,6 +58,19 @@ against real hardware.
 - No SDL2 dependency. Developed and tested on **macOS**; the Linux and
   Windows paths are expected to work but are currently untested.
 
+## Install (macOS, Homebrew)
+
+```sh
+brew tap LinuxJedi/copperline https://github.com/LinuxJedi/Copperline
+brew install copperline
+```
+
+This builds from source on your machine, so the binary is not subject to
+macOS Gatekeeper quarantine -- there is no Security & Privacy override to
+click through. Use `brew install --HEAD copperline` to build the latest
+`main` instead of the most recent tagged release. Then run `copperline` from
+the terminal.
+
 ## Build and run
 
 ```sh

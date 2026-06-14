@@ -12,6 +12,19 @@
   be exactly 512 KiB; CDTV/CD32 extended ROM sizes are covered in
   [](configuration#top-level).
 
+## Installing on macOS (Homebrew)
+
+```sh
+brew tap LinuxJedi/copperline https://github.com/LinuxJedi/Copperline
+brew install copperline
+```
+
+The formula builds from source, so the binary is compiled locally and is not
+subject to macOS Gatekeeper quarantine: there is no Security & Privacy
+override to click through, unlike a downloaded prebuilt app. Use
+`brew install --HEAD copperline` to build the latest `main` instead of the
+most recent tagged release, then run `copperline` from the terminal.
+
 ## Building
 
 ```sh
