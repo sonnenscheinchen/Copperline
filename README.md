@@ -134,69 +134,30 @@ resolved first.
 
 ## What gets emulated
 
-| Subsystem               | Notes                                                    |
-| ----------------------- | -------------------------------------------------------- |
-| M68K CPU                | Via a vendored pure-Rust m68k crate; model selectable    |
-|                         | through 68040, accurate 68000 cycle counts, 6888x FPU.   |
-| Chip RAM                | mem_map'd; reset starts with ROM overlaid at $0 until    |
-|                         | CIA-A releases /OVL.                                     |
-| Fast RAM                | Optional Zorro II autoconfig RAM at $00200000 and Zorro  |
-|                         | III autoconfig RAM (`[memory] z3`); runs at the CPU clock.|
-| Slow RAM                | Optional A500 trapdoor/fake-fast RAM at $00C00000;       |
-|                         | arbitrated on the chip bus through Agnus like chip RAM.  |
-| ROM                     | Kickstart at $F80000 (512 KiB); optional extended ROM    |
-|                         | for CD32 ($E00000) and CDTV ($F00000).                   |
-| Battery RTC             | Read-only MSM6242-compatible register view at $DC0000;   |
-|                         | guest writes affect only emulated latch/control state.   |
-| CIA-A / CIA-B           | I/O ports, /OVL, timers, TOD, keyboard SDR/ICR, disk     |
-|                         | control/status lines, and CIA-B FLAG disk index pulses.  |
-| Paula serial            | SERDAT -> stdout through a one-word transmit buffer and  |
-|                         | timed shift register; SERDATR reports TBE/TSRE/RBF.      |
-| Paula audio             | 4-channel DMA/sample playback, stereo mix, LED filter.   |
-| Paula DMACON / INTENA / | IRQ bits are stored and delivered through manual M68K    |
-| INTREQ                  | autovectors with modelled 68000 interrupt-recognition    |
-|                         | latency; audio and disk DMA raise completion IRQs.       |
-| Floppy / ADF / DMS      | DF0-DF3 standard DD ADF read/write, read-only ADZ/DMS,   |
-| / SCP                   | UAE extended ADF, initial read-only SCP flux import,     |
-|                         | track-timed disk DMA, CIA drive lines, index FLAG,       |
-|                         | DSKLEN/DSKBYTR/DSKSYNC/DSKDAT, per-drive multi-disk      |
-|                         | playlists with a swap key.                               |
-| Agnus VPOSR / VHPOSR    | Beam counters advanced per colour clock; PAL and NTSC    |
-|                         | timing (including NTSC long/short lines).                |
-| Agnus Copper            | Beam-scheduled OCS Copper with COP1/COP2 jumps, WAIT,    |
-|                         | SKIP, DMAEN/COPEN gating, and chip-bus grants.           |
-| Agnus blitter           | Scheduled per-slot engine: normal/line/fill modes,       |
-|                         | hardware per-word channel bus sequences (including the   |
-|                         | area-fill idle C slot), BBUSY/BZERO, BLTPRI "nasty" vs   |
-|                         | CPU starvation-yield arbitration, blit-done IRQ.         |
-| Denise BPLCON / COLORxx | Stored and replayed by beam position.                    |
-| Bitplane renderer       | OCS lo-res or hi-res; reads chip RAM via BPLxPT; honours |
-|                         | modulos and beam-timed BPLCON1 scroll; EHB, HAM, dual    |
-|                         | playfield, and CLXDAT collisions. Lo-res pixel-doubles   |
-|                         | horizontally to match the 716-wide framebuffer.          |
-| Display window          | winit 0.30 + pixels 0.17 surface; 716x285 framebuffer    |
-|                         | presented at 4:3 (716x537) plus a 44-pixel status bar    |
-|                         | with power/disk controls.                                |
-| Keyboard / mouse /      | Host keyboard/mouse mapped to Amiga input paths; key down|
-| gamepad                 | and key up events go through CIA-A SDR/ICR with          |
-|                         | acknowledge + KDAT handshake backpressure and            |
-|                         | keyboard-MCU pacing;                                     |
-|                         | mouse deltas feed JOY0DAT; Cmd+G toggles host mouse capture; |
-|                         | a USB gamepad (gilrs) drives the port-2 digital joystick |
-|                         | (JOY1DAT directions, /FIR1 fire, POT1Y button 2);        |
-|                         | Ctrl+Ami+Ami resets.                                     |
-| OCS sprites             | 8 DMA/manual 16-pixel sprites, attached sprites,         |
-|                         | composited over bitplanes with playfield priority.       |
-| Chip bus arbitration    | Per-colour-clock OCS slot ownership for refresh, display |
-|                         | DMA, sprites, disk, audio, Copper, blitter, and CPU      |
-|                         | chip/custom accesses, with CPU wait states.              |
-| ECS                     | ECS Agnus revisions (8372A/8375) and ECS Denise (8373):  |
-|                         | up to 2M chip RAM, DIWHIGH, BEAMCON0, SuperHires, ECS    |
-|                         | blitter (BLTSIZV/BLTSIZH), programmable geometry.        |
-| AGA                     | Alice/Lisa: 8 bitplanes, 256-entry 25-bit palette with   |
-|                         | BANK/LOCT, HAM8, FMODE wide bitplane/sprite fetch,       |
-|                         | BPLCON4, CLXCON2; A1200/CD32 profiles. Remaining gaps    |
-|                         | (e.g. 35 ns SHRES sprites) recorded in the internals docs.|
+| Subsystem | Notes |
+| --- | --- |
+| M68K CPU | Via a vendored pure-Rust m68k crate; model selectable through 68040, accurate 68000 cycle counts, 6888x FPU. |
+| Chip RAM | mem_map'd; reset starts with ROM overlaid at $0 until CIA-A releases /OVL. |
+| Fast RAM | Optional Zorro II autoconfig RAM at $00200000 and Zorro III autoconfig RAM (`[memory] z3`); runs at the CPU clock. |
+| Slow RAM | Optional A500 trapdoor/fake-fast RAM at $00C00000; arbitrated on the chip bus through Agnus like chip RAM. |
+| ROM | Kickstart at $F80000 (512 KiB); optional extended ROM for CD32 ($E00000) and CDTV ($F00000). |
+| Battery RTC | Read-only MSM6242-compatible register view at $DC0000; guest writes affect only emulated latch/control state. |
+| CIA-A / CIA-B | I/O ports, /OVL, timers, TOD, keyboard SDR/ICR, disk control/status lines, and CIA-B FLAG disk index pulses. |
+| Paula serial | SERDAT -> stdout through a one-word transmit buffer and timed shift register; SERDATR reports TBE/TSRE/RBF. |
+| Paula audio | 4-channel DMA/sample playback, stereo mix, LED filter. |
+| Paula DMACON / INTENA / INTREQ | IRQ bits are stored and delivered through manual M68K autovectors with modelled 68000 interrupt-recognition latency; audio and disk DMA raise completion IRQs. |
+| Floppy / ADF / DMS / SCP | DF0-DF3 standard DD ADF read/write, read-only ADZ/DMS, UAE extended ADF, initial read-only SCP flux import, track-timed disk DMA, CIA drive lines, index FLAG, DSKLEN/DSKBYTR/DSKSYNC/DSKDAT, per-drive multi-disk playlists with a swap key. |
+| Agnus VPOSR / VHPOSR | Beam counters advanced per colour clock; PAL and NTSC timing (including NTSC long/short lines). |
+| Agnus Copper | Beam-scheduled OCS Copper with COP1/COP2 jumps, WAIT, SKIP, DMAEN/COPEN gating, and chip-bus grants. |
+| Agnus blitter | Scheduled per-slot engine: normal/line/fill modes, hardware per-word channel bus sequences (including the area-fill idle C slot), BBUSY/BZERO, BLTPRI "nasty" vs CPU starvation-yield arbitration, blit-done IRQ. |
+| Denise BPLCON / COLORxx | Stored and replayed by beam position. |
+| Bitplane renderer | OCS lo-res or hi-res; reads chip RAM via BPLxPT; honours modulos and beam-timed BPLCON1 scroll; EHB, HAM, dual playfield, and CLXDAT collisions. Lo-res pixel-doubles horizontally to match the 716-wide framebuffer. |
+| Display window | winit 0.30 + pixels 0.17 surface; 716x285 framebuffer presented at 4:3 (716x537) plus a 44-pixel status bar with power/disk controls. |
+| Keyboard / mouse / gamepad | Host keyboard/mouse mapped to Amiga input paths; key down and key up events go through CIA-A SDR/ICR with acknowledge + KDAT handshake backpressure and keyboard-MCU pacing; mouse deltas feed JOY0DAT; Cmd+G toggles host mouse capture; a USB gamepad (gilrs) drives the port-2 digital joystick (JOY1DAT directions, /FIR1 fire, POT1Y button 2); Ctrl+Ami+Ami resets. |
+| OCS sprites | 8 DMA/manual 16-pixel sprites, attached sprites, composited over bitplanes with playfield priority. |
+| Chip bus arbitration | Per-colour-clock OCS slot ownership for refresh, display DMA, sprites, disk, audio, Copper, blitter, and CPU chip/custom accesses, with CPU wait states. |
+| ECS | ECS Agnus revisions (8372A/8375) and ECS Denise (8373): up to 2M chip RAM, DIWHIGH, BEAMCON0, SuperHires, ECS blitter (BLTSIZV/BLTSIZH), programmable geometry. |
+| AGA | Alice/Lisa: 8 bitplanes, 256-entry 25-bit palette with BANK/LOCT, HAM8, FMODE wide bitplane/sprite fetch, BPLCON4, CLXCON2; A1200/CD32 profiles. Remaining gaps (e.g. 35 ns SHRES sprites) recorded in the internals docs. |
 
 The detailed architecture (source layout, the bus, the replay renderer) and
 timing model live in the [internals docs](docs/internals/architecture.md).
