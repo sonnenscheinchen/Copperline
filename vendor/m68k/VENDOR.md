@@ -64,6 +64,33 @@ Reviewed upstream `benletchford/m68k-rs` through `9f5dab4` (8 commits past the
   `tests/unaligned_fetch_tests.rs`; the vendored cycle-exact core passes it,
   confirming the always-snapshot path here is already correct.
 
+## Upstream re-review (reviewed 2026-06-14)
+
+Re-reviewed `benletchford/m68k-rs` through `327a7c3` (8 further commits past the
+`9f5dab4` review point, all dated 2026-06-11/12). Nothing to port -- every commit
+is a throughput optimization in the trace-JIT / opcode-cache / decode-fast-path /
+wasm machinery that this fork deliberately does not use, and several would
+actively regress the Part D/E cycle-exact MC68000 timing:
+
+- `Optimize postincrement long moves` (f57eeb0): adds an
+  `exec_move_l_postinc_to_postinc` decode fast path that does a flat
+  read_32/write_32 and returns a hardcoded 4 cycles, bypassing the prefetch
+  top-up and the `write_long_mm_interleaved_68000` bus-order model this fork
+  relies on for `MOVE.L (An)+,(Am)+`. Not merged.
+- `Optimize register shift traces` (61bf70c): semantics-preserving closed-form
+  rewrite of the ASR/ROL/ROR loops, but keeps the upstream base-6 cycle cost
+  (this fork uses base 8 for long register shifts, gated to the 68000) and also
+  edits `op_cache.rs`/`trace_jit.rs`. No correctness fix; not merged.
+- The rest (`Fast-path extension control-flow steps` db11812 and its same-day
+  revert 030b279, `Avoid duplicate simple-op decode fallback` f46c9e7, the two
+  wasm trace-bookkeeping skips a48591e/15d8c98, and the `Bump m68k to 0.1.13`
+  version bump 327a7c3) are pure speed/wasm/version changes with no
+  instruction-semantics or cycle-timing bug fixes.
+
+Upstream continues to chase throughput (re-adding the perf work that `9f5dab4`
+itself rolled back); the host already paces to wall-clock time, so none of it
+buys Copperline anything.
+
 ## Fixtures (not committed -- large)
 
 The SingleStepTests `m68000` set (~182M) is gitignored. To run the harness /

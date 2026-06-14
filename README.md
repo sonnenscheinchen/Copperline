@@ -1,5 +1,7 @@
 ![Copperline](assets/brand/copperline-logo.png)
 
+Website: [copperline.dev](https://copperline.dev/)
+
 An Amiga emulator written in Rust, built around a vendored copy of
 the pure-Rust [m68k](vendor/m68k) CPU core, with a
 [pixels](https://crates.io/crates/pixels) + [winit](https://crates.io/crates/winit)
@@ -115,8 +117,9 @@ images, validation rules, and audio options -- is in the
 User and developer documentation -- getting started, the UI and shortcuts,
 headless capture, save states, input recording, both debuggers, the
 configuration reference, and the internals (timing model, chipset, CPU,
-video pipeline) -- lives under `docs/` as a [MyST](https://mystmd.org/)
-project:
+video pipeline) -- is published at [copperline.dev](https://copperline.dev/)
+and lives under `docs/` as a [MyST](https://mystmd.org/) project you can also
+build locally:
 
 ```sh
 npm install -g mystmd
