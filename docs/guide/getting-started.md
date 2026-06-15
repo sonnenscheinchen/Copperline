@@ -7,7 +7,7 @@
   `winit` + `pixels`, audio uses `cpal`, and gamepads use the pure-Rust
   `gilrs` crate.
 - Fedora build dependencies: `sudo dnf install alsa-lib-devel systemd-devel`.
-- A boot ROM. Copperline ships with the [AROS](https://www.aros.org/)
+- A boot ROM. Copperline ships with the [AROS](http://www.aros.org/)
   open-source Kickstart replacement and boots it by default, so it runs out
   of the box with no ROM of your own. It also boots Kickstart 1.3, 2.05, and
   3.1 (including the CDTV and CD32 extended ROMs) as well as
