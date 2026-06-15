@@ -40,9 +40,10 @@ against real hardware.
   latency is modelled. Real-hardware reference numbers come from the
   cross-emulator disk in `timing-test/`.
 - **OCS, ECS, and AGA**, with independent Agnus/Denise revisions and machine
-  profiles from the A500 to the A1200, plus CDTV and CD32. Boots Kickstart
-  1.3 / 2.05 / 3.1 and DiagROM v2.0, and runs the current timing-sensitive
-  OCS and AGA regression set at real speed.
+  profiles from the A500 to the A1200, plus CDTV and CD32. Boots the bundled
+  AROS ROM out of the box, as well as Kickstart 1.3 / 2.05 / 3.1 and DiagROM
+  v2.0, and runs the current timing-sensitive OCS and AGA regression set at
+  real speed.
 - **Configurable CPU** (68000 / 68EC020 / 68020 / 68030 / 68040) and clock,
   with an optional 68881/68882 FPU (default-on for the 68040).
 - **Peripherals**: a bit-timed keyboard (6500/1 MCU), mouse, USB gamepad
@@ -79,9 +80,9 @@ cargo build --release
 ```
 
 The binary looks for `./copperline.toml`; if it isn't present, built-in
-defaults are used (68000 at ~7.09 MHz, 512K chip RAM, OCS, PAL, real speed,
-ROM at `./diagrom.rom`). Override with a ROM positional argument or a config
-file:
+defaults are used (68000 at ~7.09 MHz, OCS, PAL, real speed, and the bundled
+[AROS](https://www.aros.org/) ROM on a 1 MB A500). Boot your own ROM with a
+positional argument, or point at a config file:
 
 ```sh
 ./target/release/copperline path/to/kickstart.rom
@@ -200,6 +201,11 @@ chip-bus timings against the CIA E-clock for cross-emulator comparison.
 
 ## Credits
 
+- The [AROS Research Operating System](https://www.aros.org/), bundled in
+  [`assets/aros`](assets/aros) as the default boot ROM. AROS is an
+  open-source re-implementation of the AmigaOS API, distributed under the
+  AROS Public License; the ROM images here are unmodified from the official
+  m68k nightly build (see [assets/aros/README.md](assets/aros/README.md)).
 - [DiagROM](https://www.diagrom.com/) by John "Chucky" Hertell,
   licensed for free use.
 - The [m68k](vendor/m68k) CPU core vendored under `vendor/m68k`.

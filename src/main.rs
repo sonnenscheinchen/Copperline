@@ -4,8 +4,8 @@
 //!
 //! Usage: copperline [--config FILE] [ROM]
 //!   If no --config is given, looks for ./copperline.toml.
-//!   If no ROM is given, uses the rom field from the config (default
-//!   ./diagrom.rom).
+//!   If no ROM is given (neither argument nor `rom =` in the config), boots
+//!   the bundled AROS open-source Kickstart replacement (see src/romsearch.rs).
 
 mod a2091;
 mod akiko;
@@ -31,6 +31,7 @@ mod harddrive;
 mod inputrec;
 mod memory;
 mod recorder;
+mod romsearch;
 mod rtc;
 mod savestate;
 mod screenshot;
@@ -711,6 +712,7 @@ fn main() -> Result<()> {
     }
     let mut cfg =
         load_config(cli.config_path.as_deref(), &cli.overrides)?.with_rom_override(cli.rom_path);
+    resolve_bundled_rom(&mut cfg)?;
     let disk_insert_after = resolve_disk_insert_after(&mut cfg, cli.disk_insert_after)?;
 
     info!(
@@ -1082,6 +1084,45 @@ fn load_config(explicit: Option<&Path>, overrides: &ConfigOverrides) -> Result<C
         None
     };
     Config::load_with_overrides(path, overrides)
+}
+
+/// Substitute the bundled AROS ROM when the user named no ROM. The default
+/// `rom_path` is a sentinel ([`config::BUNDLED_AROS_ROM`]); any real path from
+/// `rom = "..."` or the CLI argument replaces it before this runs and is left
+/// untouched. When the sentinel survives, locate the bundled AROS main +
+/// extended ROM pair and rewrite the config to point at them, so every
+/// downstream consumer (start-up banner, window title, save states) sees the
+/// real paths. An explicit `extended_rom` still wins over the AROS one.
+fn resolve_bundled_rom(cfg: &mut Config) -> Result<()> {
+    if cfg.rom_path != Path::new(config::BUNDLED_AROS_ROM) {
+        return Ok(());
+    }
+    let aros = romsearch::find_bundled_aros().ok_or_else(|| {
+        anyhow!(
+            "no ROM specified and the bundled AROS ROM was not found. Pass a \
+             Kickstart ROM (as the first argument or rom = \"...\" in a config), \
+             or install the AROS files ({} and {}) next to the binary or under \
+             share/copperline/aros/.",
+            romsearch::AROS_MAIN_FILE,
+            romsearch::AROS_EXT_FILE
+        )
+    })?;
+    info!(
+        "no ROM specified; booting bundled AROS ({})",
+        aros.main.display()
+    );
+    cfg.rom_path = aros.main;
+    cfg.extended_rom_path.get_or_insert(aros.extended);
+    // AROS needs more than the bare 512 KiB A500. When the user picked no
+    // machine profile and added no expansion RAM, fit the 512 KiB trapdoor
+    // (slow) RAM of a stock 1 MB A500 so a zero-argument run boots AROS
+    // instead of sitting on a black screen. Any explicit machine or memory
+    // choice is left untouched.
+    if cfg.machine.is_none() && cfg.slow_ram_bytes == 0 && cfg.fast_ram_bytes == 0 {
+        cfg.slow_ram_bytes = 512 * 1024;
+        info!("bundled AROS: fitting 512 KiB trapdoor RAM (1 MB A500) for the default machine");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

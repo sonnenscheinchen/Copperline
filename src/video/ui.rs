@@ -60,9 +60,10 @@ pub enum MenuItem {
     RecordInput,
     SaveState,
     LoadState,
+    LoadRom,
 }
 
-pub const MENU_ITEMS: [MenuItem; 9] = [
+pub const MENU_ITEMS: [MenuItem; 10] = [
     MenuItem::Debugger,
     MenuItem::Calibration,
     MenuItem::Warp,
@@ -70,6 +71,7 @@ pub const MENU_ITEMS: [MenuItem; 9] = [
     MenuItem::RecordInput,
     MenuItem::SaveState,
     MenuItem::LoadState,
+    MenuItem::LoadRom,
     MenuItem::Shortcuts,
     MenuItem::About,
 ];
@@ -93,6 +95,7 @@ fn menu_item_label(
         MenuItem::RecordInput => "Record Input",
         MenuItem::SaveState => "Save State",
         MenuItem::LoadState => "Load State...",
+        MenuItem::LoadRom => "Load Kickstart ROM...",
     }
 }
 

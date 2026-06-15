@@ -30,6 +30,12 @@
 *.[Bb][Ii][Nn]
 *.[Ii][Ss][Oo]
 
+# Exception: the AROS ROM is open-source (APL) and freely redistributable,
+# unlike the copyrighted Kickstart/CD ROMs above. It is the default boot ROM
+# and ships with the build, so it is committed despite the *.bin rule.
+!/assets/aros/aros-amiga-m68k-rom.bin
+!/assets/aros/aros-amiga-m68k-ext.bin
+
 # Local run artifacts (screenshots, recordings, save states, input scripts).
 copperline-screenshot-*.png
 copperline-video-*.avi

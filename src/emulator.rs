@@ -396,6 +396,41 @@ impl Emulator {
         Ok(())
     }
 
+    /// Fit a new boot ROM (and optionally an extended ROM) and cold-reset,
+    /// as if the Kickstart had been physically swapped and power cycled.
+    /// Both images are validated before anything is mutated, so on error the
+    /// running machine keeps its current ROMs. `extended` of `None` removes
+    /// any fitted extended ROM.
+    pub fn reload_rom(&mut self, rom: Vec<u8>, extended: Option<Vec<u8>>) -> Result<()> {
+        use crate::memory::ROM_SIZE;
+        if rom.len() != ROM_SIZE {
+            anyhow::bail!(
+                "ROM size is {} bytes, expected {} (512 KiB)",
+                rom.len(),
+                ROM_SIZE
+            );
+        }
+        // Validate the extended-ROM size up front so a bad image cannot
+        // leave the main ROM swapped but the extended ROM half-applied.
+        if let Some(image) = &extended {
+            if !matches!(image.len(), 0x8_0000 | 0x4_0000) {
+                anyhow::bail!(
+                    "extended ROM is {} bytes; expected 512 KiB ($E00000) \
+                     or 256 KiB ($F00000)",
+                    image.len()
+                );
+            }
+        }
+        let mem = &mut self.bus_mut().mem;
+        mem.rom = rom;
+        match extended {
+            Some(image) => mem.attach_extended_rom(image)?,
+            None => mem.detach_extended_rom(),
+        }
+        log::info!("boot ROM replaced; cold-resetting");
+        self.power_on_reset()
+    }
+
     /// Write a save state of the whole emulated machine to `path`. Call
     /// between frames (the event loop and the headless frame loop both run
     /// at frame granularity, so any caller outside step_frame qualifies).

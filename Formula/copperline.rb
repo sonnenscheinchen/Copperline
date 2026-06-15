@@ -30,6 +30,11 @@ class Copperline < Formula
     # Cargo.lock is committed; std_cargo_args passes --locked so the build
     # uses the pinned dependency graph (including the vendored m68k core).
     system "cargo", "install", *std_cargo_args
+
+    # Install the bundled AROS open-source Kickstart replacement (the default
+    # boot ROM) where the binary looks for it: <prefix>/share/copperline/aros.
+    # AROS is APL-licensed and freely redistributable, unlike a real Kickstart.
+    (pkgshare/"aros").install Dir["assets/aros/*"]
   end
 
   test do

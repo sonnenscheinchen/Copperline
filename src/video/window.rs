@@ -3749,6 +3749,7 @@ impl App {
                     ui::MenuItem::RecordInput => self.toggle_input_recording(),
                     ui::MenuItem::SaveState => self.save_state_interactive(),
                     ui::MenuItem::LoadState => self.load_state_from_dialog(),
+                    ui::MenuItem::LoadRom => self.load_rom_from_dialog(),
                 }
             }
             UiControl::PanelClose | UiControl::CalCancel => self.close_panel(),
@@ -3968,6 +3969,59 @@ impl App {
                     warn!("save state load failed ({}): {e:#}", path.display());
                     self.show_osd("State load failed (see log)");
                 }
+            }
+        }
+        self.emu.reanchor_realtime_clock();
+    }
+
+    /// Pick a Kickstart ROM (and an optional extended ROM) and fit it,
+    /// cold-resetting the machine as if the chip had been swapped and the
+    /// power cycled (menu "Load Kickstart ROM..."). The main ROM must be
+    /// 512 KiB; an extended ROM is 512 KiB ($E00000) or 256 KiB ($F00000).
+    /// On any error the running machine keeps its current ROM.
+    fn load_rom_from_dialog(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .set_title("Load Kickstart ROM (512 KiB)")
+            .add_filter("Amiga ROM images", &["rom", "bin"])
+            .pick_file();
+        let Some(main_path) = picked else {
+            // Re-baseline pacing after the modal dialog even when cancelled.
+            self.emu.reanchor_realtime_clock();
+            return;
+        };
+        // Offer an optional extended ROM (AROS/CDTV/CD32). Cancelling skips it
+        // and removes any extended ROM currently fitted.
+        let ext_path = rfd::FileDialog::new()
+            .set_title("Load extended ROM (optional; Cancel to skip)")
+            .add_filter("Amiga ROM images", &["rom", "bin"])
+            .pick_file();
+
+        let result = (|| -> anyhow::Result<()> {
+            let rom = std::fs::read(&main_path)
+                .map_err(|e| anyhow::anyhow!("reading ROM {}: {e}", main_path.display()))?;
+            let ext =
+                match &ext_path {
+                    Some(p) => Some(std::fs::read(p).map_err(|e| {
+                        anyhow::anyhow!("reading extended ROM {}: {e}", p.display())
+                    })?),
+                    None => None,
+                };
+            self.emu.reload_rom(rom, ext)
+        })();
+
+        match result {
+            Ok(()) => {
+                info!("boot ROM loaded: {}", main_path.display());
+                self.powered_on = true;
+                self.cpu_halted = false;
+                // The cold reset restarts the frame timeline; force a repaint.
+                self.last_rendered_emulated_frame = None;
+                self.show_osd(format!("ROM: {}", display_file_name(&main_path)));
+                self.request_redraw();
+            }
+            Err(e) => {
+                warn!("ROM load failed ({}): {e:#}", main_path.display());
+                self.show_osd("ROM load failed (see log)");
             }
         }
         self.emu.reanchor_realtime_clock();

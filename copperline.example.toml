@@ -3,8 +3,10 @@
 # `--config path/to/file.toml`. Any field can be omitted; missing
 # fields fall back to the defaults shown here.
 
-# ROM image to load. Must be exactly 512 KiB.
-rom = "diagrom.rom"
+# ROM image to load. Must be exactly 512 KiB. Omit this field (and pass no
+# ROM argument) to boot the bundled AROS open-source Kickstart replacement,
+# which ships with Copperline as the default boot ROM.
+rom = "kickstart.rom"
 
 [emulation]
 # Execution pacing. "real" is the only timing model: the CPU, chipset,

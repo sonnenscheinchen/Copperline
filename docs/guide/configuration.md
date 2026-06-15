@@ -42,12 +42,18 @@ profile in a config file.
 ## Top level
 
 ```toml
-rom = "KICK13.ROM"            # Kickstart/DiagROM image, exactly 512 KiB
+rom = "KICK13.ROM"            # Kickstart image, exactly 512 KiB
 extended_rom = "cd32ext.rom"  # optional: CDTV (256K at $F00000) or
                               # CD32 (512K at $E00000) extended ROM
 ```
 
-The ROM path can be overridden by a positional CLI argument. Machine
+The ROM path can be overridden by a positional CLI argument. Omit `rom`
+entirely (and pass no ROM argument) to boot the bundled AROS open-source
+Kickstart replacement, which ships with Copperline as the default boot ROM;
+its main and extended halves are located next to the binary (under
+`share/copperline/aros` for a Homebrew install) or set
+`COPPERLINE_AROS_DIR`. You can also fit a different ROM at runtime from the
+menu's **Load Kickstart ROM...** item, which hard-resets the machine. Machine
 profiles that need an extended ROM (CDTV, CD32) will tell you if it is
 missing.
 

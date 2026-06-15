@@ -80,6 +80,14 @@ impl Memory {
         Ok(())
     }
 
+    /// Remove any fitted extended ROM, returning the $E00000/$F00000 window
+    /// to nothing (open bus). Used when a freshly loaded main ROM is not
+    /// accompanied by an extended image.
+    pub fn detach_extended_rom(&mut self) {
+        self.extended_rom = Vec::new();
+        self.extended_rom_base = 0;
+    }
+
     /// Return memory to its cold power-on state: clear all RAM and restore
     /// the boot-time ROM overlay and Zorro autoconfig state. Unlike a
     /// warm (keyboard) reset, this does not preserve RAM contents, so the

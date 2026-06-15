@@ -83,6 +83,11 @@ Amiga; `Esc` closes it.
 - **Save State** (also `Cmd+Shift+S`) and **Load State...** (also
   `Cmd+Shift+L`): snapshot the whole emulated machine to a file, or
   restore one and continue from exactly that point. See below.
+- **Load Kickstart ROM...**: fit a different boot ROM. Pick a 512 KiB
+  Kickstart, then optionally a second file for the extended ROM (512 KiB at
+  $E00000 or 256 KiB at $F00000; Cancel to skip and remove any fitted
+  extended ROM). The machine then cold-resets, as if the chip had been
+  swapped and the power cycled.
 - **Keyboard Shortcuts**: the shortcut reference.
 - **About**: app version plus a summary of the emulated machine.
 

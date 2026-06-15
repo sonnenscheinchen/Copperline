@@ -11,6 +11,12 @@ use serde::Deserialize;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Sentinel `rom_path` meaning "the user named no ROM": boot the bundled
+/// AROS open-source Kickstart replacement if it can be found, otherwise fail
+/// with a message telling the user to supply a Kickstart. A real path (from
+/// `rom = "..."` or the CLI argument) always replaces it.
+pub const BUNDLED_AROS_ROM: &str = "<bundled-aros>";
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub rom_path: PathBuf,
@@ -314,7 +320,7 @@ impl GateArray {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            rom_path: PathBuf::from("diagrom.rom"),
+            rom_path: PathBuf::from(BUNDLED_AROS_ROM),
             cpu: CpuModel::M68000,
             fpu: CpuModel::M68000.default_fpu(),
             cpu_clock_mhz: CpuModel::M68000.default_clock_mhz(),
