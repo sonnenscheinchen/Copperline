@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Build a Copperline AppImage: a single self-contained, no-install binary
+# that runs across Linux distributions. Run from a Linux host (or CI); see
+# .github/workflows/appimage.yml.
+#
+# What it does:
+#   1. Builds the release binary with the pinned dependency graph.
+#   2. Stages an AppDir laid out like a /usr prefix, so romsearch.rs finds
+#      the bundled AROS ROM via <bindir>/../share/copperline/aros.
+#   3. Uses linuxdeploy to pull in the direct shared-library dependencies
+#      (ALSA, udev, X11/Wayland, etc.) and wrap the AppDir into an AppImage.
+#
+# Notes:
+#   - The GPU stack (Mesa/Vulkan/libGL) is deliberately NOT bundled; the
+#     wgpu/pixels render path uses the host driver, which is what linuxdeploy's
+#     default exclude list expects. Bundling those libraries breaks on hosts
+#     with a different driver.
+#   - Build on the OLDEST glibc you intend to support (an old runner image or
+#     container); an AppImage built against a newer glibc will not start on
+#     older systems.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$here/../.." && pwd)"
+flatpak_meta="$repo_root/packaging/flatpak"
+cd "$repo_root"
+
+appdir="$repo_root/AppDir"
+arch="$(uname -m)"
+tools_dir="${LINUXDEPLOY_DIR:-$repo_root/.appimage-tools}"
+linuxdeploy="$tools_dir/linuxdeploy-$arch.AppImage"
+
+echo "==> Building release binary"
+cargo build --release --locked
+
+echo "==> Staging AppDir"
+rm -rf "$appdir"
+install -Dm755 target/release/copperline "$appdir/usr/bin/copperline"
+
+# Bundled AROS open-source Kickstart replacement (default boot ROM).
+# romsearch.rs looks under <prefix>/share/copperline/aros relative to the
+# binary; in the AppImage that resolves to usr/share/copperline/aros.
+install -Dm644 assets/aros/aros-amiga-m68k-rom.bin \
+  "$appdir/usr/share/copperline/aros/aros-amiga-m68k-rom.bin"
+install -Dm644 assets/aros/aros-amiga-m68k-ext.bin \
+  "$appdir/usr/share/copperline/aros/aros-amiga-m68k-ext.bin"
+install -Dm644 assets/aros/LICENSE \
+  "$appdir/usr/share/copperline/aros/LICENSE"
+
+# Desktop integration metadata, shared with the Flatpak build.
+install -Dm644 "$flatpak_meta/dev.copperline.Copperline.desktop" \
+  "$appdir/usr/share/applications/dev.copperline.Copperline.desktop"
+install -Dm644 "$flatpak_meta/dev.copperline.Copperline.metainfo.xml" \
+  "$appdir/usr/share/metainfo/dev.copperline.Copperline.metainfo.xml"
+install -Dm644 assets/brand/copperline-icon.png \
+  "$appdir/usr/share/icons/hicolor/256x256/apps/dev.copperline.Copperline.png"
+
+echo "==> Fetching linuxdeploy"
+mkdir -p "$tools_dir"
+if [ ! -x "$linuxdeploy" ]; then
+  curl -fsSL -o "$linuxdeploy" \
+    "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$arch.AppImage"
+  chmod +x "$linuxdeploy"
+fi
+
+echo "==> Building AppImage"
+export VERSION="${VERSION:-$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)}"
+# OUTPUT controls the final file name; default mirrors the Homebrew/version
+# convention so release assets are self-describing.
+export OUTPUT="${OUTPUT:-Copperline-$VERSION-$arch.AppImage}"
+
+"$linuxdeploy" \
+  --appdir "$appdir" \
+  --executable "$appdir/usr/bin/copperline" \
+  --desktop-file "$appdir/usr/share/applications/dev.copperline.Copperline.desktop" \
+  --icon-file "$appdir/usr/share/icons/hicolor/256x256/apps/dev.copperline.Copperline.png" \
+  --output appimage
+
+echo "==> Built $OUTPUT"

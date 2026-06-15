@@ -73,6 +73,17 @@ click through. Use `brew install --HEAD copperline` to build the latest
 `main` instead of the most recent tagged release. Then run `copperline` from
 the terminal.
 
+## Install (Linux)
+
+```sh
+flatpak install flathub dev.copperline.Copperline   # any distribution
+```
+
+Or grab the single-file `Copperline-*.AppImage` from the
+[releases page](https://github.com/LinuxJedi/Copperline/releases),
+`chmod +x` it and run. Both bundle the AROS boot ROM. Packaging sources are in
+`packaging/`.
+
 ## Build and run
 
 ```sh
@@ -146,10 +157,13 @@ See `docs/README.md` for conventions and PDF output.
 
 ## Packaging
 
-Copperline is intended to be distributed from source for now. `Cargo.toml`
-sets `publish = false` because the emulator depends on a patched vendored
-copy of the `m68k` CPU core; a crates.io release needs that dependency
-resolved first.
+Copperline is distributed from source. On macOS this repository doubles as a
+Homebrew tap (`Formula/`); on Linux it builds as a Flatpak for Flathub
+(`packaging/flatpak/`) and as a portable AppImage (`packaging/appimage/`). It
+is not on crates.io: `Cargo.toml` sets `publish = false` because the emulator
+depends on a patched vendored copy of the `m68k` CPU core, which a crates.io
+release needs resolved first. Release steps for every channel are in
+[`RELEASE.md`](RELEASE.md).
 
 ## What gets emulated
 
