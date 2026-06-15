@@ -1,0 +1,64 @@
+name: AppImage
+
+# Builds a portable AppImage and uploads it as a workflow artifact on every
+# qualifying change, and attaches it to the GitHub Release when a v* tag is
+# pushed. The build runs on ubuntu-22.04 deliberately: an AppImage built
+# against an older glibc runs on newer systems but not vice versa, so this
+# pins the floor of supported distributions.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "src/**"
+      - "vendor/**"
+      - "assets/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "packaging/appimage/**"
+      - ".github/workflows/appimage.yml"
+  pull_request:
+    paths:
+      - "packaging/appimage/**"
+      - ".github/workflows/appimage.yml"
+
+concurrency:
+  group: appimage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build AppImage
+    runs-on: ubuntu-22.04
+    # Needed only by the release-attach step on v* tags.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build dependencies
+        # Development headers for the dynamically-linked runtime stack:
+        # ALSA (cpal), udev (gilrs), X11/Wayland/xkb (winit), plus FUSE so the
+        # AppImage runtime and linuxdeploy can mount themselves.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxkbcommon-dev libwayland-dev \
+            libfuse2 file
+      - name: Build AppImage
+        run: ./packaging/appimage/build-appimage.sh
+      - name: Locate artifact
+        id: artifact
+        run: echo "path=$(ls Copperline-*.AppImage | head -n1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: copperline-appimage
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.artifact.outputs.path }}

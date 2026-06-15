@@ -1,0 +1,58 @@
+name: Flatpak
+
+# Builds the Flatpak bundle and runs flatpak-builder-lint, the same gate
+# Flathub applies to submissions, so manifest/metadata regressions are caught
+# before a Flathub PR. Also verifies cargo-sources.json is in sync with
+# Cargo.lock, since a stale vendored-crate list silently breaks the offline
+# build only on Flathub's servers.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packaging/flatpak/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".github/workflows/flatpak.yml"
+  pull_request:
+    paths:
+      - "packaging/flatpak/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".github/workflows/flatpak.yml"
+
+concurrency:
+  group: flatpak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-sources-fresh:
+    name: cargo-sources.json is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Regenerate and diff
+        run: |
+          ./packaging/flatpak/generate-cargo-sources.sh
+          if ! git diff --quiet packaging/flatpak/cargo-sources.json; then
+            echo "::error::cargo-sources.json is stale; run packaging/flatpak/generate-cargo-sources.sh and commit the result."
+            git --no-pager diff --stat packaging/flatpak/cargo-sources.json
+            exit 1
+          fi
+
+  build:
+    name: Build and lint bundle
+    runs-on: ubuntu-latest
+    # The flatpak-github-actions image ships flatpak-builder, the Freedesktop
+    # runtime/SDK matching the manifest, and flatpak-builder-lint.
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: copperline.flatpak
+          manifest-path: packaging/flatpak/dev.copperline.Copperline.yaml
+          cache-key: flatpak-builder-${{ github.sha }}
+          # Mirrors the manifest+repo linting Flathub runs on submissions.
+          run-tests: false

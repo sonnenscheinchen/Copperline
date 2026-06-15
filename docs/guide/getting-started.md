@@ -28,6 +28,31 @@ override to click through, unlike a downloaded prebuilt app. Use
 `brew install --HEAD copperline` to build the latest `main` instead of the
 most recent tagged release, then run `copperline` from the terminal.
 
+## Installing on Linux
+
+Two channels are provided.
+
+**Flatpak** (recommended) works on any distribution and pulls in the GPU,
+audio and portal stack from the Freedesktop runtime, so there is nothing else
+to install:
+
+```sh
+flatpak install flathub dev.copperline.Copperline
+flatpak run dev.copperline.Copperline
+```
+
+**AppImage** is a single self-contained file that needs no installation:
+download `Copperline-X.Y.Z-<arch>.AppImage` from the
+[releases page](https://github.com/LinuxJedi/Copperline/releases), then:
+
+```sh
+chmod +x Copperline-*.AppImage
+./Copperline-*.AppImage
+```
+
+Both bundle the AROS boot ROM, so they run out of the box. Packaging sources
+live in `packaging/flatpak/` and `packaging/appimage/`.
+
 ## Building
 
 ```sh

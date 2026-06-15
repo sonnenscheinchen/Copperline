@@ -68,6 +68,34 @@ brew test copperline
 brew audit --strict --formula ./Formula/copperline.rb
 ```
 
+## Linux: Flatpak and AppImage
+
+Linux distribution uses two channels (see `packaging/`).
+
+**Flatpak / Flathub** (`packaging/flatpak/`) is the primary channel. After a
+release commit lands, refresh the vendored crate list if dependencies changed
+and point the manifest at the tag:
+
+```sh
+./packaging/flatpak/generate-cargo-sources.sh   # if Cargo.lock changed
+```
+
+Set `tag:` and `commit:` in `dev.copperline.Copperline.yaml` to the release,
+add a `<release>` entry to `dev.copperline.Copperline.metainfo.xml`, then push
+the same change to the `flathub/dev.copperline.Copperline` repository (the
+Flathub app repo created at first acceptance). The `Flatpak` workflow builds
+and lints the bundle the same way Flathub does. First-time submission steps are
+in `packaging/flatpak/README.md`.
+
+**AppImage** (`packaging/appimage/`) is the no-install fallback. The `AppImage`
+workflow builds it on `ubuntu-22.04` and, on a `v*` tag, attaches
+`Copperline-X.Y.Z-<arch>.AppImage` to the GitHub Release automatically. To
+build one by hand on a Linux host:
+
+```sh
+./packaging/appimage/build-appimage.sh
+```
+
 ## Crate packaging
 
 `cargo package --no-verify --offline` can be used to inspect the source

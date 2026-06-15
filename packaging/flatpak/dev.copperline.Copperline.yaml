@@ -1,0 +1,102 @@
+# Flatpak manifest for Copperline.
+#
+# Copperline is a GUI desktop application (wgpu via pixels, audio via cpal,
+# windowing via winit, gamepads via gilrs, file dialogs via rfd). The
+# Freedesktop runtime supplies Mesa/Vulkan, PipeWire/PulseAudio and the
+# portal stack, so none of those need bundling.
+#
+# Flathub requires the build to run offline: cargo cannot reach crates.io,
+# so the dependency crates are vendored through cargo-sources.json (generated
+# from the committed Cargo.lock by generate-cargo-sources.sh) and Cargo is
+# pointed at that offline registry. The vendored m68k core is a path
+# dependency already inside the source tree, so it needs no special handling.
+#
+# Local build and test:
+#   flatpak install flathub org.freedesktop.Platform//24.08 \
+#       org.freedesktop.Sdk//24.08 org.freedesktop.Sdk.Extension.rust-stable//24.08
+#   flatpak run org.flatpak.Builder --force-clean --user --install \
+#       --install-deps-from=flathub --repo=repo builddir \
+#       packaging/flatpak/dev.copperline.Copperline.yaml
+#   flatpak run dev.copperline.Copperline
+#
+# Lint before opening a Flathub PR:
+#   flatpak run --command=flatpak-builder-lint org.flatpak.Builder \
+#       manifest packaging/flatpak/dev.copperline.Copperline.yaml
+#   flatpak run --command=flatpak-builder-lint org.flatpak.Builder \
+#       repo repo
+id: dev.copperline.Copperline
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: copperline
+
+finish-args:
+  # Windowing: Wayland preferred, X11 fallback.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # GPU acceleration for the wgpu/pixels render path.
+  - --device=dri
+  # Game controllers (gilrs reads /dev/input via udev).
+  - --device=input
+  # Audio (cpal).
+  - --socket=pulseaudio
+  # TODO(portal): Copperline opens ROM/ADF/HDF/CD images from arbitrary
+  # paths through rfd, which currently uses a non-portal backend, so it needs
+  # direct host filesystem access. Migrating rfd to its xdg-portal backend
+  # would let this be dropped in favour of the file-chooser portal, which is
+  # the Flathub-preferred approach. Until then, read-write host access is
+  # required for the file dialogs to reach the user's images.
+  - --filesystem=host
+
+modules:
+  - name: copperline
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        # Build entirely from the vendored crate archives staged by the
+        # cargo sources below; never touch the network.
+        CARGO_HOME: /run/build/copperline/cargo
+        CARGO_NET_OFFLINE: "1"
+    build-commands:
+      # Cargo.lock is committed and the crates are vendored, so --locked +
+      # --offline reproduce the pinned graph (including the vendored m68k).
+      - cargo --offline build --release --locked
+      - install -Dm755 target/release/copperline -t ${FLATPAK_DEST}/bin/
+      # Bundled AROS open-source Kickstart replacement (the default boot ROM).
+      # romsearch.rs resolves it relative to the binary via
+      # <prefix>/share/copperline/aros, i.e. /app/share/copperline/aros here.
+      # AROS is APL-licensed and freely redistributable, unlike a real
+      # Kickstart.
+      - install -Dm644 assets/aros/aros-amiga-m68k-rom.bin
+        -t ${FLATPAK_DEST}/share/copperline/aros/
+      - install -Dm644 assets/aros/aros-amiga-m68k-ext.bin
+        -t ${FLATPAK_DEST}/share/copperline/aros/
+      - install -Dm644 assets/aros/LICENSE
+        ${FLATPAK_DEST}/share/copperline/aros/LICENSE
+      # Desktop integration metadata.
+      - install -Dm644 packaging/flatpak/dev.copperline.Copperline.desktop
+        ${FLATPAK_DEST}/share/applications/dev.copperline.Copperline.desktop
+      - install -Dm644 packaging/flatpak/dev.copperline.Copperline.metainfo.xml
+        ${FLATPAK_DEST}/share/metainfo/dev.copperline.Copperline.metainfo.xml
+      - install -Dm644 assets/brand/copperline-icon.png
+        ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/dev.copperline.Copperline.png
+      # Flathub requires the project license to be installed.
+      - install -Dm644 LICENSE
+        ${FLATPAK_DEST}/share/licenses/dev.copperline.Copperline/LICENSE
+    sources:
+      # For Flathub the source is the tagged release; switch this to
+      #   - type: dir
+      #     path: ../..
+      # for fast local iteration against the working tree.
+      - type: git
+        url: https://github.com/LinuxJedi/Copperline.git
+        tag: v0.1.0
+        commit: 5c91918761c48431cca100d803d16f07fbdda904
+      # Vendored crate archives + cargo config pointing at the offline
+      # registry. Regenerate with packaging/flatpak/generate-cargo-sources.sh
+      # whenever Cargo.lock changes.
+      - cargo-sources.json

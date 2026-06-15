@@ -45,3 +45,8 @@ copperline-video-*.avi
 
 # MyST documentation build output (see docs/README.md).
 /docs/_build
+
+# Linux AppImage build artifacts (packaging/appimage/build-appimage.sh).
+/AppDir
+/.appimage-tools
+/*.AppImage
