@@ -804,7 +804,19 @@ fn run_headless_benchmark(mut emu: Emulator, target_secs: f32) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let mut log_builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    // Copperline reads raw gamepad axis/button codes with gilrs's SDL
+    // controller mappings disabled (see gamepad.rs) and applies its own
+    // per-UUID calibration from gamepads.toml. gilrs's mapping subsystem is
+    // therefore unused, so its "No mapping found for UUID ...; default mapping
+    // will be used" warnings are misleading noise even when the pad works.
+    // Silence gilrs below error level unless the user has explicitly asked for
+    // its logs via RUST_LOG.
+    if std::env::var_os("RUST_LOG").is_none() {
+        log_builder.filter_module("gilrs", log::LevelFilter::Error);
+    }
+    log_builder.init();
 
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

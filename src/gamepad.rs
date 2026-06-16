@@ -252,6 +252,9 @@ pub struct GamepadReader {
     raw: Option<RawGamepads>,
     store: CalibrationStore,
     warned_uncalibrated: bool,
+    /// UUID of the pad whose calibration we last announced as in use, so we
+    /// log it once per pad (and again if a different pad is plugged in).
+    logged_calibrated: Option<String>,
 }
 
 impl GamepadReader {
@@ -267,6 +270,7 @@ impl GamepadReader {
             raw,
             store: CalibrationStore::load(),
             warned_uncalibrated: false,
+            logged_calibrated: None,
         }
     }
 
@@ -297,6 +301,8 @@ impl GamepadReader {
             .insert(uuid.to_string(), session.to_calibration());
         self.store.save()?;
         self.warned_uncalibrated = false;
+        // Re-announce on the next poll now that a (new) calibration is live.
+        self.logged_calibrated = None;
         Ok(())
     }
 
@@ -309,7 +315,13 @@ impl GamepadReader {
         let pad = raw.gilrs.gamepad(id);
         let uuid = uuid_hex(pad.uuid());
         match self.store.get(&uuid) {
-            Some(cal) => Some(cal.resolve(&raw.axes, &raw.buttons)),
+            Some(cal) => {
+                if self.logged_calibrated.as_deref() != Some(uuid.as_str()) {
+                    self.logged_calibrated = Some(uuid.clone());
+                    log::info!("using saved calibration for gamepad \"{}\"", pad.name());
+                }
+                Some(cal.resolve(&raw.axes, &raw.buttons))
+            }
             None => {
                 if !self.warned_uncalibrated {
                     self.warned_uncalibrated = true;
