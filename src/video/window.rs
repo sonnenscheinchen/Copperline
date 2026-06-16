@@ -6750,7 +6750,7 @@ mod tests {
 
     fn test_app_with_audio(audio: Box<dyn AudioSink>) -> super::App {
         use crate::chipset::paula::Paula;
-        use crate::config::{CpuModel, PacingBudget, SpeedMode};
+        use crate::config::{CpuModel, PacingBudget};
         use crate::emulator::Emulator;
         use crate::floppy::FloppyController;
         use crate::memory::{Memory, ROM_BASE, ROM_SIZE};
@@ -6778,17 +6778,8 @@ mod tests {
             Paula::new(Box::new(StdoutSink::new()), audio),
             FloppyController::default(),
         );
-        let emu = Emulator::new(
-            bus,
-            CpuModel::M68000,
-            false,
-            SpeedMode::Real,
-            PacingBudget::Cycles,
-            2,
-            false,
-            false,
-        )
-        .expect("test emulator");
+        let emu = Emulator::new(bus, CpuModel::M68000, false, PacingBudget::Cycles, 2, false)
+            .expect("test emulator");
         super::App::new(
             emu,
             true,

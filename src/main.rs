@@ -676,7 +676,7 @@ fn print_help() {
          \n\
          If ROM is given on the command line it overrides the rom path from\n\
          the config. If no config file exists, built-in defaults are used:\n  \
-         CPU: 68000   speed: real   chip RAM: 512K   fast RAM: 0   slow RAM: 0   chipset: OCS   ROM: diagrom.rom"
+         CPU: 68000   chip RAM: 512K   fast RAM: 0   slow RAM: 0   chipset: OCS   ROM: diagrom.rom"
     );
 }
 
@@ -823,11 +823,10 @@ fn main() -> Result<()> {
     let disk_insert_after = resolve_disk_insert_after(&mut cfg, cli.disk_insert_after)?;
 
     info!(
-        "config: cpu={:?} fpu={} cpu_clock={}MHz speed={:?} chip_ram={}K fast_ram={}K slow_ram={}K z3_ram={}K zorro_boards={} chipset={:?} (agnus={:?} denise={:?}) video={:?} rom={} floppy_drives={}",
+        "config: cpu={:?} fpu={} cpu_clock={}MHz chip_ram={}K fast_ram={}K slow_ram={}K z3_ram={}K zorro_boards={} chipset={:?} (agnus={:?} denise={:?}) video={:?} rom={} floppy_drives={}",
         cfg.cpu,
         cfg.fpu,
         cfg.cpu_clock_mhz,
-        cfg.emulation.speed,
         cfg.chip_ram_bytes / 1024,
         cfg.fast_ram_bytes / 1024,
         cfg.slow_ram_bytes / 1024,
@@ -984,10 +983,8 @@ fn main() -> Result<()> {
         bus,
         cfg.cpu,
         cfg.fpu,
-        cfg.emulation.speed,
         cfg.emulation.pacing_budget,
         cpu_clocks_per_cck,
-        cli.audio_live,
         paced,
     )?;
     emu.set_cache_emulation(cfg.cpu_icache, cfg.cpu_dcache);

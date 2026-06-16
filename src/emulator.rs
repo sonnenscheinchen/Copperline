@@ -6,7 +6,7 @@
 
 use crate::audio::{audio_profile_enabled, AudioRuntimeStatus};
 use crate::bus::Bus;
-use crate::config::{CpuModel, PacingBudget, SpeedMode};
+use crate::config::{CpuModel, PacingBudget};
 use crate::cpu;
 use anyhow::Result;
 use std::time::{Duration, Instant};
@@ -44,7 +44,6 @@ fn diag_cck_on() -> bool {
 pub struct Emulator {
     pub machine: cpu::M68kMachine,
     pub stats: EmuStats,
-    timing_mode: RuntimeTiming,
     /// When true, pace presentation to wall-clock time (interactive
     /// window). When false, run the deterministic core unthrottled
     /// (headless screenshot/frame-dump runs). The emulated result is
@@ -227,26 +226,13 @@ impl RealPacingProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeTiming {
-    /// The single emulation timing: CPU and chipset/audio advance together
-    /// in emulated time. (Turbo's host-time-paced slicing was removed; it
-    /// was non-deterministic and landed CPU register writes at jittery beam
-    /// positions.)
-    Real,
-}
-
-impl RuntimeTiming {
-    fn from_config(speed_mode: SpeedMode, _live_audio: bool) -> Self {
-        match speed_mode {
-            SpeedMode::Real => Self::Real,
-        }
-    }
-
-    fn realtime_budget(self, cpu_cycles_per_instruction: f64) -> (usize, f64) {
-        let target = real_target_instructions_per_second(cpu_cycles_per_instruction);
-        ((target / 60.0).round().max(1.0) as usize, target)
-    }
+/// Per-frame instruction quantum and the target instructions/second for the
+/// deterministic real-time core. CPU and chipset/audio advance together in
+/// emulated time; presentation is wall-clock paced for the window and
+/// unthrottled for headless runs, but the emulated result is identical.
+fn realtime_budget(cpu_cycles_per_instruction: f64) -> (usize, f64) {
+    let target = real_target_instructions_per_second(cpu_cycles_per_instruction);
+    ((target / 60.0).round().max(1.0) as usize, target)
 }
 
 fn real_cpu_cycles_per_instruction() -> f64 {
@@ -319,13 +305,10 @@ impl Emulator {
         bus: Bus,
         cpu_model: CpuModel,
         fpu_enabled: bool,
-        speed_mode: SpeedMode,
         pacing_budget: PacingBudget,
         cpu_clocks_per_cck: u32,
-        live_audio: bool,
         paced: bool,
     ) -> Result<Self> {
-        let timing_mode = RuntimeTiming::from_config(speed_mode, live_audio);
         let cpu_clocks_per_cck = cpu_clocks_per_cck.max(1);
         // The pacing math is expressed against the stock 2-clocks-per-CCK
         // 68000 ratio. An accelerated CPU runs at `cpu_clocks_per_cck` clocks
@@ -356,7 +339,6 @@ impl Emulator {
         Ok(Self {
             machine,
             stats: EmuStats::default(),
-            timing_mode,
             paced,
             cpu_cycles_per_instruction,
             real_pacing_budget_mode,
@@ -549,9 +531,7 @@ impl Emulator {
         if self.stats.started_at.is_none() {
             self.stats.started_at = Some(std::time::Instant::now());
         }
-        match self.timing_mode {
-            RuntimeTiming::Real => self.step_real()?,
-        }
+        self.step_real()?;
         self.stats.frames += 1;
         if crate::envcfg::flag("COPPERLINE_DIAG_PCSAMPLE") && self.stats.frames.is_multiple_of(50) {
             log::info!(
@@ -703,9 +683,7 @@ impl Emulator {
     }
 
     fn instruction_budget(&mut self) -> usize {
-        let (quantum, _target) = self
-            .timing_mode
-            .realtime_budget(self.cpu_cycles_per_instruction);
+        let (quantum, _target) = realtime_budget(self.cpu_cycles_per_instruction);
         quantum
     }
 
@@ -881,12 +859,12 @@ fn realtime_device_time_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        cck_for_instructions, instructions_for_cck_value, real_slice_accounting, ExecutedSlice,
-        RealPacingBudgetMode, RealPacingProfile, RuntimeTiming, DEFAULT_CPU_CYCLES_PER_INSTRUCTION,
+        cck_for_instructions, instructions_for_cck_value, real_slice_accounting, realtime_budget,
+        ExecutedSlice, RealPacingBudgetMode, RealPacingProfile, DEFAULT_CPU_CYCLES_PER_INSTRUCTION,
     };
     use crate::audio::AudioRuntimeStatus;
 
-    use crate::config::{PacingBudget, SpeedMode};
+    use crate::config::PacingBudget;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1143,24 +1121,12 @@ mod tests {
     }
 
     #[test]
-    fn config_speed_maps_to_the_single_real_timing() {
-        assert_eq!(
-            RuntimeTiming::from_config(SpeedMode::Real, true),
-            RuntimeTiming::Real
-        );
-        assert_eq!(
-            RuntimeTiming::from_config(SpeedMode::Real, false),
-            RuntimeTiming::Real
-        );
-    }
-
-    #[test]
     fn real_mode_uses_stock_realtime_budget() {
         std::env::remove_var("COPPERLINE_REAL_CPU_CPI");
         let cpu_cycles_per_instruction = super::real_cpu_cycles_per_instruction();
         let target = super::real_target_instructions_per_second(cpu_cycles_per_instruction);
         assert_eq!(
-            RuntimeTiming::Real.realtime_budget(cpu_cycles_per_instruction),
+            realtime_budget(cpu_cycles_per_instruction),
             ((target / 60.0).round() as usize, target)
         );
     }

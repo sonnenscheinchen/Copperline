@@ -9,12 +9,11 @@
 rom = "kickstart.rom"
 
 [emulation]
-# Execution pacing. "real" is the only timing model: the CPU, chipset,
-# CIA, audio, floppy, and chip-bus timing all advance on one deterministic
-# clock that approximates a stock PAL Amiga 68000. ("turbo" is accepted as
-# a deprecated alias for "real".) Use --noaudio for silent runs, or
-# --audio-wav for emulated-time WAV capture.
-speed = "real"
+# The CPU, chipset, CIA, audio, floppy, and chip-bus timing all advance on
+# one deterministic clock that approximates a stock PAL Amiga 68000. Use
+# --noaudio for silent runs, or --audio-wav for emulated-time WAV capture.
+# (An old "speed" key here is accepted but ignored: "real" was the only
+# timing model, so it carried no information.)
 # Whether the machine is powered on at launch. When false, the emulator
 # sits powered off showing a test screen until you click the power button
 # on the status bar -- useful for arming video capture first. The power
@@ -58,7 +57,7 @@ model = "68000"
 # [memory] sections still override the profile defaults. Without this
 # section the legacy A500-like defaults apply.
 # [machine]
-# model = "A600"        # A500 | A500Plus | A600 | A1200 | CDTV | CD32
+# profile = "A600"      # A500 | A500Plus | A600 | A1200 | CDTV | CD32
 # rtc = true            # $DC0000 RTC fitted (base A600 shipped without)
 
 # Extended ROM image for CDTV/CD32 machines: a 256 KiB image maps at

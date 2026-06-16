@@ -18,7 +18,7 @@ range checks as the equivalent TOML fields:
 
 | Flag | Overrides | Accepts |
 |---|---|---|
-| `--model NAME` | `[machine] model` | `A500`, `A500Plus`, `A600`, `A1200`, `CDTV`, `CD32` |
+| `--model NAME` | `[machine] profile` | `A500`, `A500Plus`, `A600`, `A1200`, `CDTV`, `CD32` |
 | `--chipset NAME` | `[chipset] revision` | `OCS`, `ECS`, `AGA` |
 | `--cpu MODEL` | `[cpu] model` | `68000`, `68EC020`, `68020`, `68030`, `68040` |
 | `--cpu-clock MHZ` | `[cpu] clock_mhz` | a number of MHz |
@@ -61,12 +61,13 @@ missing.
 
 ```toml
 [machine]
-model = "A1200"   # A500, A500Plus (A500+), A600, A1200, CDTV, CD32
+profile = "A1200" # A500, A500Plus (A500+), A600, A1200, CDTV, CD32
 rtc = true        # whether the $DC0000 battery RTC is fitted
 ```
 
 A machine profile bundles the chipset, CPU, memory, gate array, and
-peripheral defaults of a real machine. Explicit `[cpu]`, `[chipset]`, and
+peripheral defaults of a real machine. The key is `profile` (the deprecated
+`model` alias still parses) so it never collides with `[cpu] model`. Explicit `[cpu]`, `[chipset]`, and
 `[memory]` sections override individual profile defaults. Without a
 `[machine]` section you get legacy A500-like defaults (OCS, 68000, 512K
 chip RAM).
@@ -88,14 +89,16 @@ clock works.
 
 ```toml
 [emulation]
-speed = "real"             # the only timing model ("turbo" is a deprecated alias)
 power_on = true            # false = start powered off at the test screen
 pacing_budget = "cycles"   # "cycles" (hardware-accurate) or "instructions"
 ```
 
-- `speed`: the deterministic cycle-driven core is the only emulation
-  timing. It is paced to wall-clock for the interactive window and runs
-  unthrottled for headless captures; the emulated result is identical.
+The deterministic cycle-driven core is the only emulation timing. It is
+paced to wall-clock for the interactive window and runs unthrottled for
+headless captures; the emulated result is identical. (An older `speed` key
+here is accepted but ignored -- "real" was the only timing model, so it
+carried no information.)
+
 - `power_on = false` starts the machine powered off showing a test screen
   until you click the status-bar power button -- useful for arming video
   capture first. The power button cold-boots (clears RAM).
@@ -252,7 +255,7 @@ swap button cycles to the next image, wrapping around.
 
 ```toml
 [machine]
-model = "A600"               # IDE needs a Gayle machine (A600 or A1200)
+profile = "A600"             # IDE needs a Gayle machine (A600 or A1200)
 
 [ide]
 master = "AmigaSYS.hdf"      # raw flat HDF, read/write
@@ -321,7 +324,7 @@ in-memory FFS volumes. The HDD activity LED covers SCSI traffic too.
 
 ```toml
 [machine]
-model = "CD32"
+profile = "CD32"
 
 [cd]
 image = "disc.cue"        # BIN/CUE cue sheet (MODE1/2048, MODE1/2352, AUDIO)

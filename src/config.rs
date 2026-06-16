@@ -144,7 +144,6 @@ impl ScsiConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Emulation {
-    pub speed: SpeedMode,
     /// Whether the machine starts running (powered on) at launch. When
     /// false, the emulator sits powered off showing a test screen until
     /// the status-bar power button is clicked -- handy for arming video
@@ -214,15 +213,6 @@ pub struct FloppyDriveConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpeedMode {
-    /// The only emulation timing: a deterministic, cycle-driven core.
-    /// Presentation is wall-clock paced for the interactive window and
-    /// unthrottled for headless runs; the emulated result is identical
-    /// either way.
-    Real,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuModel {
     M68000,
     M68EC020,
@@ -273,7 +263,7 @@ pub enum Chipset {
     Aga,
 }
 
-/// `[machine] model`: a validated bundle of chipset revisions, CPU model and
+/// `[machine] profile`: a validated bundle of chipset revisions, CPU model and
 /// clock, memory sizes, RTC presence, and gate array. Explicit `[cpu]`/
 /// `[chipset]`/`[memory]` sections override the profile defaults where
 /// compatible; the profile owns what those sections cannot express (Gayle,
@@ -327,7 +317,6 @@ impl Default for Config {
             cpu_icache: false,
             cpu_dcache: false,
             emulation: Emulation {
-                speed: SpeedMode::Real,
                 power_on: true,
                 pacing_budget: PacingBudget::Cycles,
             },
@@ -445,7 +434,7 @@ impl ConfigOverrides {
     /// the file (or its absence) provided. Conversion validates the result.
     fn apply_to(&self, raw: &mut RawConfig) {
         if let Some(model) = &self.model {
-            raw.machine.model = Some(model.clone());
+            raw.machine.profile = Some(model.clone());
         }
         if let Some(chipset) = &self.chipset {
             raw.chipset.revision = Some(chipset.clone());
@@ -568,6 +557,9 @@ struct RawCpu {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawEmulation {
+    /// Deprecated and ignored: "real" was the only remaining timing model,
+    /// so the option carried no information. Still accepted (and warned
+    /// about) so existing configs that name it keep parsing.
     speed: Option<String>,
     power_on: Option<bool>,
     pacing_budget: Option<String>,
@@ -594,7 +586,12 @@ struct RawZorroBoard {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMachine {
-    model: Option<String>,
+    /// Machine profile name. Named `profile` (not `model`) so it never
+    /// collides with `[cpu] model`: an uncommented profile line landing in
+    /// the wrong table would otherwise be a confusing duplicate-key error.
+    /// `model` stays accepted as a deprecated alias for old configs.
+    #[serde(alias = "model")]
+    profile: Option<String>,
     /// Whether the $DC0000 RTC is fitted; defaults per profile (the base
     /// A600 had none, the A600HD did -- default keeps it fitted so the
     /// guest OS clock works).
@@ -647,7 +644,7 @@ impl TryFrom<RawConfig> for Config {
     type Error = anyhow::Error;
 
     fn try_from(raw: RawConfig) -> Result<Self> {
-        let machine = match raw.machine.model.as_deref() {
+        let machine = match raw.machine.profile.as_deref() {
             None => None,
             Some(s) => Some(parse_machine_model(s)?),
         };
@@ -684,11 +681,13 @@ impl TryFrom<RawConfig> for Config {
         if cpu_dcache && cpu != CpuModel::M68030 {
             bail!("[cpu] dcache = true needs a 68030 (the 68020 has no data cache)");
         }
+        if let Some(speed) = raw.emulation.speed.as_deref() {
+            log::warn!(
+                "[emulation] speed = {speed:?} is deprecated and ignored: the \
+                 deterministic cycle-driven core is the only timing model"
+            );
+        }
         let emulation = Emulation {
-            speed: match raw.emulation.speed.as_deref() {
-                None => defaults.emulation.speed,
-                Some(s) => parse_speed(s)?,
-            },
             power_on: raw
                 .emulation
                 .power_on
@@ -755,7 +754,7 @@ impl TryFrom<RawConfig> for Config {
             slave: raw.ide.slave.map(PathBuf::from),
         };
         if (ide.master.is_some() || ide.slave.is_some()) && defaults.gate_array == GateArray::None {
-            bail!("[ide] images need a Gayle machine: set [machine] model = \"A600\" (or A1200)");
+            bail!("[ide] images need a Gayle machine: set [machine] profile = \"A600\" (or A1200)");
         }
 
         let scsi = ScsiConfig {
@@ -868,20 +867,6 @@ pub(crate) fn parse_overscan(s: &str) -> Result<Overscan> {
     }
 }
 
-fn parse_speed(s: &str) -> Result<SpeedMode> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "turbo" => {
-            log::warn!(
-                "emulation speed \"turbo\" is deprecated and now runs the single \
-                 deterministic timing; ignoring"
-            );
-            Ok(SpeedMode::Real)
-        }
-        "real" => Ok(SpeedMode::Real),
-        _ => Err(anyhow!("unknown emulation speed {:?}: expected real", s)),
-    }
-}
-
 fn parse_pacing_budget(s: &str) -> Result<PacingBudget> {
     match s.trim().to_ascii_lowercase().as_str() {
         "cycles" | "m68k-cycles" => Ok(PacingBudget::Cycles),
@@ -937,7 +922,7 @@ fn parse_machine_model(s: &str) -> Result<MachineModel> {
     }
 }
 
-/// The defaults a `[machine] model` profile supplies before the explicit
+/// The defaults a `[machine] profile` supplies before the explicit
 /// `[cpu]`/`[chipset]`/`[memory]` sections override them.
 fn machine_profile_defaults(model: MachineModel) -> Config {
     let mut d = Config {
@@ -1261,49 +1246,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_emulation_defaults_to_real() -> Result<()> {
+    fn missing_emulation_uses_defaults() -> Result<()> {
         let cfg = parse_config("")?;
-        assert_eq!(cfg.emulation.speed, SpeedMode::Real);
+        assert!(cfg.emulation.power_on);
+        assert_eq!(cfg.emulation.pacing_budget, PacingBudget::Cycles);
         Ok(())
     }
 
     #[test]
-    fn deprecated_speed_turbo_maps_to_real() -> Result<()> {
-        let cfg = parse_config(
-            r#"
-            [emulation]
-            speed = "turbo"
-            "#,
-        )?;
-        assert_eq!(cfg.emulation.speed, SpeedMode::Real);
+    fn deprecated_speed_option_is_accepted_and_ignored() -> Result<()> {
+        // `[emulation] speed` was removed once "real" became the only timing
+        // model. Any value is now tolerated (and warned about) so old configs
+        // still parse, but it has no effect.
+        for value in ["real", "turbo", "warp"] {
+            parse_config(&format!("[emulation]\nspeed = {value:?}\n"))?;
+        }
         Ok(())
-    }
-
-    #[test]
-    fn speed_real_parses() -> Result<()> {
-        let cfg = parse_config(
-            r#"
-            [emulation]
-            speed = "real"
-            "#,
-        )?;
-        assert_eq!(cfg.emulation.speed, SpeedMode::Real);
-        Ok(())
-    }
-
-    #[test]
-    fn invalid_speed_fails_cleanly() {
-        let err = parse_config(
-            r#"
-            [emulation]
-            speed = "warp"
-            "#,
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("unknown emulation speed"),
-            "{err:#}"
-        );
     }
 
     #[test]
@@ -1377,7 +1335,7 @@ mod tests {
         let cfg = parse_config(
             r#"
             [machine]
-            model = "A600"
+            profile = "A600"
             "#,
         )?;
         assert_eq!(cfg.machine, Some(MachineModel::A600));
@@ -1394,7 +1352,7 @@ mod tests {
         let cfg = parse_config(
             r#"
             [machine]
-            model = "A600"
+            profile = "A600"
             rtc = false
             [memory]
             chip = "2M"
@@ -1406,7 +1364,7 @@ mod tests {
         let cfg = parse_config(
             r#"
             [machine]
-            model = "A500Plus"
+            profile = "A500Plus"
             "#,
         )?;
         assert_eq!(cfg.chipset, Chipset::Ecs);
@@ -1417,7 +1375,7 @@ mod tests {
         let cfg = parse_config(
             r#"
             [machine]
-            model = "A1200"
+            profile = "A1200"
             "#,
         )?;
         assert_eq!(cfg.cpu, CpuModel::M68EC020);
@@ -1428,11 +1386,33 @@ mod tests {
         let err = parse_config(
             r#"
             [machine]
-            model = "A4000"
+            profile = "A4000"
             "#,
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown machine model"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn machine_profile_accepts_deprecated_model_alias() -> Result<()> {
+        // `[machine] model` was the original key name; it now collides
+        // visually with `[cpu] model`, so the canonical key is `profile`.
+        // The old name stays accepted so existing configs keep working.
+        let by_alias = parse_config(
+            r#"
+            [machine]
+            model = "A1200"
+            "#,
+        )?;
+        let by_profile = parse_config(
+            r#"
+            [machine]
+            profile = "A1200"
+            "#,
+        )?;
+        assert_eq!(by_alias.machine, Some(MachineModel::A1200));
+        assert_eq!(by_alias.machine, by_profile.machine);
         Ok(())
     }
 
@@ -1450,7 +1430,7 @@ mod tests {
         let cfg = parse_config(
             r#"
             [machine]
-            model = "A600"
+            profile = "A600"
             [ide]
             master = "disk.hdf"
             "#,
@@ -1745,7 +1725,8 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("boot ROM"), "{err:#}");
 
-        // SCSI works on any machine model (no Gayle requirement).
+        // SCSI works on any machine model (no Gayle requirement). This also
+        // exercises the deprecated `model` alias for `[machine] profile`.
         let cfg = parse_config(
             r#"
             [machine]
