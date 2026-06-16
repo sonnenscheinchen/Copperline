@@ -578,6 +578,9 @@ impl Emulator {
                 let idle_cck = accounting.slice_cck.saturating_sub(run.bus_advanced_cck);
                 self.bus_mut().advance_devices(idle_cck);
             }
+            // `refresh_irq_line` applies any deferred timed-device color clocks
+            // before sampling the interrupt line (see its body), so a device
+            // interrupt that came due during the slice is recognized here.
             self.machine.refresh_irq_line();
             self.real_pacing_profile.record_slice(&run, accounting);
             // An interactive breakpoint/watch hit ends the frame early;

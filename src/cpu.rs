@@ -1055,6 +1055,13 @@ impl M68kMachine {
     }
 
     pub fn refresh_irq_line(&mut self) {
+        // Apply any timed-device color clocks the last instruction's bus
+        // accesses deferred before sampling the interrupt line. This runs at the
+        // top of `service_pending_irq_cycles`, i.e. before every instruction, so
+        // a device interrupt that came due during the previous instruction is
+        // recognized at the correct boundary even within a multi-instruction
+        // core slice.
+        self.bus.bus.flush_timed_devices();
         let level = self.pending_irq_level();
         self.cpu.set_irq(level);
     }
@@ -1175,6 +1182,12 @@ impl M68kMachine {
             }
         }
 
+        // Apply the final instruction's deferred timed-device color clocks
+        // (per-instruction flushes happen at the top of the next
+        // `refresh_irq_line`, so the last one would otherwise stay pending).
+        // This keeps `pending_device_cck` zero at every slice boundary, where
+        // save states are taken -- the accumulator is not serialized.
+        self.bus.bus.flush_timed_devices();
         self.bus.bus.set_cpu_bus_arbitration_enabled(false);
         let (bus_advanced_cck, _bus_tick) = self.bus.bus.take_slice_bus_advance();
         if stopped {

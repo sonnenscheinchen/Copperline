@@ -566,6 +566,18 @@ pub struct Bus {
     blitter_slowdown_cpu_misses: u8,
     slice_bus_advanced_cck: u32,
     slice_bus_tick: AgnusTick,
+    // Deferred timed-device clock. Ticking CIA/serial/pots/audio/floppy/Akiko
+    // once per CPU bus access dominated the host profile; instead accumulate the
+    // color clocks here and `flush_timed_devices` them in one batch only when a
+    // device is actually observed (a CIA/custom/peripheral access) or at an
+    // instruction boundary (interrupt recognition). The CIA E-clock divider and
+    // every device tick are exact under batching, so observable timing is
+    // unchanged. Transient (always flushed to zero at frame boundaries, where
+    // save states are taken), so skipped from serialization.
+    #[serde(skip)]
+    pending_device_cck: u32,
+    #[serde(skip)]
+    pending_device_tick: AgnusTick,
     audio_pending_cck: u32,
     last_chip_bus_owner: ChipBusOwner,
     device_clock: DeviceClock,
@@ -1439,6 +1451,8 @@ impl Bus {
             blitter_slowdown_cpu_misses: 0,
             slice_bus_advanced_cck: 0,
             slice_bus_tick: AgnusTick::default(),
+            pending_device_cck: 0,
+            pending_device_tick: AgnusTick::default(),
             audio_pending_cck: 0,
             last_chip_bus_owner: ChipBusOwner::Idle,
             device_clock: DeviceClock::default(),
@@ -2195,6 +2209,11 @@ impl Bus {
         let cck = words * 2;
         let tick = self.advance_chipset(cck);
         self.record_slice_bus_advance(cck, tick);
+        // This access targets a motherboard peripheral (CIA, RTC, Akiko, Gayle,
+        // A2091, autoconfig). The caller reads/writes the device immediately
+        // after, so apply the deferred device clocks now -- including this
+        // access -- so the device reflects time right up to the observation.
+        self.flush_timed_devices();
     }
 
     /// The bus advance accumulated so far in the current CPU slice (color
@@ -2369,6 +2388,10 @@ impl Bus {
     }
 
     pub fn advance_devices(&mut self, cck: u32) -> AgnusTick {
+        // Apply any color clocks deferred by the CPU access path before ticking
+        // this (idle/stopped-CPU or test-driven) span, so device time stays
+        // ordered, then tick this span directly.
+        self.flush_timed_devices();
         let tick = self.advance_chipset(cck);
         self.tick_timed_devices(cck, tick);
         tick
@@ -3001,6 +3024,10 @@ impl Bus {
 
     pub fn custom_read(&mut self, addr: u64, size: usize) -> u64 {
         self.grant_cpu_bus_access(size, CpuBusAccessKind::Custom);
+        // Read-only custom registers (INTREQR, DSKBYTR, SERDATR, POTxDAT, ...)
+        // reflect timed-device state, so apply the deferred device clocks before
+        // reading.
+        self.flush_timed_devices();
         let off = (addr & 0xFFF) as u16;
         self.poll_stats.tick_read_custom(off & 0xFFE);
         match size {
@@ -3036,6 +3063,11 @@ impl Bus {
     /// delivered before agnus has a chance to OR in VERTB.
     pub fn custom_write(&mut self, addr: u64, size: usize, val: u64) -> bool {
         self.grant_cpu_bus_access(size, CpuBusAccessKind::Custom);
+        // Apply deferred device clocks before the write lands: registers such as
+        // INTREQ/INTENA/ADKCON/DSKLEN/AUDxxx/SERDAT change timed-device state, so
+        // the device must first be advanced to this color clock (e.g. so a
+        // pending IRQ is latched before an INTREQ clear).
+        self.flush_timed_devices();
         let off = (addr & 0xFFF) as u16;
         match size {
             1 => {
@@ -5556,6 +5588,28 @@ impl Bus {
         if self.device_clock.realtime_enabled {
             self.device_clock.note_realtime_device_advance(cck);
         }
+        // Defer the timed-device tick: accumulate these color clocks and apply
+        // them in one batch at the next device observation or instruction
+        // boundary (see `flush_timed_devices`). The chipset/beam advance above
+        // already happened per color clock; only the CIA/serial/pots/audio/
+        // floppy/Akiko devices, whose state the CPU can only observe through a
+        // register read or an interrupt, are batched.
+        self.pending_device_cck = self.pending_device_cck.saturating_add(cck);
+        add_agnus_tick(&mut self.pending_device_tick, tick);
+    }
+
+    /// Apply any deferred timed-device color clocks (see `record_slice_bus_
+    /// advance`). Called before every device-register observation (CIA, custom,
+    /// and other peripheral reads/writes) and at each instruction boundary, so
+    /// the CPU never sees a stale device or a late interrupt. Batching is exact:
+    /// the CIA E-clock divider carries its remainder and every device tick is
+    /// linear in the color-clock count.
+    pub fn flush_timed_devices(&mut self) {
+        let cck = std::mem::take(&mut self.pending_device_cck);
+        if cck == 0 {
+            return;
+        }
+        let tick = std::mem::take(&mut self.pending_device_tick);
         self.tick_timed_devices(cck, tick);
     }
 
@@ -9212,6 +9266,7 @@ mod tests {
         bus.device_clock.realtime_enabled = true;
 
         bus.record_slice_bus_advance(2, AgnusTick::default());
+        bus.flush_timed_devices();
 
         assert_eq!(bus.device_clock.cia_tick_remainder_cck, 2);
     }
@@ -9223,11 +9278,15 @@ mod tests {
         bus.cia_b.write(REG_TBHI, 0);
         bus.cia_b.write(REG_CRB, 0x11);
 
+        // Device ticks are deferred from the per-access advance and applied in
+        // one batch at the next observation/boundary; flush to apply them here.
         bus.record_slice_bus_advance(10, AgnusTick::default());
+        bus.flush_timed_devices();
         assert_eq!(bus.cia_b.tb_count, 2);
 
         // The cycle-exact model has no post-slice reconciliation: a slice whose
         // bus time fully covered its device time advances nothing afterwards.
+        // (advance_devices flushes pending first, then ticks its own 0 cck.)
         bus.advance_devices(0);
         assert_eq!(bus.cia_b.tb_count, 2);
     }
