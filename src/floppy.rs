@@ -164,6 +164,15 @@ pub struct FloppyController {
     // drive's head rotates, it detects DSKSYNC bit-aligned and frames read-DMA
     // words off the sync bit phase.
     read_shifter: PaulaDiskReadDpllFifo,
+    /// Cached `is_idle()` so the per-CPU-access device tick can skip the whole
+    /// floppy block (an `is_idle()` recompute, plus the IRQ/sound polling) with
+    /// a single bool read while the mechanism is quiescent -- which it is for
+    /// almost all of normal running. Set false the moment any register/select
+    /// write could activate the drive (conservative; an extra tick at worst),
+    /// and recomputed exactly at the top of `tick`. `serde(default)` keeps old
+    /// save states loadable: the default `false` just costs one settling tick.
+    #[serde(default)]
+    idle_cache: bool,
 }
 
 impl Default for FloppyController {
@@ -197,6 +206,8 @@ impl Default for FloppyController {
             dma_addr_mask: 0x001F_FFFF,
             sound_steps: 0,
             read_shifter: PaulaDiskReadDpllFifo::new(),
+            // Idle at power-on; the first tick confirms it.
+            idle_cache: true,
         }
     }
 }
@@ -298,6 +309,7 @@ impl FloppyController {
         };
         let image = FloppyImage::load(&config)
             .with_context(|| format!("loading floppy.df{} image", drive_idx))?;
+        self.idle_cache = false;
         self.drives[drive_idx].insert_image(image);
         if self.selected_drive() == Some(drive_idx) {
             self.ensure_track(drive_idx, self.track_for_drive(drive_idx));
@@ -311,11 +323,13 @@ impl FloppyController {
             "invalid floppy drive df{}",
             drive_idx
         );
+        self.idle_cache = false;
         self.drives[drive_idx].eject_image();
         Ok(())
     }
 
     pub fn reset_external_drives(&mut self) {
+        self.idle_cache = false;
         for drive in self.drives.iter_mut().skip(1) {
             drive.reset_external_signal();
         }
@@ -325,6 +339,9 @@ impl FloppyController {
     }
 
     pub fn write_prb(&mut self, val: u8) {
+        // Drive select / motor / step may wake the mechanism; force the device
+        // tick to re-evaluate (recomputed exactly in `tick`).
+        self.idle_cache = false;
         let prev = self.prb;
         self.prb = val;
         // DSKSIDE is active-low on Amiga drives: 0 selects the upper
@@ -387,6 +404,7 @@ impl FloppyController {
     }
 
     pub fn write_dskdat(&mut self, val: u16) {
+        self.idle_cache = false;
         self.dskdat = val;
         if self.dma.is_some() || self.dsklen & DSKLEN_WRITE == 0 {
             return;
@@ -463,6 +481,7 @@ impl FloppyController {
     }
 
     pub fn write_dsklen(&mut self, val: u16, adkcon: u16) -> bool {
+        self.idle_cache = false;
         self.dsklen = val;
 
         if val & DSKLEN_DMAEN == 0 {
@@ -610,8 +629,16 @@ impl FloppyController {
             && self.drives.iter().all(FloppyDrive::is_settled)
     }
 
+    /// Cheap idle test for the per-CPU-access device tick: the cached result
+    /// of the last `is_idle()` recompute. Always reflects current state because
+    /// every activation path clears it and `tick` recomputes it.
+    pub fn is_idle_cached(&self) -> bool {
+        self.idle_cache
+    }
+
     pub fn tick(&mut self, cck: u32, dmacon: u16, chip_ram: &mut [u8]) -> bool {
-        if self.is_idle() {
+        self.idle_cache = self.is_idle();
+        if self.idle_cache {
             return false;
         }
         self.tick_index_pulse(cck);

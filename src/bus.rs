@@ -2616,21 +2616,31 @@ impl Bus {
         self.paula.tick_pots(cck);
         let dmacon = self.agnus.dmacon;
         self.flush_audio();
-        self.floppy.set_adkcon(self.paula.adkcon);
-        if self.floppy.tick(cck, dmacon, &mut self.mem.chip_ram) {
-            self.paula.intreq |= INT_DSKBLK;
-        }
-        if self.floppy.take_sync_irq() {
-            self.paula.intreq |= INT_DSKSYNC;
-        }
-        if self.floppy.take_index_pulse() {
-            let flag_irq = self.cia_b.assert_flag();
-            self.cia_b.release_flag();
-            if flag_irq {
-                self.paula.intreq |= INT_EXTER;
+        // The floppy mechanism is quiescent for almost all of normal running
+        // (no DMA, motor off, no drive selected). Skip the whole block -- an
+        // `is_idle()` recompute plus the DSKBLK/DSKSYNC/index-pulse polling and
+        // drive-sound feed -- on a single cached bool while that holds. The
+        // cache is cleared by every activation write and recomputed in
+        // `floppy.tick`, so a newly active drive is serviced from the next
+        // access. Drive sounds need no feed once idle: the spin/read levels are
+        // already zeroed and the tails decay in Paula's mixer.
+        if !self.floppy.is_idle_cached() {
+            self.floppy.set_adkcon(self.paula.adkcon);
+            if self.floppy.tick(cck, dmacon, &mut self.mem.chip_ram) {
+                self.paula.intreq |= INT_DSKBLK;
             }
+            if self.floppy.take_sync_irq() {
+                self.paula.intreq |= INT_DSKSYNC;
+            }
+            if self.floppy.take_index_pulse() {
+                let flag_irq = self.cia_b.assert_flag();
+                self.cia_b.release_flag();
+                if flag_irq {
+                    self.paula.intreq |= INT_EXTER;
+                }
+            }
+            self.feed_drive_sounds(dmacon);
         }
-        self.feed_drive_sounds(dmacon);
         self.refresh_cia_irq_lines();
         self.flush_pending_vbi();
         self.arm_irq_recognition_latency();
