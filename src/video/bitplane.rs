@@ -7,12 +7,13 @@
 //! completed frame so scanline and horizontal palette/control changes
 //! are based on scheduled execution rather than reparsing COP1LC.
 
+use super::FrameGeometry;
 #[cfg(test)]
 use super::FB_PIXELS;
 use super::{FB_HEIGHT, FB_WIDTH, MAX_VISIBLE_LINES};
 use crate::bus::{
-    BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource, Bus, CapturedSpriteLine,
-    RenderRegisterSnapshot, VideoRenderFrameTiming,
+    BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource, Bus, CapturedBitplaneRow,
+    CapturedSpriteLine, RenderRegisterSnapshot, VideoRenderFrameTiming,
 };
 use crate::chipset::agnus::{ddf_hard_bounds, sprite_dma_disabled_by_bitplane_ddf, AgnusRevision};
 #[cfg(test)]
@@ -1354,10 +1355,6 @@ impl RenderState {
         }
     }
 
-    fn from_bus(bus: &Bus) -> Self {
-        Self::from_snapshot(bus.frame_render_base())
-    }
-
     #[cfg(test)]
     fn display_window_y(&self) -> (usize, usize) {
         if self.diwstrt == 0 || self.diwstop == 0 {
@@ -2685,7 +2682,11 @@ fn palette_event_sequences_equivalent(a: &[BeamRegisterWrite], b: &[BeamRegister
 /// boundary where content unexpectedly appears or vanishes. All values are read
 /// from the renderer's own frame snapshot, so they match what is drawn.
 fn maybe_log_frame_state(
-    bus: &Bus,
+    emulated_seconds: f64,
+    emulated_frames: u64,
+    geometry: FrameGeometry,
+    captured_sprite_lines: &[CapturedSpriteLine],
+    sprite_dma_observed: bool,
     control: &ControlState,
     state: &RenderState,
     bplpt: &[u32; 8],
@@ -2694,7 +2695,7 @@ fn maybe_log_frame_state(
     if !crate::envcfg::flag("COPPERLINE_DBG_FRAMESTATE") {
         return;
     }
-    let secs = bus.emulated_seconds();
+    let secs = emulated_seconds;
     let after = env_f64("COPPERLINE_DBG_AFTER").unwrap_or(0.0);
     let until = env_f64("COPPERLINE_DBG_UNTIL").unwrap_or(f64::INFINITY);
     if secs < after || secs >= until {
@@ -2704,7 +2705,7 @@ fn maybe_log_frame_state(
         "framestate secs={secs:.4} frame={} vline0={visible_line0} dmacon={:#06X} \
          bplcon0={:#06X} bplcon1={:#06X} diwstrt={:#06X} diwstop={:#06X} \
          ddfstrt={:#06X} ddfstop={:#06X} fmode={:#06X} bpl1mod={} bpl2mod={} bplpt={:08X?}",
-        bus.emulated_frames(),
+        emulated_frames,
         control.dmacon,
         control.bplcon0,
         control.bplcon1,
@@ -2717,7 +2718,6 @@ fn maybe_log_frame_state(
         control.bpl2mod,
         bplpt,
     );
-    let geometry = bus.frame_geometry();
     log::info!(
         "  geometry: programmable={} visible_start={} visible_lines={} line_cck={} lace={}",
         geometry.programmable,
@@ -2730,7 +2730,7 @@ fn maybe_log_frame_state(
         .map(|i| format!("{:03x}", state.palette[i]))
         .collect();
     log::info!("  pal0-15=[{}]", pal.join(" "));
-    let spr_lines = bus.frame_captured_sprite_lines();
+    let spr_lines = captured_sprite_lines;
     let mut per_sprite = [0u32; 8];
     let (mut ymin, mut ymax) = (i32::MAX, i32::MIN);
     for l in spr_lines {
@@ -2743,7 +2743,7 @@ fn maybe_log_frame_state(
     log::info!(
         "  sprites: total={} dma_observed={} per_sprite={per_sprite:?} ybeam=[{},{}]",
         spr_lines.len(),
-        bus.frame_sprite_dma_observed(),
+        sprite_dma_observed,
         ymin,
         ymax,
     );
@@ -2753,22 +2753,99 @@ fn env_f64(var: &str) -> Option<f64> {
     crate::envcfg::var(var).and_then(|s| s.trim().parse::<f64>().ok())
 }
 
+/// Everything `render_from_input` needs to paint a completed frame, owned so
+/// it can outlive the `Bus` borrow (and, with the render-thread pipeline, be
+/// moved to a worker). It is a snapshot of the just-finished frame: the bus
+/// already double-buffers chip RAM and the beam-event/capture logs at the
+/// end-of-frame swap, so rendering is a pure function of this bundle.
+pub struct RenderInput {
+    geometry: FrameGeometry,
+    visible_start_vpos: u32,
+    palette_split: (Palette, Palette, bool),
+    render_base: RenderRegisterSnapshot,
+    frame_render_events: Vec<BeamRegisterWrite>,
+    current_render_base: RenderRegisterSnapshot,
+    current_render_events: Vec<BeamRegisterWrite>,
+    bottom_palette_events: Vec<BeamRegisterWrite>,
+    top_palette_end: Palette,
+    chip_ram: Vec<u8>,
+    chip_ram_writes: Vec<BeamChipRamWrite>,
+    captured_bitplane_rows: Vec<Option<CapturedBitplaneRow>>,
+    captured_sprite_lines: Vec<CapturedSpriteLine>,
+    sprite_display_enable_x_by_y: Vec<Option<usize>>,
+    sprite_dma_observed: bool,
+    // Agnus-derived blanking windows, sampled once per frame from the live
+    // latches (the helpers below take these instead of borrowing the Bus).
+    frame_lines: u32,
+    programmable_vertical_blank: Option<(u32, u32)>,
+    programmable_horizontal_blank: Option<(u32, u32)>,
+    // Scalars only the COPPERLINE_DBG_* side-channels read.
+    emulated_seconds: f64,
+    emulated_frames: u64,
+}
+
+impl RenderInput {
+    /// Snapshot the just-finished frame from the bus into an owned bundle.
+    pub fn from_bus(bus: &Bus) -> Self {
+        Self {
+            geometry: bus.frame_geometry(),
+            visible_start_vpos: bus.frame_visible_start_vpos(),
+            palette_split: bus.frame_palette_split(),
+            render_base: bus.frame_render_base(),
+            frame_render_events: bus.frame_render_events().to_vec(),
+            current_render_base: bus.current_render_base(),
+            current_render_events: bus.current_render_events().to_vec(),
+            bottom_palette_events: bus.frame_bottom_palette_events().to_vec(),
+            top_palette_end: bus.frame_top_palette_end(),
+            chip_ram: bus.frame_chip_ram().to_vec(),
+            chip_ram_writes: bus.frame_chip_ram_writes().to_vec(),
+            captured_bitplane_rows: bus.frame_captured_bitplane_rows().to_vec(),
+            captured_sprite_lines: bus.frame_captured_sprite_lines().to_vec(),
+            sprite_display_enable_x_by_y: bus.frame_sprite_display_enable_x_by_y().to_vec(),
+            sprite_dma_observed: bus.frame_sprite_dma_observed(),
+            frame_lines: bus.agnus.current_frame_lines(),
+            programmable_vertical_blank: bus.agnus.programmable_vertical_blank(),
+            programmable_horizontal_blank: bus.agnus.programmable_horizontal_blank(),
+            emulated_seconds: bus.emulated_seconds(),
+            emulated_frames: bus.emulated_frames(),
+        }
+    }
+}
+
+/// Outputs of `render_from_input` that must be applied back to the live
+/// machine on the main thread: the collision bits to OR into Denise CLXDAT
+/// (emulator-visible hardware state) and the render-phase timing stats.
+pub struct RenderResult {
+    pub timing: VideoRenderFrameTiming,
+    pub clxdat: u16,
+}
+
+/// Paint the just-finished frame and apply its hardware side effects. Builds
+/// the owned `RenderInput` snapshot, renders it, then writes back the Denise
+/// collision bits and render timing. The render itself is a pure function of
+/// the snapshot (`render_from_input`); this wrapper owns the bus coupling.
 pub fn render(bus: &mut Bus, fb: &mut [u32]) {
+    let input = RenderInput::from_bus(bus);
+    let result = render_from_input(&input, fb);
+    bus.denise.or_clxdat(result.clxdat);
+    bus.record_video_render_frame(result.timing);
+}
+
+pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
     let render_started = Instant::now();
     let mut render_timing = VideoRenderFrameTiming::default();
-    let mut state = RenderState::from_bus(bus);
-    let geometry = bus.frame_geometry();
+    let mut state = RenderState::from_snapshot(input.render_base);
+    let geometry = input.geometry;
     // Rows rendered this frame: the frame geometry's scan height, bounded
     // by the caller's buffer (legacy fixed-size callers keep the classic
     // field height).
     let rows = geometry.visible_lines.min(fb.len() / FB_WIDTH);
     debug_assert!(fb.len() >= FB_WIDTH * rows);
-    let visible_line0 = bus.frame_visible_start_vpos() as i32;
-    let (beam_top_palette, beam_bottom_palette, beam_bottom_palette_valid) =
-        bus.frame_palette_split();
-    let frame_render_events = bus.frame_render_events();
-    let current_render_base = bus.current_render_base();
-    let current_render_events = bus.current_render_events();
+    let visible_line0 = input.visible_start_vpos as i32;
+    let (beam_top_palette, beam_bottom_palette, beam_bottom_palette_valid) = input.palette_split;
+    let frame_render_events = input.frame_render_events.as_slice();
+    let current_render_base = input.current_render_base;
+    let current_render_events = input.current_render_events.as_slice();
     let primary_buffer_carries_forward = primary_bitplane_buffer_carries_forward(
         state.bplpt[0],
         frame_render_events,
@@ -2780,7 +2857,7 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
         .copied()
         .filter(is_cpu_copper_irq_palette_event)
         .collect();
-    let bottom_palette_replay_events = bus.frame_bottom_palette_events();
+    let bottom_palette_replay_events = input.bottom_palette_events.as_slice();
     let mut merged_render_events = Vec::new();
     let render_events = if should_inject_bottom_palette_replay_events_with_visible_line0(
         frame_render_events,
@@ -2837,7 +2914,7 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
     };
     if beam_bottom_palette_valid {
         state.palette = if primary_buffer_carries_forward {
-            bus.frame_top_palette_end()
+            input.top_palette_end
         } else {
             beam_top_palette
         };
@@ -2846,7 +2923,11 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
     let frame_start_bpldat = state.bpldat;
     let frame_start_control = ControlState::from_render_state(&state);
     maybe_log_frame_state(
-        bus,
+        input.emulated_seconds,
+        input.emulated_frames,
+        input.geometry,
+        &input.captured_sprite_lines,
+        input.sprite_dma_observed,
         &frame_start_control,
         &state,
         &frame_start_bplpt,
@@ -2901,13 +2982,13 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
         .iter()
         .map(|segments| segments.len() as u64)
         .sum();
-    let frame_ram = bus.frame_chip_ram();
-    let mut ram = TimedChipRam::new(frame_ram, bus.frame_chip_ram_writes());
-    let captured_bitplane_rows = bus.frame_captured_bitplane_rows();
+    let frame_ram = input.chip_ram.as_slice();
+    let mut ram = TimedChipRam::new(frame_ram, input.chip_ram_writes.as_slice());
+    let captured_bitplane_rows = input.captured_bitplane_rows.as_slice();
     let has_captured_bitplane_rows = captured_bitplane_rows.iter().any(Option::is_some);
-    let captured_sprite_lines = bus.frame_captured_sprite_lines();
-    let sprite_display_enable_x_by_y = bus.frame_sprite_display_enable_x_by_y();
-    let sprite_dma_observed = bus.frame_sprite_dma_observed();
+    let captured_sprite_lines = input.captured_sprite_lines.as_slice();
+    let sprite_display_enable_x_by_y = input.sprite_display_enable_x_by_y.as_slice();
+    let sprite_dma_observed = input.sprite_dma_observed;
     render_timing.sprite_lines = captured_sprite_lines.len() as u64
         + manual_sprite_lines
             .iter()
@@ -3022,7 +3103,7 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
         if crate::envcfg::flag("COPPERLINE_DBG_EXPORT_PLANES") {
             let after = env_f64("COPPERLINE_DBG_AFTER").unwrap_or(0.0);
             let until = env_f64("COPPERLINE_DBG_UNTIL").unwrap_or(f64::INFINITY);
-            let secs = bus.emulated_seconds();
+            let secs = input.emulated_seconds;
             if secs >= after && secs < until {
                 export_planes = Some(Box::new(std::array::from_fn(|_| {
                     vec![0u8; EXPORT_W * rows]
@@ -3265,7 +3346,7 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
             }
         }
         if let (Some(planes), Some(index)) = (export_planes.as_ref(), export_index.as_ref()) {
-            let frame = bus.emulated_frames();
+            let frame = input.emulated_frames;
             let dir = crate::envcfg::var("COPPERLINE_DBG_EXPORT_PLANES_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir);
@@ -3287,7 +3368,7 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
                     write_pgm("composite", &scaled);
                     log::info!(
                         "exported planes for frame {frame} (secs={:.4}) to {}",
-                        bus.emulated_seconds(),
+                        input.emulated_seconds,
                         dir.display(),
                     );
                 }
@@ -3342,11 +3423,19 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
             .finish_register_and_sprite_only_lines(captured_sprite_lines, visible_line0);
         display_frame_plan.log_summary();
     }
-    bus.denise.or_clxdat(clxdat);
-    apply_programmable_blanking(&bus.agnus, fb, visible_line0, rows);
-    blank_rows_past_frame_end(&bus.agnus, fb, visible_line0, rows);
+    apply_programmable_blanking(
+        input.programmable_vertical_blank,
+        input.programmable_horizontal_blank,
+        fb,
+        visible_line0,
+        rows,
+    );
+    blank_rows_past_frame_end(input.frame_lines, fb, visible_line0, rows);
     render_timing.total_nanos = render_started.elapsed().as_nanos();
-    bus.record_video_render_frame(render_timing);
+    RenderResult {
+        timing: render_timing,
+        clxdat,
+    }
 }
 
 /// Canvas rows whose beam line is at or past the frame wrap do not exist on
@@ -3357,14 +3446,9 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
 /// extended-ROM boot screen opens DIW to vstop $140 and relies on the frame
 /// ending at line 311, which left rows for lines 312..328 showing garbage
 /// fetched past the image. Hardware is in vertical blank there; force black.
-fn blank_rows_past_frame_end(
-    agnus: &crate::chipset::agnus::Agnus,
-    fb: &mut [u32],
-    visible_line0: i32,
-    rows: usize,
-) {
+fn blank_rows_past_frame_end(frame_lines: u32, fb: &mut [u32], visible_line0: i32, rows: usize) {
     const BLANK_RGBA: u32 = 0xFF00_0000;
-    let frame_lines = agnus.current_frame_lines() as i32;
+    let frame_lines = frame_lines as i32;
     let first_blank_row = (frame_lines - visible_line0).clamp(0, rows as i32) as usize;
     for row in fb[first_blank_row * FB_WIDTH..rows * FB_WIDTH].chunks_exact_mut(FB_WIDTH) {
         row.fill(BLANK_RGBA);
@@ -3383,7 +3467,8 @@ fn blank_rows_past_frame_end(
 /// origin. The fixed 716x285 canvas shows beam lines visible_line0.. only;
 /// blanking outside the canvas is invisible by construction.
 fn apply_programmable_blanking(
-    agnus: &crate::chipset::agnus::Agnus,
+    programmable_vertical_blank: Option<(u32, u32)>,
+    programmable_horizontal_blank: Option<(u32, u32)>,
     fb: &mut [u32],
     visible_line0: i32,
     rows: usize,
@@ -3397,7 +3482,7 @@ fn apply_programmable_blanking(
         }
     };
 
-    if let Some((strt, stop)) = agnus.programmable_vertical_blank() {
+    if let Some((strt, stop)) = programmable_vertical_blank {
         for y in 0..rows {
             let vpos = (visible_line0 + y as i32).max(0) as u32;
             if in_window(vpos, strt, stop) {
@@ -3406,7 +3491,7 @@ fn apply_programmable_blanking(
         }
     }
 
-    if let Some((strt, stop)) = agnus.programmable_horizontal_blank() {
+    if let Some((strt, stop)) = programmable_horizontal_blank {
         // HBSTRT/HBSTOP are in colour clocks; one colour clock spans two
         // lo-res DIW positions, i.e. four hi-res framebuffer pixels.
         let mut blank_cols = [false; FB_WIDTH];
