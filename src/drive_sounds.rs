@@ -74,6 +74,21 @@ const READ_RELEASE_S: f32 = 0.070;
 const SILENT_LEVEL: f32 = 1.0e-4;
 const TWO_PI: f32 = std::f32::consts::TAU;
 
+/// Advance a sine phase accumulator and keep it in `[0, TWO_PI)`. Every
+/// increment here is a small fraction of a cycle per host sample, so wrapping
+/// is a single subtraction rather than a floating-point modulo -- `% TWO_PI`
+/// lowered to `fmodf`, which showed up as several percent of the whole
+/// emulator on the per-sample audio path. The loop covers the (rare) case of a
+/// click body pitch high enough to advance more than a full cycle per sample.
+#[inline]
+fn wrap_phase(phase: f32, inc: f32) -> f32 {
+    let mut next = phase + inc;
+    while next >= TWO_PI {
+        next -= TWO_PI;
+    }
+    next
+}
+
 /// One-pole lowpass coefficient for a cutoff at the mixer rate. The
 /// linear approximation is fine for the sub-4 kHz cutoffs used here.
 fn lowpass_coeff(cutoff_hz: f32) -> f32 {
@@ -231,12 +246,12 @@ impl DriveSounds {
             // up rather than fading in at full pitch.
             let pitch = 0.35 + 0.65 * motor.spin;
             let hum_inc = TWO_PI * MOTOR_HUM_BASE_HZ * pitch / MIX_SAMPLE_RATE as f32;
-            motor.hum_phase = (motor.hum_phase + hum_inc) % TWO_PI;
+            motor.hum_phase = wrap_phase(motor.hum_phase, hum_inc);
             let hum =
                 motor.hum_phase.sin() + 0.55 * (motor.hum_phase * MOTOR_HUM_SECOND_RATIO).sin();
 
             let wobble_inc = TWO_PI * MOTOR_WOBBLE_HZ * motor.spin / MIX_SAMPLE_RATE as f32;
-            motor.wobble_phase = (motor.wobble_phase + wobble_inc) % TWO_PI;
+            motor.wobble_phase = wrap_phase(motor.wobble_phase, wobble_inc);
             let wobble = 1.0 + MOTOR_WOBBLE_DEPTH * motor.wobble_phase.sin();
 
             let rumble_cutoff = MOTOR_RUMBLE_LP_MIN_HZ
@@ -259,7 +274,7 @@ impl DriveSounds {
             }
             let noise = next_noise_bipolar(&mut self.rng);
             voice.snap_lp += snap_lp_coeff * (noise - voice.snap_lp);
-            voice.body_phase = (voice.body_phase + voice.body_phase_inc) % TWO_PI;
+            voice.body_phase = wrap_phase(voice.body_phase, voice.body_phase_inc);
             let body = voice.body_phase.sin() * voice.body_env;
             sample += voice.amp * (1.1 * voice.snap_lp * voice.snap_env + 0.55 * body);
             voice.snap_env *= snap_decay;

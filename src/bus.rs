@@ -5951,11 +5951,19 @@ impl Bus {
         self.last_frame_beam_bottom_palette = self.beam_bottom_palette;
         self.last_frame_beam_bottom_palette_valid = self.beam_bottom_palette_valid;
         self.last_frame_beam_bottom_palette_events = self.beam_bottom_palette_events.clone();
-        self.last_frame_chip_ram.clear();
-        if self.current_frame_chip_ram.len() == self.mem.chip_ram.len() {
-            self.last_frame_chip_ram
-                .extend_from_slice(&self.current_frame_chip_ram);
+        // Promote the just-finished frame's chip-RAM snapshot to `last` by
+        // swapping buffers instead of copying 2 MB. `capture_current_frame_
+        // display_start` already filled `current_frame_chip_ram` for any frame
+        // that reached its display window, so move that buffer across and
+        // recycle the old `last` buffer as the next `current`. A frame that
+        // never displayed (no capture taken) has no meaningful snapshot, so
+        // fall back to a live copy for the renderer's blank/border output.
+        if self.current_frame_display_snapshot_taken
+            && self.current_frame_chip_ram.len() == self.mem.chip_ram.len()
+        {
+            std::mem::swap(&mut self.last_frame_chip_ram, &mut self.current_frame_chip_ram);
         } else {
+            self.last_frame_chip_ram.clear();
             self.last_frame_chip_ram
                 .extend_from_slice(&self.mem.chip_ram);
         }
@@ -5972,9 +5980,12 @@ impl Bus {
         );
         self.last_frame_sprite_dma_observed = self.current_frame_sprite_dma_observed;
         self.current_frame_sprite_dma_observed = false;
+        // The next frame's snapshot is taken lazily at its display start
+        // (`capture_current_frame_display_start`), which clears and refills
+        // this buffer. Eagerly copying chip RAM here would just be overwritten,
+        // so only clear it; a frame that never displays falls back to a live
+        // copy at the next wrap (see the swap/extend above).
         self.current_frame_chip_ram.clear();
-        self.current_frame_chip_ram
-            .extend_from_slice(&self.mem.chip_ram);
         self.current_frame_beam_top_palette = self.beam_top_palette;
         self.current_frame_display_snapshot_taken = false;
         self.current_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS;
