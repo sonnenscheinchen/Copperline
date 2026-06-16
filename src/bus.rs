@@ -6068,7 +6068,10 @@ impl Bus {
         if self.current_frame_display_snapshot_taken
             && self.current_frame_chip_ram.len() == self.mem.chip_ram.len()
         {
-            std::mem::swap(&mut self.last_frame_chip_ram, &mut self.current_frame_chip_ram);
+            std::mem::swap(
+                &mut self.last_frame_chip_ram,
+                &mut self.current_frame_chip_ram,
+            );
         } else {
             self.last_frame_chip_ram.clear();
             self.last_frame_chip_ram
