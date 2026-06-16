@@ -491,6 +491,11 @@ impl Emulator {
         }
     }
 
+    pub fn reset_stats(&mut self) {
+        self.stats = EmuStats::default();
+        self.bus_mut().reset_profile_stats();
+    }
+
     /// Execute exactly `count` CPU instructions (interactive debugger
     /// single-step). The cycle-exact core advances the chipset in lockstep,
     /// so device state stays consistent; no wall-clock pacing is applied.

@@ -1849,6 +1849,11 @@ impl Bus {
         self.video_pipeline_stats.dump(label);
     }
 
+    pub fn reset_profile_stats(&mut self) {
+        self.video_pipeline_stats = VideoPipelineStats::default();
+        self.poll_stats = PollStats::default();
+    }
+
     pub(crate) fn record_video_render_frame(&mut self, timing: VideoRenderFrameTiming) {
         let stats = &mut self.video_pipeline_stats;
         stats.render_frames = stats.render_frames.saturating_add(1);
