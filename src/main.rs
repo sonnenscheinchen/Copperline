@@ -70,6 +70,9 @@ pub struct CliArgs {
     /// `--load-state PATH`: restore a save state before entering the
     /// event loop, resuming from its emulated timeline.
     pub load_state: Option<PathBuf>,
+    /// `--benchmark-until SECS`: run frames directly, without opening a
+    /// window, until the absolute emulated-time target is reached.
+    pub benchmark_until: Option<f32>,
     /// Dump consecutive rendered frames after an emulated-time delay. This
     /// is intended for debugging flicker and frame-to-frame palette
     /// changes that a single screenshot cannot show.
@@ -235,6 +238,7 @@ where
     let mut screenshot_after: Option<(f32, PathBuf)> = None;
     let mut save_state_after: Option<(f32, PathBuf)> = None;
     let mut load_state: Option<PathBuf> = None;
+    let mut benchmark_until: Option<f32> = None;
     let mut dump_dir: Option<PathBuf> = None;
     let mut dump_start_secs: f32 = 0.0;
     let mut dump_count: Option<u32> = None;
@@ -478,6 +482,17 @@ where
                     .ok_or_else(|| anyhow!("--load-state requires a path"))?;
                 load_state = Some(PathBuf::from(v));
             }
+            "--benchmark-until" | "--bench-until" => {
+                let secs: f32 = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--benchmark-until requires SECS"))?
+                    .parse()
+                    .map_err(|_| anyhow!("--benchmark-until SECS must be a number"))?;
+                if secs <= 0.0 {
+                    return Err(anyhow!("--benchmark-until SECS must be greater than zero"));
+                }
+                benchmark_until = Some(secs);
+            }
             "--dump-frames" => {
                 let path = args
                     .next()
@@ -555,6 +570,9 @@ where
             "--profile-live-audio and --noaudio are mutually exclusive"
         ));
     }
+    if benchmark_until.is_some() && !explicit_audio_live && audio_wav.is_none() {
+        audio_live = false;
+    }
     let frame_dump = match (dump_dir, dump_count) {
         (Some(dir), Some(count)) => Some(FrameDumpSpec {
             dir,
@@ -576,6 +594,7 @@ where
         screenshot_after,
         save_state_after,
         load_state,
+        benchmark_until,
         frame_dump,
         press_after,
         click_after,
@@ -614,6 +633,8 @@ fn print_help() {
          \x20                            then keep running\n  \
          --load-state PATH              restore a save state before starting, resuming from\n  \
          \x20                            its emulated timeline\n  \
+         --benchmark-until SECS         run frames with no window until absolute emulated\n  \
+         \x20                            time SECS, report counters, then exit\n  \
          --dump-frames DIR              dump consecutive PNG frames into DIR, then exit\n  \
          --dump-start SECS              start frame dumping after SECS seconds (default: 0)\n  \
          --dump-count COUNT             number of frames to dump with --dump-frames\n  \
@@ -700,6 +721,88 @@ fn resolve_disk_insert_after(
     Ok(out)
 }
 
+fn validate_benchmark_args(cli: &CliArgs) -> Result<()> {
+    if cli.benchmark_until.is_none() {
+        return Ok(());
+    }
+
+    if cli.screenshot_after.is_some() {
+        return Err(anyhow!(
+            "--benchmark-until cannot be combined with --screenshot-after"
+        ));
+    }
+    if cli.save_state_after.is_some() {
+        return Err(anyhow!(
+            "--benchmark-until cannot be combined with --save-state-after"
+        ));
+    }
+    if cli.frame_dump.is_some() {
+        return Err(anyhow!(
+            "--benchmark-until cannot be combined with --dump-frames"
+        ));
+    }
+    if cli.live_audio_profile_secs.is_some() {
+        return Err(anyhow!(
+            "--benchmark-until cannot be combined with --profile-live-audio"
+        ));
+    }
+    if !cli.press_after.is_empty()
+        || !cli.click_after.is_empty()
+        || !cli.joy_after.is_empty()
+        || !cli.mouse_after.is_empty()
+    {
+        return Err(anyhow!(
+            "--benchmark-until cannot be combined with scheduled input events"
+        ));
+    }
+    if cli.record_input.is_some() {
+        return Err(anyhow!(
+            "--benchmark-until cannot be combined with --record-input"
+        ));
+    }
+    if !cli.disk_insert_after.is_empty() {
+        return Err(anyhow!(
+            "--benchmark-until cannot be combined with scheduled disk inserts"
+        ));
+    }
+
+    Ok(())
+}
+
+fn run_headless_benchmark(mut emu: Emulator, target_secs: f32) -> Result<()> {
+    emu.set_paced(false);
+    emu.reset_stats();
+
+    let start_emulated = emu.bus().emulated_seconds();
+    let target_secs = f64::from(target_secs);
+    if target_secs <= start_emulated {
+        return Err(anyhow!(
+            "--benchmark-until target {:.3}s is not after current emulated time {:.3}s",
+            target_secs,
+            start_emulated
+        ));
+    }
+
+    let start_frames = emu.bus().emulated_frames();
+    let started = Instant::now();
+    while emu.bus().emulated_seconds() < target_secs {
+        emu.step_frame()?;
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let frames = emu.bus().emulated_frames().saturating_sub(start_frames);
+    let emulated = emu.bus().emulated_seconds() - start_emulated;
+    info!(
+        "benchmark: ran {:.3}s emulated to {:.3}s target in {:.3}s wall, {} frames ({:.1}/s)",
+        emulated,
+        target_secs,
+        elapsed,
+        frames,
+        frames as f64 / elapsed.max(f64::EPSILON)
+    );
+    emu.report_stats();
+    Ok(())
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -710,6 +813,7 @@ fn main() -> Result<()> {
     }));
 
     let cli = parse_args()?;
+    validate_benchmark_args(&cli)?;
     if cli.calibrate_gamepad {
         return gamepad::run_calibration();
     }
@@ -871,7 +975,8 @@ fn main() -> Result<()> {
     // Headless capture runs (screenshot / frame dump) advance the
     // deterministic core unthrottled; the interactive window paces to
     // wall-clock time. The emulated result is identical either way.
-    let headless_capture = cli.screenshot_after.is_some() || cli.frame_dump.is_some();
+    let headless_capture =
+        cli.screenshot_after.is_some() || cli.frame_dump.is_some() || cli.benchmark_until.is_some();
     let paced = !headless_capture;
     info!("emulation timing: deterministic core, paced={paced}");
     let cpu_clocks_per_cck = crate::config::clocks_per_cck_for_mhz(cfg.cpu_clock_mhz);
@@ -893,6 +998,9 @@ fn main() -> Result<()> {
             path.display(),
             emu.bus().emulated_seconds()
         );
+    }
+    if let Some(target_secs) = cli.benchmark_until {
+        return run_headless_benchmark(emu, target_secs);
     }
     let disk_write_protected = std::array::from_fn(|idx| {
         cfg.floppy.drives[idx]
@@ -1280,6 +1388,47 @@ mod tests {
 
         let err = parse(&["--profile-live-audio", "0.25", "--noaudio"]).unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn benchmark_until_parses_and_defaults_to_null_audio() -> Result<()> {
+        let args = parse(&["--benchmark-until", "85.4"])?;
+        assert_eq!(args.benchmark_until, Some(85.4));
+        assert!(!args.audio_live);
+        assert!(args.audio_wav.is_none());
+        validate_benchmark_args(&args)?;
+        Ok(())
+    }
+
+    #[test]
+    fn benchmark_until_preserves_explicit_live_audio() -> Result<()> {
+        let args = parse(&["--benchmark-until", "85.4", "--audio"])?;
+        assert_eq!(args.benchmark_until, Some(85.4));
+        assert!(args.audio_live);
+        validate_benchmark_args(&args)?;
+        Ok(())
+    }
+
+    #[test]
+    fn benchmark_until_rejects_window_scheduled_work() -> Result<()> {
+        let args = parse(&["--benchmark-until", "85.4", "--press-after", "1.0", "ctrl"])?;
+        let err = validate_benchmark_args(&args).unwrap_err();
+        assert!(err.to_string().contains("scheduled input"), "{err:#}");
+
+        let args = parse(&["--benchmark-until", "85.4", "--profile-live-audio", "0.1"])?;
+        let err = validate_benchmark_args(&args).unwrap_err();
+        assert!(err.to_string().contains("--profile-live-audio"), "{err:#}");
+
+        let args = parse(&[
+            "--benchmark-until",
+            "85.4",
+            "--screenshot-after",
+            "85.4",
+            "/tmp/x",
+        ])?;
+        let err = validate_benchmark_args(&args).unwrap_err();
+        assert!(err.to_string().contains("--screenshot-after"), "{err:#}");
         Ok(())
     }
 

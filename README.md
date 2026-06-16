@@ -184,7 +184,7 @@ release needs resolved first. Release steps for every channel are in
 | Agnus Copper | Beam-scheduled OCS Copper with COP1/COP2 jumps, WAIT, SKIP, DMAEN/COPEN gating, and chip-bus grants. |
 | Agnus blitter | Scheduled per-slot engine: normal/line/fill modes, hardware per-word channel bus sequences (including the area-fill idle C slot), BBUSY/BZERO, BLTPRI "nasty" vs CPU starvation-yield arbitration, blit-done IRQ. |
 | Denise BPLCON / COLORxx | Stored and replayed by beam position. |
-| Bitplane renderer | OCS lo-res or hi-res; reads chip RAM via BPLxPT; honours modulos and beam-timed BPLCON1 scroll; EHB, HAM, dual playfield, and CLXDAT collisions. Lo-res pixel-doubles horizontally to match the 716-wide framebuffer. |
+| Bitplane renderer | OCS lo-res or hi-res; reads chip RAM via BPLxPT; honours modulos and beam-timed BPLCON1 scroll; EHB, HAM, dual playfield, and CLXDAT collisions. Completed frames render on a worker thread by default; `COPPERLINE_THREADED_RENDER=0` forces synchronous rendering. |
 | Display window | winit 0.30 + pixels 0.17 surface; 716x285 framebuffer presented at 4:3 (716x537) plus a 44-pixel status bar with power/disk controls. |
 | Keyboard / mouse / gamepad | Host keyboard/mouse mapped to Amiga input paths; key down and key up events go through CIA-A SDR/ICR with acknowledge + KDAT handshake backpressure and keyboard-MCU pacing; mouse deltas feed JOY0DAT; `Cmd+G` on macOS or `Alt+G` on Linux/Windows toggles host mouse capture; a USB gamepad (gilrs) drives the port-2 digital joystick (JOY1DAT directions, /FIR1 fire, POT1Y button 2); Ctrl+Ami+Ami resets. |
 | OCS sprites | 8 DMA/manual 16-pixel sprites, attached sprites, composited over bitplanes with playfield priority. |

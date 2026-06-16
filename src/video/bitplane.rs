@@ -7,12 +7,13 @@
 //! completed frame so scanline and horizontal palette/control changes
 //! are based on scheduled execution rather than reparsing COP1LC.
 
+use super::FrameGeometry;
 #[cfg(test)]
 use super::FB_PIXELS;
 use super::{FB_HEIGHT, FB_WIDTH, MAX_VISIBLE_LINES};
 use crate::bus::{
-    BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource, Bus, CapturedSpriteLine,
-    RenderRegisterSnapshot, VideoRenderFrameTiming,
+    BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource, Bus, CapturedBitplaneRow,
+    CapturedSpriteLine, RenderRegisterSnapshot, VideoRenderFrameTiming,
 };
 use crate::chipset::agnus::{ddf_hard_bounds, sprite_dma_disabled_by_bitplane_ddf, AgnusRevision};
 #[cfg(test)]
@@ -1354,10 +1355,6 @@ impl RenderState {
         }
     }
 
-    fn from_bus(bus: &Bus) -> Self {
-        Self::from_snapshot(bus.frame_render_base())
-    }
-
     #[cfg(test)]
     fn display_window_y(&self) -> (usize, usize) {
         if self.diwstrt == 0 || self.diwstop == 0 {
@@ -2685,7 +2682,11 @@ fn palette_event_sequences_equivalent(a: &[BeamRegisterWrite], b: &[BeamRegister
 /// boundary where content unexpectedly appears or vanishes. All values are read
 /// from the renderer's own frame snapshot, so they match what is drawn.
 fn maybe_log_frame_state(
-    bus: &Bus,
+    emulated_seconds: f64,
+    emulated_frames: u64,
+    geometry: FrameGeometry,
+    captured_sprite_lines: &[CapturedSpriteLine],
+    sprite_dma_observed: bool,
     control: &ControlState,
     state: &RenderState,
     bplpt: &[u32; 8],
@@ -2694,7 +2695,7 @@ fn maybe_log_frame_state(
     if !crate::envcfg::flag("COPPERLINE_DBG_FRAMESTATE") {
         return;
     }
-    let secs = bus.emulated_seconds();
+    let secs = emulated_seconds;
     let after = env_f64("COPPERLINE_DBG_AFTER").unwrap_or(0.0);
     let until = env_f64("COPPERLINE_DBG_UNTIL").unwrap_or(f64::INFINITY);
     if secs < after || secs >= until {
@@ -2704,7 +2705,7 @@ fn maybe_log_frame_state(
         "framestate secs={secs:.4} frame={} vline0={visible_line0} dmacon={:#06X} \
          bplcon0={:#06X} bplcon1={:#06X} diwstrt={:#06X} diwstop={:#06X} \
          ddfstrt={:#06X} ddfstop={:#06X} fmode={:#06X} bpl1mod={} bpl2mod={} bplpt={:08X?}",
-        bus.emulated_frames(),
+        emulated_frames,
         control.dmacon,
         control.bplcon0,
         control.bplcon1,
@@ -2717,7 +2718,6 @@ fn maybe_log_frame_state(
         control.bpl2mod,
         bplpt,
     );
-    let geometry = bus.frame_geometry();
     log::info!(
         "  geometry: programmable={} visible_start={} visible_lines={} line_cck={} lace={}",
         geometry.programmable,
@@ -2730,7 +2730,7 @@ fn maybe_log_frame_state(
         .map(|i| format!("{:03x}", state.palette[i]))
         .collect();
     log::info!("  pal0-15=[{}]", pal.join(" "));
-    let spr_lines = bus.frame_captured_sprite_lines();
+    let spr_lines = captured_sprite_lines;
     let mut per_sprite = [0u32; 8];
     let (mut ymin, mut ymax) = (i32::MAX, i32::MIN);
     for l in spr_lines {
@@ -2743,7 +2743,7 @@ fn maybe_log_frame_state(
     log::info!(
         "  sprites: total={} dma_observed={} per_sprite={per_sprite:?} ybeam=[{},{}]",
         spr_lines.len(),
-        bus.frame_sprite_dma_observed(),
+        sprite_dma_observed,
         ymin,
         ymax,
     );
@@ -2753,22 +2753,115 @@ fn env_f64(var: &str) -> Option<f64> {
     crate::envcfg::var(var).and_then(|s| s.trim().parse::<f64>().ok())
 }
 
+/// Everything `render_from_input` needs to paint a completed frame, owned so
+/// it can outlive the `Bus` borrow (and, with the render-thread pipeline, be
+/// moved to a worker). It is a snapshot of the just-finished frame: the bus
+/// already double-buffers chip RAM and the beam-event/capture logs at the
+/// end-of-frame swap, so rendering is a pure function of this bundle.
+pub struct RenderInput {
+    geometry: FrameGeometry,
+    visible_start_vpos: u32,
+    palette_split: (Palette, Palette, bool),
+    render_base: RenderRegisterSnapshot,
+    frame_render_events: Vec<BeamRegisterWrite>,
+    current_render_base: RenderRegisterSnapshot,
+    current_render_events: Vec<BeamRegisterWrite>,
+    bottom_palette_events: Vec<BeamRegisterWrite>,
+    top_palette_end: Palette,
+    chip_ram: Vec<u8>,
+    chip_ram_writes: Vec<BeamChipRamWrite>,
+    captured_bitplane_rows: Vec<Option<CapturedBitplaneRow>>,
+    captured_sprite_lines: Vec<CapturedSpriteLine>,
+    sprite_display_enable_x_by_y: Vec<Option<usize>>,
+    sprite_dma_observed: bool,
+    // Agnus-derived blanking windows, sampled once per frame from the live
+    // latches (the helpers below take these instead of borrowing the Bus).
+    frame_lines: u32,
+    programmable_vertical_blank: Option<(u32, u32)>,
+    programmable_horizontal_blank: Option<(u32, u32)>,
+    // Scalars only the COPPERLINE_DBG_* side-channels read.
+    emulated_seconds: f64,
+    emulated_frames: u64,
+}
+
+impl RenderInput {
+    /// Snapshot the just-finished frame from the bus into an owned bundle.
+    pub fn from_bus(bus: &Bus) -> Self {
+        Self {
+            geometry: bus.frame_geometry(),
+            visible_start_vpos: bus.frame_visible_start_vpos(),
+            palette_split: bus.frame_palette_split(),
+            render_base: bus.frame_render_base(),
+            frame_render_events: bus.frame_render_events().to_vec(),
+            current_render_base: bus.current_render_base(),
+            current_render_events: bus.current_render_events().to_vec(),
+            bottom_palette_events: bus.frame_bottom_palette_events().to_vec(),
+            top_palette_end: bus.frame_top_palette_end(),
+            chip_ram: bus.frame_chip_ram().to_vec(),
+            chip_ram_writes: bus.frame_chip_ram_writes().to_vec(),
+            captured_bitplane_rows: bus.frame_captured_bitplane_rows().to_vec(),
+            captured_sprite_lines: bus.frame_captured_sprite_lines().to_vec(),
+            sprite_display_enable_x_by_y: bus.frame_sprite_display_enable_x_by_y().to_vec(),
+            sprite_dma_observed: bus.frame_sprite_dma_observed(),
+            frame_lines: bus.agnus.current_frame_lines(),
+            programmable_vertical_blank: bus.agnus.programmable_vertical_blank(),
+            programmable_horizontal_blank: bus.agnus.programmable_horizontal_blank(),
+            emulated_seconds: bus.emulated_seconds(),
+            emulated_frames: bus.emulated_frames(),
+        }
+    }
+
+    pub fn geometry(&self) -> FrameGeometry {
+        self.geometry
+    }
+
+    pub fn visible_start_vpos(&self) -> u32 {
+        self.visible_start_vpos
+    }
+
+    pub fn render_base(&self) -> RenderRegisterSnapshot {
+        self.render_base
+    }
+
+    pub fn emulated_frames(&self) -> u64 {
+        self.emulated_frames
+    }
+}
+
+/// Outputs of `render_from_input`. Render timing is always recorded back on
+/// the main thread. `clxdat` is applied only by the synchronous wrapper; the
+/// threaded path completes CPU-visible Denise collision state at frame end
+/// before the worker can lag behind.
+pub struct RenderResult {
+    pub timing: VideoRenderFrameTiming,
+    pub clxdat: u16,
+}
+
+/// Paint the just-finished frame through the synchronous compatibility path.
+/// The render itself is a pure function of the owned snapshot
+/// (`render_from_input`); this wrapper owns the remaining bus coupling.
 pub fn render(bus: &mut Bus, fb: &mut [u32]) {
+    let input = RenderInput::from_bus(bus);
+    let result = render_from_input(&input, fb);
+    bus.denise.or_clxdat(result.clxdat);
+    bus.record_video_render_frame(result.timing);
+}
+
+pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
     let render_started = Instant::now();
     let mut render_timing = VideoRenderFrameTiming::default();
-    let mut state = RenderState::from_bus(bus);
-    let geometry = bus.frame_geometry();
+    let mut state = RenderState::from_snapshot(input.render_base);
+    let geometry = input.geometry;
     // Rows rendered this frame: the frame geometry's scan height, bounded
     // by the caller's buffer (legacy fixed-size callers keep the classic
     // field height).
     let rows = geometry.visible_lines.min(fb.len() / FB_WIDTH);
     debug_assert!(fb.len() >= FB_WIDTH * rows);
-    let visible_line0 = bus.frame_visible_start_vpos() as i32;
-    let (beam_top_palette, beam_bottom_palette, beam_bottom_palette_valid) =
-        bus.frame_palette_split();
-    let frame_render_events = bus.frame_render_events();
-    let current_render_base = bus.current_render_base();
-    let current_render_events = bus.current_render_events();
+    let visible_line0 = input.visible_start_vpos as i32;
+    let (beam_top_palette, beam_bottom_palette, beam_bottom_palette_valid) = input.palette_split;
+    let frame_render_events = input.frame_render_events.as_slice();
+    let current_render_base = input.current_render_base;
+    let current_render_events = input.current_render_events.as_slice();
     let primary_buffer_carries_forward = primary_bitplane_buffer_carries_forward(
         state.bplpt[0],
         frame_render_events,
@@ -2780,7 +2873,7 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
         .copied()
         .filter(is_cpu_copper_irq_palette_event)
         .collect();
-    let bottom_palette_replay_events = bus.frame_bottom_palette_events();
+    let bottom_palette_replay_events = input.bottom_palette_events.as_slice();
     let mut merged_render_events = Vec::new();
     let render_events = if should_inject_bottom_palette_replay_events_with_visible_line0(
         frame_render_events,
@@ -2837,7 +2930,7 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
     };
     if beam_bottom_palette_valid {
         state.palette = if primary_buffer_carries_forward {
-            bus.frame_top_palette_end()
+            input.top_palette_end
         } else {
             beam_top_palette
         };
@@ -2846,7 +2939,11 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
     let frame_start_bpldat = state.bpldat;
     let frame_start_control = ControlState::from_render_state(&state);
     maybe_log_frame_state(
-        bus,
+        input.emulated_seconds,
+        input.emulated_frames,
+        input.geometry,
+        &input.captured_sprite_lines,
+        input.sprite_dma_observed,
         &frame_start_control,
         &state,
         &frame_start_bplpt,
@@ -2901,13 +2998,13 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
         .iter()
         .map(|segments| segments.len() as u64)
         .sum();
-    let frame_ram = bus.frame_chip_ram();
-    let mut ram = TimedChipRam::new(frame_ram, bus.frame_chip_ram_writes());
-    let captured_bitplane_rows = bus.frame_captured_bitplane_rows();
+    let frame_ram = input.chip_ram.as_slice();
+    let mut ram = TimedChipRam::new(frame_ram, input.chip_ram_writes.as_slice());
+    let captured_bitplane_rows = input.captured_bitplane_rows.as_slice();
     let has_captured_bitplane_rows = captured_bitplane_rows.iter().any(Option::is_some);
-    let captured_sprite_lines = bus.frame_captured_sprite_lines();
-    let sprite_display_enable_x_by_y = bus.frame_sprite_display_enable_x_by_y();
-    let sprite_dma_observed = bus.frame_sprite_dma_observed();
+    let captured_sprite_lines = input.captured_sprite_lines.as_slice();
+    let sprite_display_enable_x_by_y = input.sprite_display_enable_x_by_y.as_slice();
+    let sprite_dma_observed = input.sprite_dma_observed;
     render_timing.sprite_lines = captured_sprite_lines.len() as u64
         + manual_sprite_lines
             .iter()
@@ -3022,7 +3119,7 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
         if crate::envcfg::flag("COPPERLINE_DBG_EXPORT_PLANES") {
             let after = env_f64("COPPERLINE_DBG_AFTER").unwrap_or(0.0);
             let until = env_f64("COPPERLINE_DBG_UNTIL").unwrap_or(f64::INFINITY);
-            let secs = bus.emulated_seconds();
+            let secs = input.emulated_seconds;
             if secs >= after && secs < until {
                 export_planes = Some(Box::new(std::array::from_fn(|_| {
                     vec![0u8; EXPORT_W * rows]
@@ -3265,7 +3362,7 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
             }
         }
         if let (Some(planes), Some(index)) = (export_planes.as_ref(), export_index.as_ref()) {
-            let frame = bus.emulated_frames();
+            let frame = input.emulated_frames;
             let dir = crate::envcfg::var("COPPERLINE_DBG_EXPORT_PLANES_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir);
@@ -3287,7 +3384,7 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
                     write_pgm("composite", &scaled);
                     log::info!(
                         "exported planes for frame {frame} (secs={:.4}) to {}",
-                        bus.emulated_seconds(),
+                        input.emulated_seconds,
                         dir.display(),
                     );
                 }
@@ -3342,11 +3439,19 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
             .finish_register_and_sprite_only_lines(captured_sprite_lines, visible_line0);
         display_frame_plan.log_summary();
     }
-    bus.denise.or_clxdat(clxdat);
-    apply_programmable_blanking(&bus.agnus, fb, visible_line0, rows);
-    blank_rows_past_frame_end(&bus.agnus, fb, visible_line0, rows);
+    apply_programmable_blanking(
+        input.programmable_vertical_blank,
+        input.programmable_horizontal_blank,
+        fb,
+        visible_line0,
+        rows,
+    );
+    blank_rows_past_frame_end(input.frame_lines, fb, visible_line0, rows);
     render_timing.total_nanos = render_started.elapsed().as_nanos();
-    bus.record_video_render_frame(render_timing);
+    RenderResult {
+        timing: render_timing,
+        clxdat,
+    }
 }
 
 /// Canvas rows whose beam line is at or past the frame wrap do not exist on
@@ -3357,14 +3462,9 @@ pub fn render(bus: &mut Bus, fb: &mut [u32]) {
 /// extended-ROM boot screen opens DIW to vstop $140 and relies on the frame
 /// ending at line 311, which left rows for lines 312..328 showing garbage
 /// fetched past the image. Hardware is in vertical blank there; force black.
-fn blank_rows_past_frame_end(
-    agnus: &crate::chipset::agnus::Agnus,
-    fb: &mut [u32],
-    visible_line0: i32,
-    rows: usize,
-) {
+fn blank_rows_past_frame_end(frame_lines: u32, fb: &mut [u32], visible_line0: i32, rows: usize) {
     const BLANK_RGBA: u32 = 0xFF00_0000;
-    let frame_lines = agnus.current_frame_lines() as i32;
+    let frame_lines = frame_lines as i32;
     let first_blank_row = (frame_lines - visible_line0).clamp(0, rows as i32) as usize;
     for row in fb[first_blank_row * FB_WIDTH..rows * FB_WIDTH].chunks_exact_mut(FB_WIDTH) {
         row.fill(BLANK_RGBA);
@@ -3383,7 +3483,8 @@ fn blank_rows_past_frame_end(
 /// origin. The fixed 716x285 canvas shows beam lines visible_line0.. only;
 /// blanking outside the canvas is invisible by construction.
 fn apply_programmable_blanking(
-    agnus: &crate::chipset::agnus::Agnus,
+    programmable_vertical_blank: Option<(u32, u32)>,
+    programmable_horizontal_blank: Option<(u32, u32)>,
     fb: &mut [u32],
     visible_line0: i32,
     rows: usize,
@@ -3397,7 +3498,7 @@ fn apply_programmable_blanking(
         }
     };
 
-    if let Some((strt, stop)) = agnus.programmable_vertical_blank() {
+    if let Some((strt, stop)) = programmable_vertical_blank {
         for y in 0..rows {
             let vpos = (visible_line0 + y as i32).max(0) as u32;
             if in_window(vpos, strt, stop) {
@@ -3406,7 +3507,7 @@ fn apply_programmable_blanking(
         }
     }
 
-    if let Some((strt, stop)) = agnus.programmable_horizontal_blank() {
+    if let Some((strt, stop)) = programmable_horizontal_blank {
         // HBSTRT/HBSTOP are in colour clocks; one colour clock spans two
         // lo-res DIW positions, i.e. four hi-res framebuffer pixels.
         let mut blank_cols = [false; FB_WIDTH];
@@ -3459,6 +3560,14 @@ fn render_planned_playfield_line(
     // the copper-x position and continue to advance with `control_segment_idx`.
     let mut scroll_bplcon1 = base_scroll_bplcon1;
     let mut scroll_segment_idx = 0usize;
+    // Playfield-collision classification (clxcon_planes_match) depends only on
+    // the bitplane index and the constant control fields (CLXCON/CLXCON2, plane
+    // count, dual-playfield), so memoize it per control run as a 256-entry
+    // table indexed by the sample index. This lifts a per-plane matching loop
+    // out of the per-pixel path; the table is rebuilt only when those control
+    // inputs change.
+    let mut collision_key: Option<(u16, u16, bool, usize)> = None;
+    let mut collision_table = [CollisionPixel::default(); 256];
     // The loop runs in segment-bounded chunks: control, scroll, and palette
     // segments apply at pixel boundaries (x stepping by pixel_repeat), so
     // between two boundaries every control-derived value is constant and is
@@ -3518,6 +3627,26 @@ fn render_planned_playfield_line(
         let nplanes = sample_control.nplanes().min(plan.plane_words.len());
         let delays = std::array::from_fn(|plane| sample_control.scroll_for_plane(plane));
 
+        let collision_dual = pixel_control.dual_playfield();
+        let collision_key_now = (
+            pixel_control.clxcon,
+            pixel_control.clxcon2,
+            collision_dual,
+            nplanes,
+        );
+        if collision_key != Some(collision_key_now) {
+            collision_table = std::array::from_fn(|idx| {
+                collision_pixel(
+                    idx as u8,
+                    nplanes,
+                    pixel_control.clxcon,
+                    pixel_control.clxcon2,
+                    collision_dual,
+                )
+            });
+            collision_key = Some(collision_key_now);
+        }
+
         loop {
             let output_native_x = ((x - plan.x_start) / pixel_repeat) * native_per_pixel;
             let Some(relative_native_x) = output_native_x.checked_sub(pixel_fetch_start_native_x)
@@ -3558,20 +3687,24 @@ fn render_planned_playfield_line(
                     denise_playfield_output(pixel_control, palette, sample.idx, &mut ham_color),
                 )
             };
+            // Collision classification is identical for every framebuffer
+            // pixel of this native sample, so look it up once. CLXDAT only
+            // accumulates set bits, so ORing it here (rather than once per
+            // written pixel) is equivalent: a visible sample writes at least
+            // one in-window pixel.
+            let collision = collision_table[sample.idx as usize];
+            let pf_mask = u8::from(collision.pf1) | (u8::from(collision.pf2) << 1);
+            *clxdat |= collision.clxdat_bits();
             for dx in 0..pixel_repeat {
                 let pixel_x = x + dx;
                 if pixel_x >= plan.x_stop || pixel_x < win_x_start || pixel_x >= win_x_stop {
                     continue;
                 }
                 let fb_idx = plan.y * FB_WIDTH + pixel_x;
-                record_generated_playfield_collision_pixel(
-                    playfield_mask,
-                    collision_pixels,
-                    clxdat,
-                    fb_idx,
-                    sample,
-                    pixel_control,
-                );
+                if pf_mask != 0 {
+                    playfield_mask[fb_idx] = pf_mask;
+                }
+                collision_pixels[fb_idx] = collision;
                 let transparent =
                     pixel_control.genlock_transparent(output.color_latch, Some(sample), false);
                 fb[fb_idx] = rgb24_to_rgba8_alpha(output.color, !transparent);
@@ -5239,7 +5372,13 @@ mod tests {
 
         const FILL: u32 = 0xFFAA_BBCC;
         let mut fb = vec![FILL; FB_PIXELS];
-        apply_programmable_blanking(&agnus, &mut fb, PAL_VISIBLE_LINE0, FB_HEIGHT);
+        apply_programmable_blanking(
+            agnus.programmable_vertical_blank(),
+            agnus.programmable_horizontal_blank(),
+            &mut fb,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
 
         let row = |fb: &[u32], y: usize| fb[y * FB_WIDTH];
         assert_eq!(row(&fb, 0x23), FILL, "line before VBSTRT untouched");
@@ -5250,7 +5389,13 @@ mod tests {
         // Without VARVBEN the window is ignored.
         agnus.write_beamcon0(BEAMCON0_PAL);
         let mut fb = vec![FILL; FB_PIXELS];
-        apply_programmable_blanking(&agnus, &mut fb, PAL_VISIBLE_LINE0, FB_HEIGHT);
+        apply_programmable_blanking(
+            agnus.programmable_vertical_blank(),
+            agnus.programmable_horizontal_blank(),
+            &mut fb,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
         assert_eq!(row(&fb, 0x24), FILL);
     }
 
@@ -5270,7 +5415,13 @@ mod tests {
 
         const FILL: u32 = 0xFFAA_BBCC;
         let mut fb = vec![FILL; FB_PIXELS];
-        apply_programmable_blanking(&agnus, &mut fb, PAL_VISIBLE_LINE0, FB_HEIGHT);
+        apply_programmable_blanking(
+            agnus.programmable_vertical_blank(),
+            agnus.programmable_horizontal_blank(),
+            &mut fb,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
 
         let x_first = ((0x80 - DIW_HSTART_FB0) * 2) as usize;
         let x_last = ((0x90 - DIW_HSTART_FB0) * 2) as usize - 1;
@@ -5295,7 +5446,13 @@ mod tests {
         ocs.write_vbstop(0x58);
         const FILL: u32 = 0xFFAA_BBCC;
         let mut fb = vec![FILL; FB_PIXELS];
-        apply_programmable_blanking(&ocs, &mut fb, PAL_VISIBLE_LINE0, FB_HEIGHT);
+        apply_programmable_blanking(
+            ocs.programmable_vertical_blank(),
+            ocs.programmable_horizontal_blank(),
+            &mut fb,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
         assert!(fb.iter().all(|&px| px == FILL));
 
         // VBSTRT >= VBSTOP wraps through the frame top: everything from
@@ -5306,7 +5463,13 @@ mod tests {
         ecs.write_vbstrt(0x120);
         ecs.write_vbstop(0x30);
         let mut fb = vec![FILL; FB_PIXELS];
-        apply_programmable_blanking(&ecs, &mut fb, PAL_VISIBLE_LINE0, FB_HEIGHT);
+        apply_programmable_blanking(
+            ecs.programmable_vertical_blank(),
+            ecs.programmable_horizontal_blank(),
+            &mut fb,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
         let row = |fb: &[u32], y: usize| fb[y * FB_WIDTH];
         // Beam line 0x2C (row 0) is below VBSTOP 0x30: blanked.
         assert_eq!(row(&fb, 0), 0xFF00_0000);

@@ -209,6 +209,12 @@ at the cost of a slight motion trail. Off by default so screenshots and
 frame dumps stay frame-exact. `COPPERLINE_PHOSPHOR=0.4` overrides the
 config for a single run.
 
+Rendering completed frames uses a worker thread by default so emulation can
+advance while the previous frame is painted. The worker is an implementation
+detail of presentation: screenshots, frame dumps, and recordings wait for
+the exact frame they save. `COPPERLINE_THREADED_RENDER=0` forces the old
+synchronous render path for comparison.
+
 ## `[audio]`
 
 ```toml

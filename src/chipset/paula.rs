@@ -48,6 +48,7 @@ const INT_AUDX: [u16; 4] = [INT_AUD0, INT_AUD1, INT_AUD2, INT_AUD3];
 const INTREQ_MASK: u16 = 0x7FFF;
 const SERPER_LONG: u16 = 1 << 15;
 const ADKCON_UARTBRK: u16 = 1 << 11;
+const ADKCON_AUDIO_MOD_EVENT_MASK: u16 = 0x0077;
 
 /// DMACON.DMAEN master enable. Stored on agnus.dmacon; Paula audio
 /// gating ANDs this with the per-channel AUDxEN bits 0..3.
@@ -714,6 +715,14 @@ impl Paula {
         self.adkcon & (volume_attach | period_attach) != 0
     }
 
+    fn channel_drives_audio_modulation(&self, ch_idx: usize) -> bool {
+        ch_idx < 3 && self.channel_attached_as_modulator(ch_idx)
+    }
+
+    fn audio_modulation_events_enabled(&self) -> bool {
+        self.adkcon & ADKCON_AUDIO_MOD_EVENT_MASK != 0
+    }
+
     pub fn write_potgo(&mut self, val: u16) {
         self.potgo = val & 0xFF01;
         if val & 0x0001 != 0 {
@@ -1218,6 +1227,7 @@ impl Paula {
     pub fn grant_audio_dma(&mut self, ch_idx: usize, word: u16) -> u16 {
         let ptr_mask = self.dma_ptr_mask();
         let min_period = u32::from(self.audio_min_period_cck);
+        let source_modulates = self.channel_drives_audio_modulation(ch_idx);
         let Some(ch) = self.chans.get_mut(ch_idx) else {
             return 0;
         };
@@ -1246,21 +1256,32 @@ impl Paula {
             ch.phase = 1;
             ch.period_acc = 0;
             ch.state = ChanState::Running;
-            let loaded_word = ((ch.word_hi as u8 as u16) << 8) | ch.word_lo as u8 as u16;
-            self.apply_audio_modulation(&[AudioModEvent {
-                source: ch_idx,
-                word: loaded_word,
-                word_start: true,
-            }]);
+            if source_modulates {
+                let loaded_word = ((ch.word_hi as u8 as u16) << 8) | ch.word_lo as u8 as u16;
+                self.apply_audio_modulation(&[AudioModEvent {
+                    source: ch_idx,
+                    word: loaded_word,
+                    word_start: true,
+                }]);
+            }
         }
         irq_bits
     }
 
     fn advance_audio_channels(&mut self, cck: u32) -> u16 {
+        if self.audio_modulation_events_enabled() {
+            self.advance_audio_channels_inner::<true>(cck)
+        } else {
+            self.advance_audio_channels_inner::<false>(cck)
+        }
+    }
+
+    fn advance_audio_channels_inner<const MODULATE: bool>(&mut self, cck: u32) -> u16 {
         let mut irq_bits = 0;
-        let mut mod_events = Vec::new();
+        let mut mod_events = MODULATE.then(Vec::new);
         let ptr_mask = self.dma_ptr_mask();
         for ch_idx in 0..4 {
+            let source_modulates = MODULATE && self.channel_drives_audio_modulation(ch_idx);
             let ch = &mut self.chans[ch_idx];
             if matches!(ch.state, ChanState::Off | ChanState::ManualHold) {
                 continue;
@@ -1325,19 +1346,29 @@ impl Paula {
                     // Emit the next byte and advance phase.
                     if ch.phase == 0 {
                         ch.current = ch.word_hi;
-                        mod_events.push(AudioModEvent {
-                            source: ch_idx,
-                            word: ((ch.word_hi as u8 as u16) << 8) | ch.word_lo as u8 as u16,
-                            word_start: true,
-                        });
+                        if source_modulates {
+                            if let Some(mod_events) = mod_events.as_mut() {
+                                mod_events.push(AudioModEvent {
+                                    source: ch_idx,
+                                    word: ((ch.word_hi as u8 as u16) << 8)
+                                        | ch.word_lo as u8 as u16,
+                                    word_start: true,
+                                });
+                            }
+                        }
                         ch.phase = 1;
                     } else {
                         ch.current = ch.word_lo;
-                        mod_events.push(AudioModEvent {
-                            source: ch_idx,
-                            word: ((ch.word_hi as u8 as u16) << 8) | ch.word_lo as u8 as u16,
-                            word_start: false,
-                        });
+                        if source_modulates {
+                            if let Some(mod_events) = mod_events.as_mut() {
+                                mod_events.push(AudioModEvent {
+                                    source: ch_idx,
+                                    word: ((ch.word_hi as u8 as u16) << 8)
+                                        | ch.word_lo as u8 as u16,
+                                    word_start: false,
+                                });
+                            }
+                        }
                         ch.phase = 0;
                         // Whole 16-bit word consumed: promote the word the
                         // DMA slot fetched ahead into the holding register.
@@ -1355,7 +1386,9 @@ impl Paula {
                 }
             }
         }
-        self.apply_audio_modulation(&mod_events);
+        if let Some(mod_events) = mod_events {
+            self.apply_audio_modulation(&mod_events);
+        }
         irq_bits
     }
 

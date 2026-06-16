@@ -4,7 +4,9 @@ The renderer's central rule: **it never races the chipset.** The chipset
 does not paint pixels as it runs; instead, every render-relevant event is
 recorded with its beam position, and the renderer replays the completed
 frame's events afterwards. The live emulation and the painting of pixels
-are decoupled in time but exact in beam position.
+are decoupled in time but exact in beam position. In normal windowed and
+headless runs, replay happens on the default render worker; the CPU,
+custom-chip model, and GPU presentation remain on the main thread.
 
 ## Recording: beam events (`video/beam.rs`)
 
@@ -60,6 +62,41 @@ Two vertical edge cases the replay honours:
   the beam never produces those lines, and a deep-overscan window would
   otherwise let the replay keep walking bitplane memory past the image.
 
+## Threaded frame handoff (`RenderInput`, `video/window.rs`)
+
+At frame end, `Bus::begin_new_beam_frame` freezes the just-finished frame:
+the render-event journal, chip-RAM snapshot, captured bitplane/sprite DMA
+rows, palette split, display geometry, visible start line, and Agnus
+programmable blanking latches become the source for
+`RenderInput::from_bus`. `render_from_input` consumes only that owned
+bundle, so the main thread can start emulating frame N+1 while the worker
+renders frame N.
+
+`window.rs` starts a persistent `copperline-render` worker by default.
+`COPPERLINE_THREADED_RENDER=0` (also `false`, `off`, or `no`) disables the
+worker and uses the synchronous wrapper path. The default worker owns a
+scratch framebuffer and the deinterlacer history, calls
+`bitplane::render_from_input`, applies the same presentation post-processing
+as the synchronous path, and returns a presentation framebuffer tagged with
+the render generation and emulated frame number. Resets, power changes, and
+save-state loads bump the generation so stale worker results are ignored
+instead of being shown after the machine timeline changes.
+
+The worker never mutates emulator-visible hardware state. `CLXDAT`
+collisions are CPU-visible Denise state, so the bus completes unread live
+collision replay to the end of the frame before rolling the frame buffers.
+The synchronous fallback still ORs the render result's collision bits into
+Denise after painting, but the threaded path treats those bits as diagnostic
+render output and records only the returned render timing on the main
+thread.
+
+wgpu and winit remain main-thread-only: the worker paints CPU buffers, and
+the main thread uploads the newest completed presentation buffer to the
+`pixels` surface. Normal display can be one frame behind emulation; exact
+capture paths call `finish_render_for_current_frame` so screenshots, frame
+dumps, recordings, debugger step, and run-to-PC output use the requested
+emulated frame.
+
 ## Interlace (`video/deinterlace.rs`)
 
 Interlaced (LACE) content is presented through a motion-adaptive
@@ -73,6 +110,8 @@ sideways so dithered moving art bobs as a region instead of weaving and
 interpolating on alternate pixels.
 Progressive content is line-doubled without history.
 `COPPERLINE_DEINTERLACE=0` falls back to plain line doubling.
+In the default threaded pipeline the worker owns this history; the
+synchronous fallback keeps it on the window `App`.
 
 ## Known display gaps
 
@@ -90,7 +129,9 @@ Progressive content is line-doubled without history.
 
 `window.rs` owns the winit `ApplicationHandler` and the `pixels` GPU
 surface: the field is presented at a TV-like 4:3 aspect plus the
-44-pixel status bar, scaling continuously with the window.
+44-pixel status bar, scaling continuously with the window. The GPU surface
+is fed from `present_fb`, the post-processed presentation buffer produced by
+either the render worker or the synchronous fallback.
 
 Two presentation-only adjustments (they never alter the emulated
 framebuffer):
@@ -114,7 +155,9 @@ against a real emulator instance in the unit tests.
 
 `--screenshot-after` and `--dump-frames` render through the identical
 pipeline with the window hidden; PNGs are scaled to the same geometry the
-window would present. The [headless debugger](../debugger/headless)
+window would present. Because the default render worker may be one frame
+behind, these paths wait for the worker result matching the target emulated
+frame before writing the PNG. The [headless debugger](../debugger/headless)
 `COPPERLINE_DBG_SHOT` hook reuses the same path to capture the last
 completed frame at a breakpoint.
 
@@ -132,9 +175,10 @@ Capture is locked to the emulated timeline, not the host clock. Paula
 carries an optional capture tap that collects every mixed stereo frame
 (before the master output volume); the window drains it once per
 emulated frame and, when the frame loop completed a new emulated frame,
-pushes the deinterlacer output through the same `scale_y_into`
-presentation resample as screenshots. At finish the AVI's video
-rate/scale is patched from the exact frames-to-audio-samples ratio, so
+waits for the matching presentation buffer before pushing it through the
+same `scale_y_into` presentation resample as screenshots. At finish the
+AVI's video rate/scale is patched from the exact frames-to-audio-samples
+ratio, so
 a nominal "50 fps" label never drifts against PAL's true field rate and
 warp-speed captures play back at normal speed. The REC badge, status
 bar, OSD, and menus are drawn into the presentation texture after
