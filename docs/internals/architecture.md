@@ -47,7 +47,7 @@ src/
     beam.rs         # beam-position event index for the renderer
     bitplane.rs     # event replay + planar->RGBA renderer
     deinterlace.rs  # motion-adaptive deinterlacer
-    window.rs       # winit ApplicationHandler + pixels surface + status bar
+    window.rs       # winit ApplicationHandler + render worker + pixels surface + status bar
     ui.rs           # pop-up menu + overlay windows (debugger etc.)
     font.rs         # 8x8 overlay font
 vendor/m68k/        # vendored m68k CPU core
@@ -57,12 +57,14 @@ timing-test/        # bootable cross-emulator timing-measurement disk
 
 ## The big picture
 
-Copperline runs synchronously on the main thread inside winit's event
-loop. There is no emulation thread and no locking between CPU and chipset:
-each turn of the loop (`Emulator::step_real`, `src/emulator.rs`) advances
-the deterministic core a frame's worth of emulated time, cycle-stepping the
-CPU and the chipset together, then presentation paints from what the core
-recorded.
+Copperline's emulated machine runs synchronously on the main thread inside
+winit's event loop. There is no emulation thread and no locking between CPU
+and chipset: each turn of the loop (`Emulator::step_real`,
+`src/emulator.rs`) advances the deterministic core a frame's worth of
+emulated time, cycle-stepping the CPU and the chipset together. By default,
+the completed-frame renderer runs one frame behind on a worker thread; set
+`COPPERLINE_THREADED_RENDER=0` to use the synchronous renderer for
+comparison.
 
 The flow of a frame:
 
@@ -78,10 +80,20 @@ The flow of a frame:
 3. When the CPU sits in `STOP`, the loop fast-forwards device time to the
    next event (timer underflow, raised interrupt) instead of spinning.
 4. Render-relevant register writes (by Copper or CPU) are recorded as
-   beam-position events. At presentation time the renderer replays them to
-   paint the framebuffer; it never races the live chipset state
-   ([](video)).
-5. For the interactive window the loop sleeps to pace emulated time to
+   beam-position events. At the frame boundary, the bus turns the completed
+   frame's events, chip-RAM snapshot, display geometry, and Agnus blanking
+   latches into an owned `RenderInput`; the renderer replays that snapshot,
+   never the live chipset state ([](video)).
+5. In the default path `window.rs` sends `RenderInput` to the
+   `copperline-render` worker while the main thread advances the next frame.
+   The worker paints into a CPU framebuffer, owns the deinterlacer history,
+   and returns a presentation buffer tagged with the emulated frame. GPU
+   upload and winit/window operations stay on the main thread.
+6. For screenshots, frame dumps, video recording, debugger stepping, and
+   run-to-PC commands, the window code waits for the worker result for the
+   exact emulated frame being captured or inspected. For normal interactive
+   display, one frame of presentation latency is allowed.
+7. For the interactive window the loop sleeps to pace emulated time to
    wall-clock; for headless captures it does not. The emulated result is
    identical either way -- pacing only schedules host work.
 

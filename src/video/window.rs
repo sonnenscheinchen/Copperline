@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! winit + pixels integration. The emulator runs synchronously on the
-//! main thread inside `about_to_wait`, so the window's responsiveness
-//! is bounded by how long one frame of emulation takes.
+//! winit + pixels integration. The emulator core runs synchronously on the
+//! main thread inside `about_to_wait`; by default a worker renders the
+//! completed frame while the main thread advances the next frame. winit and
+//! wgpu presentation stay on the main thread.
 
-use super::deinterlace::Deinterlacer;
+use super::deinterlace::{Deinterlacer, OUT_HEIGHT};
 use super::ui::{self, Panel, UiControl, UiState};
 use super::{
-    bitplane, blend_rgba, font, FB_HEIGHT, FB_PIXELS, FB_WIDTH, HOST_SHORTCUT_MODIFIER_LABEL,
-    MAX_FB_PIXELS, PRESENT_HEIGHT,
+    bitplane, blend_rgba, font, FrameGeometry, FB_HEIGHT, FB_PIXELS, FB_WIDTH,
+    HOST_SHORTCUT_MODIFIER_LABEL, MAX_FB_PIXELS, PRESENT_HEIGHT,
 };
-use crate::bus::{BeamWriteSource, FrontPanelStatus};
+use crate::bus::{BeamWriteSource, FrontPanelStatus, VideoRenderFrameTiming};
 use crate::config::Overscan;
 use crate::emulator::Emulator;
 use crate::screenshot;
@@ -244,7 +245,11 @@ use log::{error, info, warn};
 use pixels::{Pixels, ScalingMode, SurfaceTexture};
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    mpsc::{self, Receiver, SyncSender, TryRecvError},
+    Arc, OnceLock,
+};
+use std::thread::JoinHandle;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -262,7 +267,13 @@ pub struct App {
     /// buffer that the window texture, screenshots, and frame dumps
     /// read (see [`deinterlace`](super::deinterlace)).
     deinterlacer: Deinterlacer,
+    /// Active presentation buffer, already deinterlaced/line-doubled and
+    /// post-processed. The first `present_rows * FB_WIDTH` pixels are valid.
+    present_fb: Vec<u32>,
+    present_rows: usize,
     render: Option<Render>,
+    render_worker: Option<RenderWorker>,
+    render_recycle_fb: Vec<u32>,
     cpu_halted: bool,
     /// Host-level power state. When false the emulator does not step;
     /// the machine sits powered off until the status-bar power button
@@ -316,6 +327,8 @@ pub struct App {
     mouse_captured: bool,
     mouse_delta_remainder: (f64, f64),
     last_rendered_emulated_frame: Option<u64>,
+    last_submitted_render_frame: Option<u64>,
+    render_generation: u64,
     last_fdd_track: Option<u8>,
     /// Transient on-screen overlay message (screenshot saved, disk
     /// swapped), or None when nothing is being shown.
@@ -407,6 +420,90 @@ struct Render {
     texture_scale: usize,
 }
 
+struct RenderJob {
+    generation: u64,
+    input: bitplane::RenderInput,
+    h_shift: usize,
+    overscan: Overscan,
+    presentation_fb: Vec<u32>,
+}
+
+struct RenderWorkerResult {
+    generation: u64,
+    emulated_frame: u64,
+    timing: VideoRenderFrameTiming,
+    presentation_fb: Vec<u32>,
+    present_rows: usize,
+}
+
+struct RenderWorker {
+    job_tx: Option<SyncSender<RenderJob>>,
+    result_rx: Receiver<RenderWorkerResult>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RenderWorker {
+    fn new(phosphor: f32) -> Self {
+        let (job_tx, job_rx) = mpsc::sync_channel::<RenderJob>(1);
+        let (result_tx, result_rx) = mpsc::channel::<RenderWorkerResult>();
+        let handle = std::thread::Builder::new()
+            .name("copperline-render".to_string())
+            .spawn(move || {
+                let mut fb = vec![0u32; MAX_FB_PIXELS];
+                let mut deinterlacer = Deinterlacer::with_phosphor(phosphor);
+                while let Ok(mut job) = job_rx.recv() {
+                    let result = render_job_to_presentation(
+                        job.generation,
+                        &job.input,
+                        &mut fb,
+                        &mut deinterlacer,
+                        job.h_shift,
+                        job.overscan,
+                        &mut job.presentation_fb,
+                    );
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn render worker");
+        Self {
+            job_tx: Some(job_tx),
+            result_rx,
+            handle: Some(handle),
+        }
+    }
+
+    fn send(&self, job: RenderJob) -> std::result::Result<(), Vec<u32>> {
+        match self
+            .job_tx
+            .as_ref()
+            .expect("render worker sender missing")
+            .send(job)
+        {
+            Ok(()) => Ok(()),
+            Err(err) => Err(err.0.presentation_fb),
+        }
+    }
+
+    fn try_recv(&self) -> std::result::Result<RenderWorkerResult, TryRecvError> {
+        self.result_rx.try_recv()
+    }
+
+    fn recv(&self) -> std::result::Result<RenderWorkerResult, mpsc::RecvError> {
+        self.result_rx.recv()
+    }
+}
+
+impl Drop for RenderWorker {
+    fn drop(&mut self) {
+        self.job_tx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl App {
     pub fn new(
         emu: Emulator,
@@ -432,11 +529,19 @@ impl App {
             || screenshot_after.is_some()
             || save_state_after.is_some()
             || frame_dump.is_some();
+        let render_worker = threaded_render_enabled().then(|| {
+            info!("threaded render pipeline enabled");
+            RenderWorker::new(phosphor)
+        });
         Self {
             emu,
             fb: vec![0u32; MAX_FB_PIXELS],
             deinterlacer: Deinterlacer::with_phosphor(phosphor),
+            present_fb: vec![0u32; FB_WIDTH * OUT_HEIGHT],
+            present_rows: OUT_HEIGHT,
             render: None,
+            render_worker,
+            render_recycle_fb: Vec::new(),
             cpu_halted: false,
             powered_on,
             paused: false,
@@ -470,6 +575,8 @@ impl App {
             mouse_captured: false,
             mouse_delta_remainder: (0.0, 0.0),
             last_rendered_emulated_frame: None,
+            last_submitted_render_frame: None,
+            render_generation: 0,
             last_fdd_track: None,
             osd: None,
             disk_playlists,
@@ -632,6 +739,7 @@ impl ApplicationHandler for App {
             paint_test_screen(&mut self.fb);
             self.deinterlacer
                 .push_field(&self.fb, FB_HEIGHT, false, true, true);
+            self.refresh_present_from_deinterlacer();
         }
         self.request_redraw();
         if let Some((secs, path)) = self.pending_auto_shot.take() {
@@ -990,12 +1098,7 @@ impl ApplicationHandler for App {
                 let input_recording = self.input_recorder.is_some();
                 if let Some(r) = self.render.as_mut() {
                     let frame = r.pixels.frame_mut();
-                    copy_present_frame(
-                        self.deinterlacer.output(),
-                        self.deinterlacer.output_rows(),
-                        frame,
-                        r.texture_scale,
-                    );
+                    copy_present_frame(&self.present_fb, self.present_rows, frame, r.texture_scale);
                     draw_status_bar(frame, &view, r.texture_scale);
                     if recording {
                         // Painted into the presentation texture only, so
@@ -1102,7 +1205,10 @@ impl ApplicationHandler for App {
         let now = Instant::now();
         // While powered off, leave the parked test screen in place; the
         // emulator is not advancing, so there is no new frame to show.
-        let rendered = self.powered_on && self.render_emulated_frame_if_needed();
+        let mut rendered = self.powered_on && self.render_emulated_frame_if_needed();
+        if self.recorder.is_some() && self.powered_on {
+            rendered |= self.finish_render_for_current_frame();
+        }
         self.capture_recorder_output(rendered);
         // Headless capture (screenshot/frame-dump) builds the framebuffer
         // for the saved PNG but never needs to present to the window;
@@ -1236,6 +1342,7 @@ impl ApplicationHandler for App {
         }
         if let Some((secs, path)) = self.auto_shot.take() {
             if self.emu.bus().emulated_seconds() >= secs as f64 {
+                self.finish_render_for_current_frame();
                 self.save_screenshot(&path);
                 self.emu.report_stats();
                 self.emu.bus().poll_stats.dump_top("at screenshot");
@@ -1262,6 +1369,68 @@ fn set_mouse_button(emu: &mut Emulator, button: MouseButtonKind, pressed: bool) 
         MouseButtonKind::Right => input.rmb_port1 = pressed,
         MouseButtonKind::Middle => input.mmb_port1 = pressed,
     }
+}
+
+fn render_job_to_presentation(
+    generation: u64,
+    input: &bitplane::RenderInput,
+    fb: &mut [u32],
+    deinterlacer: &mut Deinterlacer,
+    h_shift: usize,
+    overscan: Overscan,
+    presentation_fb: &mut Vec<u32>,
+) -> RenderWorkerResult {
+    let render_result = bitplane::render_from_input(input, fb);
+    let geometry = input.geometry();
+    let visible_start_vpos = input.visible_start_vpos();
+    let field_rows =
+        post_process_rendered_field(fb, geometry, visible_start_vpos, h_shift, overscan);
+    let base = input.render_base();
+    deinterlacer.push_field(
+        fb,
+        field_rows,
+        base.bplcon0 & 0x0004 != 0,
+        base.long_field,
+        !geometry.programmable,
+    );
+    let present_rows = deinterlacer.output_rows();
+    let active = present_rows * FB_WIDTH;
+    presentation_fb.resize(active, 0);
+    presentation_fb.copy_from_slice(&deinterlacer.output()[..active]);
+    RenderWorkerResult {
+        generation,
+        emulated_frame: input.emulated_frames(),
+        timing: render_result.timing,
+        presentation_fb: std::mem::take(presentation_fb),
+        present_rows,
+    }
+}
+
+fn post_process_rendered_field(
+    fb: &mut [u32],
+    geometry: FrameGeometry,
+    visible_start_vpos: u32,
+    h_shift: usize,
+    overscan: Overscan,
+) -> usize {
+    let field_rows = geometry.visible_lines.min(fb.len() / FB_WIDTH);
+    // Vertical/horizontal recentring and the TV bezel mask are 15 kHz
+    // CRT concepts anchored to the standard PAL/NTSC window; a
+    // programmable scan defines its own window and presents in full,
+    // like a multisync monitor.
+    if !geometry.programmable {
+        center_present_frame_for_visible_start(fb, visible_start_vpos);
+        center_present_frame_horizontally(fb, h_shift);
+        if overscan == Overscan::Tv {
+            mask_present_frame_to_tv(fb, h_shift, standard_window_top_row(visible_start_vpos));
+        }
+    } else if geometry.line_cck != 227 {
+        // A multisync monitor's horizontal deflection is time-linear:
+        // each colour clock of this scan's shorter/longer line covers
+        // 227/line_cck of the glass a standard line's clock would.
+        screenshot::stretch_rows_x(fb, FB_WIDTH, field_rows, geometry.line_cck, 227);
+    }
+    field_rows
 }
 
 fn log_frame_dump_metadata(index: u32, emu: &Emulator) {
@@ -3990,7 +4159,7 @@ impl App {
                     self.cpu_halted = false;
                     // Force a fresh presentation: the restored frame counter
                     // may equal (or precede) the last rendered one.
-                    self.last_rendered_emulated_frame = None;
+                    self.reset_render_pipeline();
                     self.show_osd(format!("Loaded {}", display_file_name(&path)));
                     self.request_redraw();
                 }
@@ -4041,7 +4210,7 @@ impl App {
                     self.powered_on = true;
                     self.cpu_halted = false;
                     // The cold reset restarts the frame timeline; force a repaint.
-                    self.last_rendered_emulated_frame = None;
+                    self.reset_render_pipeline();
                     self.show_osd(format!("ROM: {}", display_file_name(&main_path)));
                     self.request_redraw();
                 }
@@ -4126,9 +4295,9 @@ impl App {
             rec.push_audio(&samples);
             if rendered {
                 screenshot::scale_y_into(
-                    self.deinterlacer.output(),
+                    &self.present_fb,
                     FB_WIDTH,
-                    self.deinterlacer.output_rows(),
+                    self.present_rows,
                     PRESENT_HEIGHT,
                     &mut self.record_fb,
                 );
@@ -4188,7 +4357,7 @@ impl App {
                 break;
             }
         }
-        self.render_emulated_frame_if_needed();
+        self.finish_render_for_current_frame();
     }
 
     /// Run until the PC reaches the address typed in the entry box,
@@ -4220,7 +4389,7 @@ impl App {
                 self.sync_live_audio_suspension();
             }
         }
-        self.render_emulated_frame_if_needed();
+        self.finish_render_for_current_frame();
     }
 
     /// Surface a pending breakpoint/watchpoint hit: pause the machine,
@@ -4794,18 +4963,18 @@ impl App {
         // for standard fields, the native scan height for programmable
         // modes): the presentation resampler blends adjacent lines, so
         // per-scanline forensics need the unscaled field.
-        let src_rows = self.deinterlacer.output_rows();
+        let src_rows = self.present_rows;
         let result = if crate::envcfg::flag("COPPERLINE_SHOT_RAW") {
             screenshot::save(
                 path,
-                &self.deinterlacer.output()[..src_rows * FB_WIDTH],
+                &self.present_fb[..src_rows * FB_WIDTH],
                 FB_WIDTH as u32,
                 src_rows as u32,
             )
         } else {
             screenshot::save_scaled_y(
                 path,
-                self.deinterlacer.output(),
+                &self.present_fb,
                 FB_WIDTH as u32,
                 src_rows as u32,
                 PRESENT_HEIGHT as u32,
@@ -4822,6 +4991,7 @@ impl App {
     /// presentation texture after the frame is captured, so it never
     /// appears in the saved image.
     fn take_screenshot(&mut self) {
+        self.finish_render_for_current_frame();
         let path = screenshot::auto_filename();
         self.save_screenshot(&path);
         self.show_osd(format!("Saved {}", display_file_name(&path)));
@@ -4853,7 +5023,7 @@ impl App {
     }
 
     fn dump_frame_if_due(&mut self, _now: Instant, event_loop: &ActiveEventLoop) -> bool {
-        let Some(state) = self.frame_dump.as_mut() else {
+        let Some(state) = self.frame_dump.as_ref() else {
             return false;
         };
         if self.emu.bus().emulated_seconds() < state.start_secs as f64 {
@@ -4863,16 +5033,20 @@ impl App {
         if state.last_saved_emulated_frame == Some(emulated_frame) {
             return false;
         }
+        self.finish_render_for_current_frame();
 
+        let Some(state) = self.frame_dump.as_mut() else {
+            return false;
+        };
         let path = state.dir.join(format!("frame-{:06}.png", state.dumped));
         if crate::envcfg::flag("COPPERLINE_DUMP_RENDER_META") {
             log_frame_dump_metadata(state.dumped, &self.emu);
         }
         match screenshot::save_scaled_y(
             &path,
-            self.deinterlacer.output(),
+            &self.present_fb,
             FB_WIDTH as u32,
-            self.deinterlacer.output_rows() as u32,
+            self.present_rows as u32,
             PRESENT_HEIGHT as u32,
         ) {
             Ok(()) => {
@@ -4956,11 +5130,12 @@ impl App {
             self.sync_live_audio_suspension();
         }
         self.held_rawkeys = [false; 128];
-        self.last_rendered_emulated_frame = None;
+        self.reset_render_pipeline();
         self.last_fdd_track = None;
         paint_test_screen(&mut self.fb);
         self.deinterlacer
             .push_field(&self.fb, FB_HEIGHT, false, true, true);
+        self.refresh_present_from_deinterlacer();
     }
 
     fn reset_emulator(&mut self, clear_host_keys: bool) {
@@ -4971,7 +5146,7 @@ impl App {
         } else {
             self.cpu_halted = false;
             self.sync_live_audio_suspension();
-            self.last_rendered_emulated_frame = None;
+            self.reset_render_pipeline();
             self.last_fdd_track = None;
             if clear_host_keys {
                 self.held_rawkeys = [false; 128];
@@ -4979,7 +5154,129 @@ impl App {
         }
     }
 
+    fn refresh_present_from_deinterlacer(&mut self) {
+        let rows = self.deinterlacer.output_rows();
+        let active = rows * FB_WIDTH;
+        self.present_fb.resize(active, 0);
+        self.present_fb
+            .copy_from_slice(&self.deinterlacer.output()[..active]);
+        self.present_rows = rows;
+    }
+
+    fn reset_render_pipeline(&mut self) {
+        self.render_generation = self.render_generation.wrapping_add(1);
+        self.last_rendered_emulated_frame = None;
+        self.last_submitted_render_frame = None;
+        let _ = self.collect_threaded_render_results(false);
+    }
+
+    fn apply_threaded_render_result(&mut self, result: RenderWorkerResult) -> bool {
+        if result.generation != self.render_generation {
+            if self.render_recycle_fb.is_empty() {
+                self.render_recycle_fb = result.presentation_fb;
+            }
+            return false;
+        }
+
+        self.emu.bus_mut().record_video_render_frame(result.timing);
+        let old = std::mem::replace(&mut self.present_fb, result.presentation_fb);
+        self.render_recycle_fb = old;
+        self.present_rows = result.present_rows;
+        self.last_rendered_emulated_frame = Some(result.emulated_frame);
+        true
+    }
+
+    fn collect_threaded_render_results(&mut self, wait: bool) -> bool {
+        let mut rendered = false;
+        loop {
+            let result = match self.render_worker.as_ref() {
+                Some(worker) if wait => match worker.recv() {
+                    Ok(result) => result,
+                    Err(_) => {
+                        self.render_worker = None;
+                        return rendered;
+                    }
+                },
+                Some(worker) => match worker.try_recv() {
+                    Ok(result) => result,
+                    Err(TryRecvError::Empty) => return rendered,
+                    Err(TryRecvError::Disconnected) => {
+                        self.render_worker = None;
+                        return rendered;
+                    }
+                },
+                None => return rendered,
+            };
+            rendered |= self.apply_threaded_render_result(result);
+            if wait {
+                return rendered;
+            }
+        }
+    }
+
+    fn render_emulated_frame_threaded(&mut self) -> bool {
+        let mut rendered = self.collect_threaded_render_results(false);
+        let emulated_frame = self.emu.bus().emulated_frames();
+        if !should_render_emulated_frame(self.last_submitted_render_frame, emulated_frame) {
+            return rendered;
+        }
+
+        let input = bitplane::RenderInput::from_bus(self.emu.bus());
+        let h_shift = if self.hcenter {
+            let base = input.render_base();
+            bitplane::present_h_shift(
+                base.diwhigh.h_start(base.diwstrt),
+                base.diwhigh.h_stop(base.diwstop),
+            )
+        } else {
+            0
+        };
+        let job = RenderJob {
+            generation: self.render_generation,
+            input,
+            h_shift,
+            overscan: self.overscan,
+            presentation_fb: std::mem::take(&mut self.render_recycle_fb),
+        };
+        let send_result = self
+            .render_worker
+            .as_ref()
+            .expect("threaded render path without worker")
+            .send(job);
+        match send_result {
+            Ok(()) => {
+                self.last_submitted_render_frame = Some(emulated_frame);
+            }
+            Err(err) => {
+                warn!("render worker stopped; falling back to synchronous rendering");
+                self.render_recycle_fb = err;
+                self.render_worker = None;
+                rendered |= self.render_emulated_frame_sync();
+            }
+        }
+        rendered | self.collect_threaded_render_results(false)
+    }
+
+    fn finish_render_for_current_frame(&mut self) -> bool {
+        if !self.powered_on {
+            return false;
+        }
+        let target = self.emu.bus().emulated_frames();
+        let mut rendered = self.render_emulated_frame_if_needed();
+        while self.render_worker.is_some() && self.last_rendered_emulated_frame != Some(target) {
+            rendered |= self.collect_threaded_render_results(true);
+        }
+        rendered
+    }
+
     fn render_emulated_frame_if_needed(&mut self) -> bool {
+        if self.render_worker.is_some() {
+            return self.render_emulated_frame_threaded();
+        }
+        self.render_emulated_frame_sync()
+    }
+
+    fn render_emulated_frame_sync(&mut self) -> bool {
         let emulated_frame = self.emu.bus().emulated_frames();
         if !should_render_emulated_frame(self.last_rendered_emulated_frame, emulated_frame) {
             return false;
@@ -4997,27 +5294,13 @@ impl App {
         };
         bitplane::render(self.emu.bus_mut(), &mut self.fb);
         let geometry = self.emu.bus().frame_geometry();
-        // Vertical/horizontal recentring and the TV bezel mask are 15 kHz
-        // CRT concepts anchored to the standard PAL/NTSC window; a
-        // programmable scan defines its own window and presents in full,
-        // like a multisync monitor.
-        let field_rows = geometry.visible_lines.min(self.fb.len() / FB_WIDTH);
-        if !geometry.programmable {
-            center_present_frame_for_visible_start(&mut self.fb, visible_start_vpos);
-            center_present_frame_horizontally(&mut self.fb, h_shift);
-            if self.overscan == Overscan::Tv {
-                mask_present_frame_to_tv(
-                    &mut self.fb,
-                    h_shift,
-                    standard_window_top_row(visible_start_vpos),
-                );
-            }
-        } else if geometry.line_cck != 227 {
-            // A multisync monitor's horizontal deflection is time-linear:
-            // each colour clock of this scan's shorter/longer line covers
-            // 227/line_cck of the glass a standard line's clock would.
-            screenshot::stretch_rows_x(&mut self.fb, FB_WIDTH, field_rows, geometry.line_cck, 227);
-        }
+        let field_rows = post_process_rendered_field(
+            &mut self.fb,
+            geometry,
+            visible_start_vpos,
+            h_shift,
+            self.overscan,
+        );
         let base = self.emu.bus().frame_render_base();
         // Standard 15 kHz fields line-double / weave to 2x rows; a
         // programmable progressive scan already carries every line.
@@ -5028,7 +5311,9 @@ impl App {
             base.long_field,
             !geometry.programmable,
         );
+        self.refresh_present_from_deinterlacer();
         self.last_rendered_emulated_frame = Some(emulated_frame);
+        self.last_submitted_render_frame = Some(emulated_frame);
         true
     }
 }
@@ -5100,6 +5385,16 @@ fn hcenter_enabled() -> bool {
         Some(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
+}
+
+fn threaded_render_enabled() -> bool {
+    match crate::envcfg::var("COPPERLINE_THREADED_RENDER") {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
         ),
         None => true,
     }
@@ -6585,7 +6880,11 @@ mod tests {
         let frames_to_record = 5;
         for _ in 0..frames_to_record {
             app.emu.step_frame().expect("step frame");
-            let rendered = app.render_emulated_frame_if_needed();
+            let rendered = if app.render_worker.is_some() {
+                app.finish_render_for_current_frame()
+            } else {
+                app.render_emulated_frame_if_needed()
+            };
             assert!(rendered, "each step quantum should complete a frame");
             app.capture_recorder_output(rendered);
         }

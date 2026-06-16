@@ -4374,6 +4374,50 @@ impl Bus {
         self.lazy_collision_hpos = end_hpos;
     }
 
+    fn accumulate_live_collisions_to_frame_end(&mut self) {
+        const VISIBLE_END_HPOS: u32 =
+            RENDER_COPPER_WAIT_HPOS_FB0 + (RENDER_FRAMEBUFFER_WIDTH as u32 / 4);
+        let visible_start_vpos = self.current_frame_visible_start_vpos;
+        let visible_end_vpos =
+            visible_start_vpos + self.current_frame_geometry.visible_lines as u32;
+        if visible_end_vpos <= visible_start_vpos {
+            return;
+        }
+
+        let end_vpos = visible_end_vpos - 1;
+        let start_vpos = self.lazy_collision_vpos.max(visible_start_vpos);
+        if start_vpos > end_vpos {
+            return;
+        }
+        let start_hpos = if self.lazy_collision_vpos < visible_start_vpos {
+            RENDER_COPPER_WAIT_HPOS_FB0
+        } else {
+            self.lazy_collision_hpos.min(VISIBLE_END_HPOS)
+        };
+        if start_vpos == end_vpos && start_hpos >= VISIBLE_END_HPOS {
+            return;
+        }
+
+        for vpos in start_vpos..=end_vpos {
+            let old_hpos = if vpos == start_vpos {
+                start_hpos
+            } else {
+                RENDER_COPPER_WAIT_HPOS_FB0
+            };
+            let new_hpos = VISIBLE_END_HPOS;
+            if new_hpos <= old_hpos {
+                continue;
+            }
+            self.accumulate_live_playfield_collisions_if_due(vpos, old_hpos, new_hpos);
+            self.accumulate_live_manual_bpl_collisions_if_due(vpos, old_hpos, new_hpos);
+            self.accumulate_live_sprite_sprite_collisions_if_due(vpos, old_hpos, new_hpos);
+            self.accumulate_live_manual_sprite_collisions_if_due(vpos, old_hpos, new_hpos);
+        }
+
+        self.lazy_collision_vpos = end_vpos;
+        self.lazy_collision_hpos = VISIBLE_END_HPOS;
+    }
+
     fn accumulate_live_sprite_sprite_collisions_if_due(
         &mut self,
         vpos: u32,
@@ -5904,6 +5948,7 @@ impl Bus {
                 );
             }
         }
+        self.accumulate_live_collisions_to_frame_end();
         self.log_bus_accounting_frame();
         self.last_frame_render_base = Some(self.current_frame_render_base);
         self.last_frame_visible_start_vpos = self.current_frame_visible_start_vpos;
@@ -13516,6 +13561,29 @@ mod tests {
         bus.write_custom_word_from(0x144, 0x8000, BeamWriteSource::Cpu);
         bus.write_custom_word_from(0x154, 0x8000, BeamWriteSource::Cpu);
         bus.advance_chipset(2);
+
+        assert_eq!(bus.custom_read(0x00E, 2), 0x8200);
+        assert_eq!(bus.custom_read(0x00E, 2), 0x8000);
+    }
+
+    #[test]
+    fn frame_end_completes_unread_live_sprite_sprite_clxdat() {
+        let mut bus = empty_bus();
+        let (pos, ctl) = sprite_control_words(0x2C, 0x2D, 0x0083);
+        bus.agnus.vpos = 0x2C;
+        bus.agnus.hpos = 0x38;
+        bus.denise.diwstrt = 0x2C83;
+        bus.denise.diwstop = 0x2DC1;
+        bus.denise.sprpos[0] = pos;
+        bus.denise.sprctl[0] = ctl;
+        bus.denise.sprpos[2] = pos;
+        bus.denise.sprctl[2] = ctl;
+        bus.current_frame_sprite_display_enable_x_by_y[0] = Some(0);
+        bus.current_frame_render_base = bus.capture_render_snapshot();
+
+        bus.write_custom_word_from(0x144, 0x8000, BeamWriteSource::Cpu);
+        bus.write_custom_word_from(0x154, 0x8000, BeamWriteSource::Cpu);
+        bus.accumulate_live_collisions_to_frame_end();
 
         assert_eq!(bus.custom_read(0x00E, 2), 0x8200);
         assert_eq!(bus.custom_read(0x00E, 2), 0x8000);

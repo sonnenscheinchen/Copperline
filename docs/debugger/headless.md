@@ -109,6 +109,9 @@ Timing-model knobs that pair well with the debugger:
 - `COPPERLINE_DEINTERLACE=0` -- disable the motion-adaptive deinterlacer.
 - `COPPERLINE_PHOSPHOR=0.0..0.95` -- CRT phosphor persistence for one run
   (overrides `[display] phosphor`).
+- `COPPERLINE_THREADED_RENDER=0` -- force the synchronous renderer instead
+  of the default render worker when bisecting presentation or capture
+  issues.
 - `COPPERLINE_REAL_PACING_BUDGET=cycles|instructions` and
   `COPPERLINE_REAL_CPU_CPI=N` -- pacing-budget overrides (see
   [](../internals/timing)).

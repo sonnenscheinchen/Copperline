@@ -1,16 +1,19 @@
 # Render-thread pipeline: design and implementation plan
 
-Status: design only (branch `threaded-render`). Not implemented. The
-analysis below was done after the 2026-06-15 host-CPU optimisation pass
-(committed to `main`: idle device ticks, background-fill chunking,
-poll-stats table). Threading was deliberately *not* landed blind because
-its live-window behaviour cannot be verified headlessly.
+Status: implemented and default-on on branch `threaded-render`.
+`COPPERLINE_THREADED_RENDER=0` (also `false`, `off`, or `no`) forces the
+old synchronous render path for comparison. The analysis below was done
+after the 2026-06-15 host-CPU optimisation pass (committed to `main`:
+idle device ticks, background-fill chunking, poll-stats table).
 
-2026-06-16 review update: this is a plausible second-stage optimisation,
-but it is not yet a mechanical implementation plan. The current renderer is
-mostly a completed-frame consumer, but it still has a few hardware side
-effects and live-latch reads that must be separated before worker rendering
-is safe.
+2026-06-16 implementation update: the current renderer is now an owned
+completed-frame consumer through `RenderInput`/`render_from_input`. Agnus
+blanking and geometry latches are captured into the input bundle. Denise
+collision accumulation is completed synchronously at frame end on the bus,
+so the worker never writes late `CLXDAT` bits back into emulator-visible
+state. The worker renders, applies presentation post-processing, owns the
+deinterlacer history, and returns a tagged presentation buffer plus render
+timing to the main thread; wgpu/winit present stays on the main thread.
 
 2026-06-16 Rosetta/live-audio update: the A1200 `second-nature.adf` CPAL
 underrun report was reproduced with the x86_64/Rosetta build and then with
@@ -61,7 +64,7 @@ native arm64 speed while producing byte-identical screenshots. Keep native
 arm64 as the performance baseline on Apple Silicon; use the x86_64 build only
 to reproduce Intel/Rosetta-specific behavior.
 
-`taskpolicy -c background target/x86_64-apple-darwin/release/copperline` is
+`taskpolicy -c background target/release/copperline` is
 a useful low-clock stress profile on Apple Silicon because it pushes the
 Rosetta process onto efficiency cores, but it is harsher than a pure CPU
 frequency proxy: it also applies background scheduling. On 2026-06-16 the
@@ -86,22 +89,21 @@ worker owns its copy, the emulation thread can advance frame N freely while
 the worker paints frame N-1. Save-state / input-replay determinism is
 untouched (they depend on the emulation core, not the paint).
 
-That is the target architecture, not the current code. The implementation
-must first remove these remaining bus dependencies from `bitplane::render`:
+Implementation notes for the bus dependencies that had to be removed from
+`bitplane::render`:
 
-1. Denise collision write-back: render ORs the accumulated playfield/sprite
-   collision bits into `CLXDAT`. If frame N-1 is painted while frame N is
-   already emulating, 68000 reads of `CLXDAT` during frame N can observe stale
-   collision state. Either collision accumulation must stay synchronous at
-   the frame boundary, or `render_from_input` must return the collision bits
-   and main must apply them before `step_frame()` for the next frame.
-2. Agnus programmable blanking/frame-end blanking: render currently samples
-   live Agnus latches for frame height and programmable horizontal/vertical
-   blank windows. Those values must be captured into `RenderInput`; the
-   worker must not read frame-N Agnus state while painting frame N-1.
-3. Debug/trace side effects: plane export and display-plan logging need the
-   bundled frame number/time. The file writes can remain on the worker, but
-   all metadata must come from the bundle.
+1. Denise collision write-back: `Bus::begin_new_beam_frame` now completes
+   unread live collision replay to the end of the just-finished frame before
+   the next CPU frame can run. The synchronous renderer still returns and ORs
+   collision bits harmlessly, but the worker path treats them as diagnostic
+   render output and does not write late bits back to `CLXDAT`.
+2. Agnus programmable blanking/frame-end blanking: frame height and
+   programmable horizontal/vertical blank windows are captured into
+   `RenderInput`; the worker does not sample live Agnus latches while painting
+   an earlier frame.
+3. Debug/trace side effects: plane export and display-plan logging use the
+   bundled frame number/time. The file writes can run on the worker because
+   all metadata comes from the bundle.
 
 ## The owned render bundle (`RenderInput`)
 
@@ -130,22 +132,24 @@ Bundle contents (all owned; clone the slices, move/clone the snapshot):
 - render_state: RenderState (from_bus) -- lift its inputs into the bundle
 - emulated_seconds, emulated_frames: f64/u64       (for COPPERLINE_DBG_* )
 - agnus_frame_lines and programmable blank windows
-- returned collision bits to OR into Denise CLXDAT on the main thread
+- returned collision bits for synchronous rendering / diagnostics; the
+  threaded path does not apply them to Denise CLXDAT
 
 Gotchas:
 
 1. Write-back: `record_video_render_frame(timing)` mutates the bus. On the
    worker, return the timing from `render_from_input` and record it on main.
 2. Hardware write-back: `CLXDAT` collision bits are emulator-visible state,
-   not presentation metadata. Apply them at a deterministic frame boundary
-   before the CPU can read the next frame's collision register.
+   not presentation metadata. They are completed synchronously on the bus at
+   frame end; do not apply worker-returned collision bits later.
 3. DBG side effects: the playfield export keyed on `emulated_seconds`
    (COPPERLINE_DBG_AFTER/UNTIL) writes files. Pass the scalars in the
    bundle; the file write is fine on the worker but rare. No bus access.
-4. Snapshot cost: the bus already clones chip RAM each frame into
-   `last_frame_chip_ram`. To avoid a *second* 2 MB clone, hand ownership of
-   that buffer to the worker via a double-buffered swap (two Vecs ping-pong
-   between bus and worker) rather than cloning into the bundle.
+4. Snapshot cost: the bus still clones chip RAM into `last_frame_chip_ram`
+   and `RenderInput` currently clones it into the worker bundle. A future
+   optimisation should hand ownership of that buffer to the worker via a
+   double-buffered swap (two Vecs ping-pong between bus and worker) rather
+   than cloning into the bundle.
 
 ## Pipeline wiring (window.rs)
 
@@ -182,14 +186,19 @@ frame dump on frame N while saving the N-1 presentation buffer.
 2. Unit/regression tests for the hardware side effects separated above:
    Denise collision bits, programmable blanking, frame-end blanking, and
    interlace/phosphor history. These should name the hardware behaviour, not
-   a particular title.
-3. Threaded-dump comparison: add a headless mode that drives the *threaded*
-   pipeline with `--dump-frames` and diff every frame against the
-   synchronous baseline. This verifies channel ordering / frame skew /
-   bundle correctness end-to-end. Only the literal GPU present call (a few
-   lines, unchanged) then remains unverified -- low risk.
-4. Full unit suite (cargo test, ~971) + clippy + fmt.
-5. Human check at the live window: no tearing, input latency acceptable,
+   a particular title. Current coverage includes frame-end live `CLXDAT`
+   completion, programmable blanking, and deinterlace/phosphor history.
+3. Threaded path smoke: `cargo test
+   video::window::tests::recording_captures_emulated_frames_with_audio`
+   exercises worker render completion, tagged presentation output, deinterlace
+   ownership, and recorder capture alignment.
+4. Threaded-dump comparison: add a headless mode that drives the *threaded*
+   pipeline with `--dump-frames` and diff every frame against the synchronous
+   baseline. This verifies channel ordering / frame skew / bundle correctness
+   end-to-end. Only the literal GPU present call (a few lines, unchanged) then
+   remains unverified -- low risk.
+5. Full unit suite + clippy + fmt.
+6. Human check at the live window: no tearing, input latency acceptable,
    audio underruns gone on a slow machine.
 
 ## Alternative (higher ceiling, more risk): emulation on the worker

@@ -2810,20 +2810,36 @@ impl RenderInput {
             emulated_frames: bus.emulated_frames(),
         }
     }
+
+    pub fn geometry(&self) -> FrameGeometry {
+        self.geometry
+    }
+
+    pub fn visible_start_vpos(&self) -> u32 {
+        self.visible_start_vpos
+    }
+
+    pub fn render_base(&self) -> RenderRegisterSnapshot {
+        self.render_base
+    }
+
+    pub fn emulated_frames(&self) -> u64 {
+        self.emulated_frames
+    }
 }
 
-/// Outputs of `render_from_input` that must be applied back to the live
-/// machine on the main thread: the collision bits to OR into Denise CLXDAT
-/// (emulator-visible hardware state) and the render-phase timing stats.
+/// Outputs of `render_from_input`. Render timing is always recorded back on
+/// the main thread. `clxdat` is applied only by the synchronous wrapper; the
+/// threaded path completes CPU-visible Denise collision state at frame end
+/// before the worker can lag behind.
 pub struct RenderResult {
     pub timing: VideoRenderFrameTiming,
     pub clxdat: u16,
 }
 
-/// Paint the just-finished frame and apply its hardware side effects. Builds
-/// the owned `RenderInput` snapshot, renders it, then writes back the Denise
-/// collision bits and render timing. The render itself is a pure function of
-/// the snapshot (`render_from_input`); this wrapper owns the bus coupling.
+/// Paint the just-finished frame through the synchronous compatibility path.
+/// The render itself is a pure function of the owned snapshot
+/// (`render_from_input`); this wrapper owns the remaining bus coupling.
 pub fn render(bus: &mut Bus, fb: &mut [u32]) {
     let input = RenderInput::from_bus(bus);
     let result = render_from_input(&input, fb);
@@ -5356,7 +5372,13 @@ mod tests {
 
         const FILL: u32 = 0xFFAA_BBCC;
         let mut fb = vec![FILL; FB_PIXELS];
-        apply_programmable_blanking(&agnus, &mut fb, PAL_VISIBLE_LINE0, FB_HEIGHT);
+        apply_programmable_blanking(
+            agnus.programmable_vertical_blank(),
+            agnus.programmable_horizontal_blank(),
+            &mut fb,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
 
         let row = |fb: &[u32], y: usize| fb[y * FB_WIDTH];
         assert_eq!(row(&fb, 0x23), FILL, "line before VBSTRT untouched");
@@ -5367,7 +5389,13 @@ mod tests {
         // Without VARVBEN the window is ignored.
         agnus.write_beamcon0(BEAMCON0_PAL);
         let mut fb = vec![FILL; FB_PIXELS];
-        apply_programmable_blanking(&agnus, &mut fb, PAL_VISIBLE_LINE0, FB_HEIGHT);
+        apply_programmable_blanking(
+            agnus.programmable_vertical_blank(),
+            agnus.programmable_horizontal_blank(),
+            &mut fb,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
         assert_eq!(row(&fb, 0x24), FILL);
     }
 
@@ -5387,7 +5415,13 @@ mod tests {
 
         const FILL: u32 = 0xFFAA_BBCC;
         let mut fb = vec![FILL; FB_PIXELS];
-        apply_programmable_blanking(&agnus, &mut fb, PAL_VISIBLE_LINE0, FB_HEIGHT);
+        apply_programmable_blanking(
+            agnus.programmable_vertical_blank(),
+            agnus.programmable_horizontal_blank(),
+            &mut fb,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
 
         let x_first = ((0x80 - DIW_HSTART_FB0) * 2) as usize;
         let x_last = ((0x90 - DIW_HSTART_FB0) * 2) as usize - 1;
@@ -5412,7 +5446,13 @@ mod tests {
         ocs.write_vbstop(0x58);
         const FILL: u32 = 0xFFAA_BBCC;
         let mut fb = vec![FILL; FB_PIXELS];
-        apply_programmable_blanking(&ocs, &mut fb, PAL_VISIBLE_LINE0, FB_HEIGHT);
+        apply_programmable_blanking(
+            ocs.programmable_vertical_blank(),
+            ocs.programmable_horizontal_blank(),
+            &mut fb,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
         assert!(fb.iter().all(|&px| px == FILL));
 
         // VBSTRT >= VBSTOP wraps through the frame top: everything from
@@ -5423,7 +5463,13 @@ mod tests {
         ecs.write_vbstrt(0x120);
         ecs.write_vbstop(0x30);
         let mut fb = vec![FILL; FB_PIXELS];
-        apply_programmable_blanking(&ecs, &mut fb, PAL_VISIBLE_LINE0, FB_HEIGHT);
+        apply_programmable_blanking(
+            ecs.programmable_vertical_blank(),
+            ecs.programmable_horizontal_blank(),
+            &mut fb,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
         let row = |fb: &[u32], y: usize| fb[y * FB_WIDTH];
         // Beam line 0x2C (row 0) is below VBSTOP 0x30: blanked.
         assert_eq!(row(&fb, 0), 0xFF00_0000);
