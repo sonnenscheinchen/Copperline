@@ -9,6 +9,23 @@ The configuration is validated up front and the emulator refuses to start
 with a clear error message rather than guessing (unknown CPU or chipset
 names, out-of-range sizes, missing disk images, and so on).
 
+### Paths on Windows
+
+This applies to every path field below (`rom`, disk images, hard-drive
+files, the SCSI ROMs, and so on). In a TOML double-quoted string the
+backslash is an escape character, so a Windows path written the obvious way
+(`rom = "C:\Kickstarts\KICK31.ROM"`) is rejected: `\K` is not a valid escape.
+Use any one of:
+
+```toml
+rom = 'C:\Kickstarts\KICK31.ROM'    # single quotes: a literal string, no escaping
+rom = "C:\\Kickstarts\\KICK31.ROM"  # double quotes: backslashes doubled
+rom = "C:/Kickstarts/KICK31.ROM"    # forward slashes also work on Windows
+```
+
+Single-quoted literal strings are the least error-prone. macOS and Linux paths
+use forward slashes and need none of this.
+
 ## Command-line overrides
 
 The most common machine knobs can be set on the command line without writing

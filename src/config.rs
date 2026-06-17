@@ -396,7 +396,21 @@ impl Config {
 fn raw_from_path(path: &Path) -> Result<RawConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+    toml::from_str(&text).map_err(|e| {
+        let mut err = anyhow::Error::new(e);
+        // A backslash in a double-quoted TOML string is an escape character,
+        // so a Windows path like "C:\Kickstarts\KICK31.ROM" fails to parse on
+        // "\K". The bare "invalid escape sequence" message rarely makes that
+        // connection, so point at the fix.
+        if err.to_string().contains("escape") {
+            err = err.context(
+                "a backslash in a double-quoted string is an escape character; \
+                 for Windows paths use single quotes ('C:\\dir\\file'), double \
+                 the backslashes, or use forward slashes",
+            );
+        }
+        err.context(format!("parsing config {}", path.display()))
+    })
 }
 
 /// Command-line overrides for the handful of machine knobs it is convenient
@@ -1243,6 +1257,22 @@ mod tests {
     fn parse_config(text: &str) -> Result<Config> {
         let raw: RawConfig = toml::from_str(text)?;
         raw.try_into()
+    }
+
+    #[test]
+    fn windows_path_escape_error_explains_fix() {
+        // A backslash in a double-quoted TOML string is an escape character,
+        // so an unescaped Windows path fails on "\K". The error must point at
+        // the remedy rather than leaving a bare "invalid escape sequence".
+        let path = temp_path("badescape.toml");
+        fs::write(&path, "rom = \"C:\\Kickstarts\\KICK31.ROM\"\n").unwrap();
+        let err = raw_from_path(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("single quotes") && msg.contains("forward slashes"),
+            "error should explain the Windows-path fix, got: {msg}"
+        );
     }
 
     #[test]
