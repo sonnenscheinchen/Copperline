@@ -80,6 +80,13 @@ HAM8, the BPLCON4 BPLAM pixel-index XOR mask, and the OSPRM/ESPRM sprite
 palette banks. Denise state is not rendered live -- writes become beam
 events that the [video pipeline](video) replays.
 
+The ECS DIWHIGH high bits only stay in force until the next DIWSTRT or
+DIWSTOP write, which re-arms the OCS-implicit high bits derived from the
+low DIWSTRT/DIWSTOP values. Software that programmed a wide window through
+DIWHIGH and then touches DIWSTRT/DIWSTOP falls back to the implicit
+window, so the replay must drop the stale DIWHIGH on those writes rather
+than hold it.
+
 ## CIA (`cia.rs`)
 
 A small 8520 model used for both CIAs: I/O ports, the

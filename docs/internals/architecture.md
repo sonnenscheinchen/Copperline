@@ -125,6 +125,17 @@ The CPU-visible memory map:
 MMIO stubs cover every "gap" region DiagROM probes during fast-RAM
 detection, so probing software sees bus-like behaviour everywhere.
 
+A CPU read of an address no region claims floats to the last value the
+chip data bus carried (`Bus.data_bus`, fed by the live display and audio
+DMA fetches), as on real Agnus-arbitrated hardware -- not a fixed all-ones
+pattern; on a blank screen that value is 0. The constant matters: software
+that chases a pointer off into unmapped space (e.g. a filesystem walking a
+corrupted buffer-cache chain) can loop forever on a fixed value, where the
+ever-changing floating value lets the chase wander to a zero terminator as
+on silicon. Device windows that decode their own floating bus keep their
+own values -- e.g. the A2091 board's unpopulated XT-interface bytes read
+`$FF` from its own model, not the chip data bus.
+
 ## Determinism and the host boundary
 
 The core's only inputs are the config, the loaded images, and the
@@ -135,6 +146,12 @@ scheduling only. This is what makes `--screenshot-after` runs exactly
 reproducible, lets the headless debugger replay a failure
 deterministically, and makes [save states](savestate) exact: a restored
 run is byte-identical to one that was never interrupted.
+
+The one host-clock value that reaches emulated state is the battery RTC: a
+guest that reads it (`$DC0000`) sees the host date and time, so RTC reads
+are not reproducible across wall-clock runs. `COPPERLINE_RTC_FIXED_SECS=`
+*unix-seconds* pins the clock to a fixed value, which is what makes
+differential traces against another emulator line up.
 
 ### Input scripting and recording (`inputrec.rs`)
 
