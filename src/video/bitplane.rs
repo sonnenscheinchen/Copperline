@@ -2349,8 +2349,19 @@ fn apply_move(state: &mut RenderState, off: u16, val: u16) {
             state.clxcon2 = 0;
         }
         0x10E => state.clxcon2 = val & 0x0FFF,
-        0x08E => state.diwstrt = val,
-        0x090 => state.diwstop = val,
+        // Writing DIWSTRT/DIWSTOP re-arms the OCS-implicit high bits: an ECS
+        // DIWHIGH value only applies until the next DIWSTRT/DIWSTOP write (the
+        // Agnus side clears its diwhigh_written flag here for the same reason).
+        // Without this, a stale DIWHIGH (e.g. $00FF, pushing V-start off-screen)
+        // keeps the display window empty even after the window is reprogrammed.
+        0x08E => {
+            state.diwstrt = val;
+            state.diwhigh = DiwHigh::ocs_implicit();
+        }
+        0x090 => {
+            state.diwstop = val;
+            state.diwhigh = DiwHigh::ocs_implicit();
+        }
         0x1E4 => state.diwhigh = DiwHigh::ecs_explicit(val),
         0x092 => state.ddfstrt = val,
         0x094 => state.ddfstop = val,
@@ -5802,6 +5813,24 @@ mod tests {
         assert_eq!(state.diw_h_start(), 0x00FC);
         assert_eq!(state.diw_v_stop(), 0x007F);
         assert_eq!(state.diw_h_stop(), 0x0001);
+    }
+
+    #[test]
+    fn display_window_diwstrt_diwstop_write_reverts_diwhigh_to_implicit() {
+        // An ECS DIWHIGH value only applies until the next DIWSTRT/DIWSTOP
+        // write, which re-arms the OCS-implicit high bits. A stale DIWHIGH
+        // must not keep shrinking the window after it is reprogrammed --
+        // TurboTomato's ECS title rendered black because $00FF stayed latched
+        // and pushed the vertical window start off-screen.
+        let mut state = blank_state();
+        apply_move(&mut state, 0x1E4, 0x00FF);
+        assert_eq!(state.diwhigh, DiwHigh::ecs_explicit(0x00FF));
+        apply_move(&mut state, 0x08E, 0x2C81);
+        assert_eq!(state.diwhigh, DiwHigh::ocs_implicit());
+
+        apply_move(&mut state, 0x1E4, 0x00FF);
+        apply_move(&mut state, 0x090, 0x2CC1);
+        assert_eq!(state.diwhigh, DiwHigh::ocs_implicit());
     }
 
     #[test]
