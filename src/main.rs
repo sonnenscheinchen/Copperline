@@ -38,6 +38,7 @@ mod savestate;
 mod screenshot;
 mod scsi;
 mod serial;
+mod timestamp;
 mod timetravel;
 mod video;
 mod zorro;

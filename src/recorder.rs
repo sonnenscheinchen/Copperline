@@ -63,11 +63,8 @@ const HEADER_LEN: usize = 324;
 
 /// Pick a default filename for an interactive recording.
 pub fn auto_filename() -> PathBuf {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    PathBuf::from(format!("copperline-video-{n}.avi"))
+    let ts = crate::timestamp::compact_now();
+    PathBuf::from(format!("copperline-video-{ts}.avi"))
 }
 
 struct IndexEntry {

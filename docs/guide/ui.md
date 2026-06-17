@@ -11,10 +11,10 @@ The app shortcut modifier is `Cmd` on macOS and `Alt` on Linux/Windows.
 | macOS | Linux/Windows | Action |
 |---|---|---|
 | `Cmd+Q` | `Alt+Q` | Quit |
-| `Cmd+S` | `Alt+S` | Save a screenshot (`copperline-screenshot-<unix-ts>.png` in the working directory; the on-screen confirmation overlay is not part of the saved image) |
+| `Cmd+S` | `Alt+S` | Save a screenshot (`copperline-screenshot-<YYYYMMDDHHmmSS>.png` in the working directory; the on-screen confirmation overlay is not part of the saved image) |
 | `Cmd+R` | `Alt+R` | Start / stop a video-with-audio recording (below) |
 | `Cmd+Shift+R` | `Alt+Shift+R` | Start / stop an input recording (below) |
-| `Cmd+Shift+S` | `Alt+Shift+S` | Save a state (`copperline-state-<unix-ts>.clstate` in the working directory) |
+| `Cmd+Shift+S` | `Alt+Shift+S` | Save a state (`copperline-state-<YYYYMMDDHHmmSS>.clstate` in the working directory) |
 | `Cmd+Shift+L` | `Alt+Shift+L` | Load a save state from a file dialog |
 | `Cmd+D` | `Alt+D` | Swap to the next disk in a drive's configured playlist |
 | `Cmd+G` | `Alt+G` | Capture / release the host mouse (clicking the display also captures) |
@@ -106,7 +106,7 @@ The Keyboard Shortcuts window.
 
 `Cmd+R` on macOS or `Alt+R` on Linux/Windows (or the menu's "Record Video")
 starts capturing the emulated display and sound to
-`copperline-video-<unix-ts>.avi` in the working directory; pressing it again
+`copperline-video-<YYYYMMDDHHmmSS>.avi` in the working directory; pressing it again
 stops and finalizes the file. A red REC
 badge sits in the display's top-right corner while a recording runs --
 like the screenshot overlay, the badge, status bar, and menus are never
@@ -134,7 +134,7 @@ continues.
 machine -- key presses with their hold times, mouse buttons and motion,
 port-2 joystick / CD32-pad controls, and floppy inserts -- each stamped
 with its emulated time. Pressing it again stops the recording and writes
-`copperline-input-<unix-ts>.clscript` in the working directory: a plain
+`copperline-input-<YYYYMMDDHHmmSS>.clscript` in the working directory: a plain
 text file of scripted-input directives that
 `copperline --script FILE` replays exactly, because the core is
 deterministic and the events re-fire at the same emulated timestamps.
@@ -151,7 +151,7 @@ headless `--record-input` variant are described in
 
 `Cmd+Shift+S` on macOS or `Alt+Shift+S` on Linux/Windows (or the menu's
 "Save State") writes a snapshot of the whole emulated machine to
-`copperline-state-<unix-ts>.clstate` in the working directory: CPU,
+`copperline-state-<YYYYMMDDHHmmSS>.clstate` in the working directory: CPU,
 chip/slow/fast RAM, ROM, the full chipset and CIA state, floppy images
 (including unsaved in-memory changes), expansion boards, and CD/NVRAM
 state. `Cmd+Shift+L` / `Alt+Shift+L` (or "Load State...") restores one; the

@@ -430,6 +430,7 @@ dependencies = [
  "flate2",
  "gilrs",
  "hound",
+ "libc",
  "log",
  "m68k",
  "objc2 0.6.4",

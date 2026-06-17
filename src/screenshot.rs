@@ -145,9 +145,6 @@ pub fn stretch_rows_x(fb: &mut [u32], width: usize, rows: usize, src_num: u32, s
 
 /// Pick a default filename for an interactive screenshot grab.
 pub fn auto_filename() -> PathBuf {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    PathBuf::from(format!("copperline-screenshot-{n}.png"))
+    let ts = crate::timestamp::compact_now();
+    PathBuf::from(format!("copperline-screenshot-{ts}.png"))
 }

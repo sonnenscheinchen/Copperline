@@ -103,7 +103,7 @@ Run it with `--script FILE` (combines freely with the other flags).
 Rather than writing scripts by hand, record one: in the window,
 `Cmd+Shift+R` on macOS or `Alt+Shift+R` on Linux/Windows starts and stops a
 live-input recording, written to
-`copperline-input-<unix-ts>.clscript` in the working directory; the
+`copperline-input-<YYYYMMDDHHmmSS>.clscript` in the working directory; the
 headless equivalent `--record-input PATH` records the whole run and
 writes the file on exit. Every input event that reaches the emulated
 machine is captured with its emulated timestamp -- key holds, mouse

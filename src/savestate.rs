@@ -48,11 +48,8 @@ pub const STATE_VERSION: u32 = 4;
 
 /// Default state file name, timestamped like the screenshot/recorder names.
 pub fn auto_filename() -> std::path::PathBuf {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    std::path::PathBuf::from(format!("copperline-state-{secs}.clstate"))
+    let ts = crate::timestamp::compact_now();
+    std::path::PathBuf::from(format!("copperline-state-{ts}.clstate"))
 }
 
 /// Write the machine's emulated state to `path`. Call only between

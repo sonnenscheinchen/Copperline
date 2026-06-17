@@ -36,6 +36,9 @@ ringbuf = "0.4"
 hound = "3.5"
 rfd = "0.17.2"
 gilrs = "0.11"
+# Already pulled in transitively; used directly only for localtime_r, so
+# auto-generated filenames stamp in the host's local time zone.
+libc = "0.2"
 
 # macOS dock icon: winit's with_window_icon is a no-op on macOS, so the dock
 # icon must be set at runtime via NSApplication. These objc2 versions match the

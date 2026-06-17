@@ -64,11 +64,8 @@ const PORT1_BUTTONS: [(&str, ControlRead); 3] = [
 /// Default recording file name, timestamped like the screenshot/recorder
 /// names.
 pub fn auto_filename() -> PathBuf {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    PathBuf::from(format!("copperline-input-{secs}.clscript"))
+    let ts = crate::timestamp::compact_now();
+    PathBuf::from(format!("copperline-input-{ts}.clscript"))
 }
 
 pub struct InputRecorder {
