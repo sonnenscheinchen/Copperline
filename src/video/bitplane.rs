@@ -23,6 +23,7 @@ use crate::chipset::denise::{
     Palette, COLOR_RGB_MASK, COLOR_TRANSPARENCY_BIT,
 };
 use std::borrow::Cow;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 // Beam-to-framebuffer conversion anchors for the pragmatic renderer.
@@ -1290,7 +1291,9 @@ struct BeamSpriteState {
     /// them via SPRxPOS. When present the sprite is armed and displays this
     /// held data (with its full wide-fetch words, unlike a manual SPRxDATA
     /// write which only replicates one word) at the current SPRxPOS, clipped
-    /// per reposition interval.
+    /// per reposition interval. The held state is captured only after sprite
+    /// DMA has already made the channel active; once SPREN is off, the DMA
+    /// descriptor's later VSTOP no longer clears that latched display data.
     held: [Option<HeldSpriteLine>; 8],
 }
 
@@ -1361,32 +1364,18 @@ impl BeamSpriteState {
         if x_start >= x_stop || !self.spr_armed[sprite] {
             return None;
         }
-        let held = self.held[sprite];
         let pos = self.sprpos[sprite];
         let ctl = self.sprctl[sprite];
-        let (vstart, vstop) = if let Some(held) = held {
-            (held.vstart, held.vstop)
-        } else {
-            (sprite_vstart(pos, ctl), sprite_vstop(ctl))
-        };
-        // Normal pair: [vstart, vstop). An inverted pair (vstop <= vstart) is
-        // not "off": the vstop comparator fired before vstart, so the sprite is
-        // on from vstart to the frame end and again from 0 to vstop (the wrap).
-        let in_window = if vstop > vstart {
-            beam_y >= vstart && beam_y < vstop
-        } else {
-            beam_y >= vstart || beam_y < vstop
-        };
-        if !in_window {
-            return None;
-        }
-        // A held (DMA-off, Copper-repositioned) sprite carries its full
-        // DMA-fetched words; a plain manual SPRxDATA write replicates one word
-        // across the wide window.
+        let held = self.held[sprite];
+        let hstart = sprite_hstart(pos, ctl);
+        let hsub_70ns = sprite_hsub_70ns(ctl);
+        // A held sprite was already active when SPREN was cleared. With no
+        // sprite DMA slot running, the DMA descriptor's stop comparator cannot
+        // retire the latched data; later SPRxPOS writes simply reposition it.
         if let Some(held) = held {
             return Some(SpriteLine {
-                hstart: sprite_hstart(pos, ctl),
-                hsub_70ns: sprite_hsub_70ns(ctl),
+                hstart,
+                hsub_70ns,
                 beam_y,
                 data: held.line.data,
                 datb: held.line.datb,
@@ -1397,6 +1386,19 @@ impl BeamSpriteState {
                 x_start,
                 x_stop,
             });
+        }
+        let vstart = sprite_vstart(pos, ctl);
+        let vstop = sprite_vstop(ctl);
+        // Normal pair: [vstart, vstop). An inverted pair (vstop <= vstart) is
+        // not "off": the vstop comparator fired before vstart, so the sprite is
+        // on from vstart to the frame end and again from 0 to vstop (the wrap).
+        let in_window = if vstop > vstart {
+            beam_y >= vstart && beam_y < vstop
+        } else {
+            beam_y >= vstart || beam_y < vstop
+        };
+        if !in_window {
+            return None;
         }
         let width_words = if self.aga {
             sprite_width_words_from_fmode(self.fmode)
@@ -1411,8 +1413,8 @@ impl BeamSpriteState {
             ([0; 3], [0; 3])
         };
         Some(SpriteLine {
-            hstart: sprite_hstart(pos, ctl),
-            hsub_70ns: sprite_hsub_70ns(ctl),
+            hstart,
+            hsub_70ns,
             beam_y,
             data,
             datb,
@@ -2909,6 +2911,162 @@ fn maybe_log_frame_state(
     );
 }
 
+#[derive(Clone, Copy)]
+struct ManualSpriteDiagSpec {
+    want_all: bool,
+    beam_y: Option<i32>,
+    after: f64,
+    until: f64,
+}
+
+fn manual_sprite_diag_spec() -> Option<ManualSpriteDiagSpec> {
+    static SPEC: OnceLock<Option<ManualSpriteDiagSpec>> = OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let raw = crate::envcfg::var("COPPERLINE_DIAG_MANUAL_SPRITES")?;
+        let raw = raw.trim();
+        let (want_all, beam_y) = if raw.eq_ignore_ascii_case("all") {
+            (true, None)
+        } else {
+            (false, Some(raw.parse::<i32>().ok()?))
+        };
+        Some(ManualSpriteDiagSpec {
+            want_all,
+            beam_y,
+            after: env_f64("COPPERLINE_DBG_AFTER").unwrap_or(0.0),
+            until: env_f64("COPPERLINE_DBG_UNTIL").unwrap_or(f64::INFINITY),
+        })
+    })
+}
+
+fn maybe_log_manual_sprite_intervals(
+    emulated_seconds: f64,
+    emulated_frames: u64,
+    events: &[BeamRegisterWrite],
+    held: &[Option<HeldSpriteLine>; 8],
+    lines: &[Vec<SpriteLine>],
+) {
+    let Some(spec) = manual_sprite_diag_spec() else {
+        return;
+    };
+    let secs = emulated_seconds;
+    if secs < spec.after || secs >= spec.until {
+        return;
+    }
+
+    let held_summary: Vec<_> = held
+        .iter()
+        .map(|line| {
+            line.map(|line| {
+                (
+                    line.vstart,
+                    line.vstop,
+                    line.line.hstart,
+                    line.line.width_words,
+                    line.line.attached,
+                )
+            })
+        })
+        .collect();
+    let event_count = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.offset & 0x01FE,
+                0x096 | 0x10C | 0x140..=0x17E | 0x180..=0x1BE | 0x1FC
+            )
+        })
+        .count();
+    log::info!(
+        "manual-sprite intervals secs={secs:.4} frame={} events={} held={held_summary:?}",
+        emulated_frames,
+        event_count,
+    );
+
+    for event in events.iter().filter(|event| {
+        matches!(
+            event.offset & 0x01FE,
+            0x096 | 0x10C | 0x140..=0x17E | 0x180..=0x1BE | 0x1FC
+        )
+    }) {
+        if !spec.want_all
+            && spec
+                .beam_y
+                .is_some_and(|beam_y| event.vpos as i32 != beam_y)
+        {
+            continue;
+        }
+        let off = event.offset & 0x01FE;
+        let beam_x = beam_to_framebuffer_x_unclamped(event.hpos);
+        let color_x = color_write_framebuffer_x(event.hpos);
+        match off {
+            0x096 => log::info!(
+                "manual-sprite event y={} h={} beam_x={} DMACON={:#06X}",
+                event.vpos,
+                event.hpos,
+                beam_x,
+                event.value
+            ),
+            0x10C => log::info!(
+                "manual-sprite event y={} h={} beam_x={} color_x={} BPLCON4={:#06X}",
+                event.vpos,
+                event.hpos,
+                beam_x,
+                color_x,
+                event.value
+            ),
+            0x1FC => log::info!(
+                "manual-sprite event y={} h={} beam_x={} FMODE={:#06X}",
+                event.vpos,
+                event.hpos,
+                beam_x,
+                event.value
+            ),
+            0x180..=0x1BE => log::info!(
+                "manual-sprite event y={} h={} color_x={} COLOR{}={:#06X}",
+                event.vpos,
+                event.hpos,
+                color_x,
+                (off - 0x180) / 2,
+                event.value
+            ),
+            0x140..=0x17E => {
+                let sprite = ((off - 0x140) / 8) as usize;
+                log::info!(
+                    "manual-sprite event y={} h={} beam_x={} s{} reg={:#05X} val={:#06X}",
+                    event.vpos,
+                    event.hpos,
+                    beam_x,
+                    sprite,
+                    off,
+                    event.value
+                );
+            }
+            _ => {}
+        }
+    }
+
+    for (sprite, sprite_lines) in lines.iter().enumerate() {
+        for line in sprite_lines {
+            if !spec.want_all && spec.beam_y.is_some_and(|beam_y| line.beam_y != beam_y) {
+                continue;
+            }
+            log::info!(
+                "manual-sprite line y={} s{} x={}..{} hstart={} hsub={} words={} att={} data={:04X}/{:04X}",
+                line.beam_y,
+                sprite,
+                line.x_start,
+                line.x_stop,
+                line.hstart,
+                u8::from(line.hsub_70ns),
+                line.width_words,
+                u8::from(line.attached),
+                line.data,
+                line.datb
+            );
+        }
+    }
+}
+
 fn env_f64(var: &str) -> Option<f64> {
     crate::envcfg::var(var).and_then(|s| s.trim().parse::<f64>().ok())
 }
@@ -3118,6 +3276,13 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         &input.held_sprites,
         visible_line0,
         rows,
+    );
+    maybe_log_manual_sprite_intervals(
+        input.emulated_seconds,
+        input.emulated_frames,
+        render_events,
+        &input.held_sprites,
+        &manual_sprite_lines,
     );
     let mut base_palettes = vec![state.palette; rows];
     let mut palette_segments = vec![Vec::new(); rows];
@@ -7500,7 +7665,7 @@ mod tests {
     }
 
     #[test]
-    fn held_sprite_reposition_uses_dma_vertical_window() {
+    fn held_sprite_after_dma_disable_persists_past_descriptor_vstop() {
         let mut initial_state = blank_state();
         let held_vstart = PAL_VISIBLE_LINE0;
         let held_vstop = PAL_VISIBLE_LINE0 + 4;
@@ -7551,7 +7716,10 @@ mod tests {
         assert_eq!(line.x_start, 0);
         assert!(manual_sprite_lines[0]
             .iter()
-            .all(|line| line.beam_y >= held_vstart && line.beam_y < held_vstop));
+            .any(|line| line.beam_y == held_vstop && line.hstart == live_hstart));
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .any(|line| line.beam_y > held_vstop && line.hstart == live_hstart));
     }
 
     #[test]

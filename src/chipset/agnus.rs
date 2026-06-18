@@ -520,7 +520,10 @@ pub fn sprite_dma_disabled_by_bitplane_ddf(
         return false;
     }
     let ddfstart = effective_bitplane_ddf_hpos(bplcon0, ddfstrt);
-    ddfstart != 0 && ddfstart < 0x0038
+    // Sprite 7 loses its late DMA slot to the lowres bitplane fetch block that
+    // starts at $30. Earlier DDF starts occupy earlier fixed-DMA slots; they do
+    // not by themselves collide with sprite 7.
+    ddfstart == 0x0030
 }
 
 pub fn bitplane_dma_planes(bplcon0: u16, aga: bool) -> usize {
@@ -1610,6 +1613,15 @@ mod tests {
             DMACON_DMAEN | DMACON_BPLEN,
             0x0030,
             0x0038,
+            false,
+        ));
+        assert!(!sprite_dma_disabled_by_bitplane_ddf(
+            7,
+            AgnusRevision::Ocs,
+            0x1000,
+            DMACON_DMAEN | DMACON_BPLEN,
+            0x0028,
+            0x0028,
             false,
         ));
         assert!(!sprite_dma_disabled_by_bitplane_ddf(

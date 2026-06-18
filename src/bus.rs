@@ -6425,11 +6425,9 @@ impl Bus {
         // display window: a sprite that starts in the top border has its
         // control/data words fetched before the first framebuffer line, so
         // advance the DMA state across those offscreen lines. Crucially, SPREN
-        // can be toggled within the frame -- a title may enable sprite DMA only
-        // briefly off-screen to load reused sprites, then clear it before the
-        // visible window (SANITY Roots II's AGA copper-chunky "cherries" screen
-        // fetches its two reused sprites on lines ~0..28 then clears SPREN at
-        // line 29, repositioning the held sprites per line for the display).
+        // can be toggled within the frame -- software may enable sprite DMA
+        // only briefly off-screen to load reused sprites, then clear it before
+        // the visible window and reposition the held sprites per line.
         // So replay this frame's DMACON writes across the offscreen span and
         // run the sprite fetch only on lines where SPREN was actually enabled,
         // rather than sampling DMACON at the (already-cleared) visible start.
@@ -6717,11 +6715,9 @@ impl Bus {
             // wraps, and the sprite keeps fetching data to the bottom of the
             // frame. Clamp the effective vstop to the frame bottom -- the
             // per-field VBLANK reset re-fetches this descriptor, which covers
-            // the 0..vstop wrap tail on the next field. SANITY Roots II's AGA
-            // copper-chunky "cherries" screen relies on this: it sets vstop=0 <
-            // vstart and reuses the sprite as a full-height strip, repositioned
-            // every line by the Copper (SPRxPOS). Treating vstop<vstart as
-            // "off" dropped the whole screen.
+            // the 0..vstop wrap tail on the next field. Treating vstop<vstart
+            // as "off" drops full-height strips that are intentionally reused
+            // and repositioned every line by SPRxPOS writes.
             let vstop = if raw_vstop < vstart {
                 self.agnus.current_frame_lines() as i32
             } else {
@@ -6804,9 +6800,7 @@ impl Bus {
         // the fetch-time hstart: with sprite DMA off the Copper (or CPU) can
         // reposition a reused sprite by rewriting SPRxPOS, so the held data
         // must follow it. For a sprite left where the DMA fetched it this is
-        // the same value. (SANITY Roots II's "cherries" repositions two held
-        // sprites every line; emit_repositioned_held_sprite adds the extra
-        // mid-line positions on each SPRxPOS write.)
+        // the same value.
         let pos = self.denise.sprpos[sprite];
         let ctl = self.denise.sprctl[sprite];
         Some(CapturedSpriteLine {
@@ -13341,8 +13335,8 @@ mod tests {
     /// An inverted vertical pair (vstop < vstart) does not disable a sprite:
     /// Agnus arms it at vstart and, since the vstop comparator already passed,
     /// keeps fetching data to the bottom of the frame instead of terminating.
-    /// SANITY Roots II's AGA copper-chunky "cherries" screen reuses sprites
-    /// this way (vstop=0 < vstart). Previously vstop<vstart killed the sprite.
+    /// Previously vstop<vstart killed sprites that deliberately reuse the same
+    /// fetched strip across the remaining field.
     #[test]
     fn sprite_dma_inverted_vstop_runs_to_frame_bottom() {
         let mut bus = empty_bus();
