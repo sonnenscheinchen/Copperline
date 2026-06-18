@@ -105,6 +105,49 @@ pub fn present_h_shift(diw_h_start: u16, diw_h_stop: u16) -> usize {
     let right_border = FB_WIDTH.saturating_sub(right_x);
     left_border.saturating_sub(right_border) / 2
 }
+
+/// `present_h_shift`, but able to recentre a display that opens its DIW window
+/// into the overscan around a picture it only fetches at standard width.
+///
+/// A demo can open DIWSTRT/DIWSTOP much wider than the playfield it draws --
+/// Virtual Dreams' "Absolute Inebriation" opens DIW $02..$1FF around a standard
+/// 320-px lo-res picture (DDF $38..$D0) -- where the extra window only reveals
+/// COLOR0 border the TV crops, not content. The bare `present_h_shift` keys off
+/// DIW alone and so declines to recentre any window that reaches into the
+/// overscan, leaving such a picture sitting right-of-centre.
+///
+/// While the DIW window stays inside the standard window, behaviour is
+/// identical to `present_h_shift(diw_h_start, diw_h_stop)` -- the window
+/// (including any COLOR0 border it legitimately shows) is centred as before.
+/// Only when the window reaches into the overscan do we fall back to centring
+/// on the *fetched content* (DDF) clamped to the window: a picture whose fetch
+/// stays within the standard window is recentred like the standard display it
+/// really is, while one that genuinely fetches bitplane data into the border is
+/// still left exactly as rendered (`present_h_shift` returns 0 for it).
+pub fn present_h_shift_for(snapshot: &RenderRegisterSnapshot) -> usize {
+    let control = ControlState::from_render_state(&RenderState::from_snapshot(*snapshot));
+    let diw_start = control.diw_h_start() as i32;
+    let mut diw_stop = control.diw_h_stop() as i32;
+    if diw_stop <= diw_start {
+        diw_stop += 0x100;
+    }
+    // DIW within the standard window: centre on the window itself, exactly as
+    // the bare helper does, so stock and sub-standard displays are unchanged.
+    if diw_start >= STANDARD_DIW_HSTART && diw_stop <= STANDARD_DIW_HSTOP {
+        return present_h_shift(diw_start as u16, diw_stop as u16);
+    }
+    // DIW reaches into the overscan: recentre on the fetched content if it
+    // stays standard, otherwise leave a true overscan display untouched.
+    let Some((content_start, content_stop)) = control.bitplane_content_window_h() else {
+        return 0;
+    };
+    let eff_start = diw_start.max(content_start);
+    let eff_stop = diw_stop.min(content_stop);
+    if eff_stop <= eff_start {
+        return 0;
+    }
+    present_h_shift(eff_start as u16, eff_stop as u16)
+}
 const BPLCON0_ECSENA: u16 = 1 << 0;
 const BPLCON0_SHRES: u16 = 1 << 6;
 const BPLCON2_ZDBPSEL_SHIFT: u16 = 12;
@@ -586,6 +629,54 @@ impl ControlState {
                 self.harddis,
             )
             .is_some()
+    }
+
+    /// Horizontal extent, in DIWSTRT/DIWSTOP H coordinates, of the bitplane
+    /// data this control actually fetches: the display-data-fetch window
+    /// (DDFSTRT/DDFSTOP, quantized to the fetch grid) widened by the fetched
+    /// word count at the current resolution. Calibrated so a standard DDF
+    /// window ($38/$D0 lo-res, $3C/$D4 hi-res) yields exactly the standard
+    /// DIW edges (`STANDARD_DIW_HSTART`..`STANDARD_DIW_HSTOP`): the picture a
+    /// stock display fetches lands on the same beam positions as its DIW
+    /// window, so presentation centring of a stock display is unchanged.
+    ///
+    /// Returns `None` when no valid DDF window is programmed, so the caller
+    /// falls back to the raw DIW window.
+    fn bitplane_content_window_h(&self) -> Option<(i32, i32)> {
+        let hires_like = self.hires() || self.shres();
+        // Reuse `words_per_row`'s own validity check (same arguments): a
+        // valid window guarantees a non-fallback word count below.
+        effective_ddf_window(
+            self.agnus_revision,
+            hires_like,
+            self.ddfstrt,
+            self.ddfstop,
+            self.harddis,
+        )?;
+        let words = self.words_per_row(0) as i32;
+        if words == 0 {
+            return None;
+        }
+        // DDFSTRT shifts the picture in whole fetch-grid gulps, matching the
+        // renderer's placement (see `fetch_origin_native_shift`). Each colour
+        // clock of DDF shift moves the picture two lo-res H units.
+        let gulp = self.fetch_period() as i32;
+        let align = |hpos: i32| -> i32 {
+            (hpos.div_euclid(gulp) * gulp).max(BITPLANE_DDF_HARD_START as i32)
+        };
+        let standard_ddf = if hires_like { 0x003C } else { 0x0038 };
+        let aligned_start = align(effective_ddf_start_hpos(hires_like, self.ddfstrt) as i32);
+        let start_h = STANDARD_DIW_HSTART + (aligned_start - align(standard_ddf)) * 2;
+        // Fetched H width: one word spans 16 lo-res, 8 hi-res, or 4 super-hi-res
+        // H units, so the standard 20/40/80-word row is 320 H units wide.
+        let h_units_per_word = if self.shres() {
+            4
+        } else if self.hires() {
+            8
+        } else {
+            16
+        };
+        Some((start_h, start_h + words * h_units_per_word))
     }
 
     fn fetch_start_native_x(&self, diw_h_start: u16, pixel_repeat: usize) -> usize {
@@ -5544,6 +5635,79 @@ mod tests {
         assert_eq!(present_h_shift(0x81, 0x1D4), 0);
         // Both.
         assert_eq!(present_h_shift(0x71, 0x1E0), 0);
+    }
+
+    #[test]
+    fn content_window_h_matches_standard_diw_for_stock_ddf() {
+        // A standard lo-res fetch ($38..$D0) covers exactly the standard DIW
+        // window, so a stock display's presentation centring is unchanged.
+        let lores = ControlState {
+            ddfstrt: 0x0038,
+            ddfstop: 0x00D0,
+            ..ControlState::default()
+        };
+        assert_eq!(
+            lores.bitplane_content_window_h(),
+            Some((STANDARD_DIW_HSTART, STANDARD_DIW_HSTOP))
+        );
+        // The standard hi-res fetch ($3C..$D4) covers the same window.
+        let hires = ControlState {
+            bplcon0: 0x8000,
+            ddfstrt: 0x003C,
+            ddfstop: 0x00D4,
+            ..ControlState::default()
+        };
+        assert_eq!(
+            hires.bitplane_content_window_h(),
+            Some((STANDARD_DIW_HSTART, STANDARD_DIW_HSTOP))
+        );
+    }
+
+    fn ocs_snapshot(
+        diwstrt: u16,
+        diwstop: u16,
+        ddfstrt: u16,
+        ddfstop: u16,
+    ) -> RenderRegisterSnapshot {
+        RenderRegisterSnapshot {
+            // 5 lo-res planes; resolution/plane count is irrelevant to the H
+            // window, but keep it a plausible playfield.
+            bplcon0: 0x5200,
+            diwstrt,
+            diwstop,
+            ddfstrt,
+            ddfstop,
+            ..RenderRegisterSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn present_h_shift_for_centres_wide_diw_around_standard_fetch() {
+        // Virtual Dreams "Absolute Inebriation": DIW opened wide
+        // (DIWSTRT $5702 -> H $02, DIWSTOP $FFFF -> H $1FF) around a standard
+        // 320-px lo-res picture (DDF $38..$D0). The open window only reveals
+        // COLOR0 border the TV crops, so the picture must still recentre by the
+        // stock 26px instead of sitting right-of-centre.
+        assert_eq!(
+            present_h_shift_for(&ocs_snapshot(0x5702, 0xFFFF, 0x0038, 0x00D0)),
+            26
+        );
+        // A genuinely centred stock display is unchanged.
+        assert_eq!(
+            present_h_shift_for(&ocs_snapshot(0x2C81, 0x2CC1, 0x0038, 0x00D0)),
+            26
+        );
+    }
+
+    #[test]
+    fn present_h_shift_for_leaves_true_overscan_fetch_untouched() {
+        // Wide DIW *and* a fetch that reaches into the overscan border
+        // (DDFSTRT $30 starts the picture left of the standard window): a real
+        // overscan display, presented exactly as rendered.
+        assert_eq!(
+            present_h_shift_for(&ocs_snapshot(0x5702, 0xFFFF, 0x0030, 0x00D8)),
+            0
+        );
     }
 
     fn put_word(ram: &mut [u8], pc: usize, word: u16) {

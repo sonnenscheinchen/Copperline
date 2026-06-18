@@ -141,7 +141,11 @@ framebuffer):
 - **Horizontal recentring**: a standard (non-overscan) display is recentred
   for presentation, since the framebuffer captures a deep slab of left
   overscan that would otherwise push the picture right of centre compared
-  with vAmiga/FS-UAE. Overscan frames are left exactly as rendered.
+  with vAmiga/FS-UAE. The decision keys off the bitplane data the display
+  actually fetches (DDF), not just the DIW window: a demo that opens DIW wide
+  open around a standard-width picture (Virtual Dreams' "Absolute Inebriation")
+  is still recentred, while a display that genuinely fetches bitplane data into
+  the overscan border is left exactly as rendered.
 
 `ui.rs` implements the status bar widgets, the pop-up menu, and the
 overlay windows (About, Shortcuts, Calibration, Debugger) drawn over the

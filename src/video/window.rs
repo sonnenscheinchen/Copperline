@@ -5327,11 +5327,7 @@ impl App {
 
         let input = bitplane::RenderInput::from_bus(self.emu.bus());
         let h_shift = if self.hcenter {
-            let base = input.render_base();
-            bitplane::present_h_shift(
-                base.diwhigh.h_start(base.diwstrt),
-                base.diwhigh.h_stop(base.diwstop),
-            )
+            bitplane::present_h_shift_for(&input.render_base())
         } else {
             0
         };
@@ -5388,11 +5384,7 @@ impl App {
 
         let visible_start_vpos = self.emu.bus().frame_visible_start_vpos();
         let h_shift = if self.hcenter {
-            let base = self.emu.bus().frame_render_base();
-            bitplane::present_h_shift(
-                base.diwhigh.h_start(base.diwstrt),
-                base.diwhigh.h_stop(base.diwstop),
-            )
+            bitplane::present_h_shift_for(&self.emu.bus().frame_render_base())
         } else {
             0
         };
