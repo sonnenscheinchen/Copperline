@@ -13,7 +13,7 @@ use super::FB_PIXELS;
 use super::{FB_HEIGHT, FB_WIDTH, MAX_VISIBLE_LINES};
 use crate::bus::{
     BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource, Bus, CapturedBitplaneRow,
-    CapturedSpriteLine, RenderRegisterSnapshot, VideoRenderFrameTiming,
+    CapturedSpriteLine, HeldSpriteLine, RenderRegisterSnapshot, VideoRenderFrameTiming,
 };
 use crate::chipset::agnus::{ddf_hard_bounds, sprite_dma_disabled_by_bitplane_ddf, AgnusRevision};
 #[cfg(test)]
@@ -799,10 +799,10 @@ impl SpriteLine {
 }
 
 /// Sprite colour entry in the palette store. AGA bases the lookup on the
-/// BPLCON4 OSPRM (odd sprites / attached pairs) or ESPRM (even sprites)
-/// nibble; pre-AGA uses the classic 16..31 block. Attached pairs use the
-/// 4-bit pixel index directly; unattached sprites add the pair's 4-colour
-/// offset.
+/// BPLCON4 OSPRM low nibble (odd sprites / attached pairs) or ESPRM high
+/// nibble (even sprites); pre-AGA uses the classic 16..31 block. Attached
+/// pairs use the 4-bit pixel index directly; unattached sprites add the pair's
+/// 4-colour offset.
 fn sprite_color_entry(control: ControlState, sprite: usize, idx: u8, attached: bool) -> usize {
     let offset = if attached {
         idx as usize
@@ -811,9 +811,9 @@ fn sprite_color_entry(control: ControlState, sprite: usize, idx: u8, attached: b
     };
     if control.aga() {
         let nibble = if attached || sprite & 1 != 0 {
-            (control.bplcon4 >> 4) & 0x0F
-        } else {
             control.bplcon4 & 0x0F
+        } else {
+            (control.bplcon4 >> 4) & 0x0F
         } as usize;
         (nibble << 4) + offset
     } else {
@@ -1290,21 +1290,32 @@ struct BeamSpriteState {
     /// them via SPRxPOS. When present the sprite is armed and displays this
     /// held data (with its full wide-fetch words, unlike a manual SPRxDATA
     /// write which only replicates one word) at the current SPRxPOS, clipped
-    /// per reposition interval. SANITY Roots II's "cherries" screen.
-    held: [Option<CapturedSpriteLine>; 8],
+    /// per reposition interval.
+    held: [Option<HeldSpriteLine>; 8],
 }
 
 impl BeamSpriteState {
-    fn from_render_state(state: &RenderState, held: &[Option<CapturedSpriteLine>; 8]) -> Self {
+    fn from_render_state(state: &RenderState, held: &[Option<HeldSpriteLine>; 8]) -> Self {
+        let mut sprpos = state.sprpos;
+        let mut sprctl = state.sprctl;
         let mut spr_armed = state.spr_armed;
         for (i, h) in held.iter().enumerate() {
-            if h.is_some() {
+            if let Some(held) = h {
+                let (pos, ctl) = sprite_control_words_from_parts(
+                    held.vstart,
+                    held.vstop,
+                    held.line.hstart,
+                    held.line.hsub_70ns,
+                    held.line.attached,
+                );
+                sprpos[i] = pos;
+                sprctl[i] = ctl;
                 spr_armed[i] = true;
             }
         }
         Self {
-            sprpos: state.sprpos,
-            sprctl: state.sprctl,
+            sprpos,
+            sprctl,
             sprdata: state.sprdata,
             sprdatb: state.sprdatb,
             spr_armed,
@@ -1350,10 +1361,14 @@ impl BeamSpriteState {
         if x_start >= x_stop || !self.spr_armed[sprite] {
             return None;
         }
+        let held = self.held[sprite];
         let pos = self.sprpos[sprite];
         let ctl = self.sprctl[sprite];
-        let vstart = sprite_vstart(pos, ctl);
-        let vstop = sprite_vstop(ctl);
+        let (vstart, vstop) = if let Some(held) = held {
+            (held.vstart, held.vstop)
+        } else {
+            (sprite_vstart(pos, ctl), sprite_vstop(ctl))
+        };
         // Normal pair: [vstart, vstop). An inverted pair (vstop <= vstart) is
         // not "off": the vstop comparator fired before vstart, so the sprite is
         // on from vstart to the frame end and again from 0 to vstop (the wrap).
@@ -1368,16 +1383,16 @@ impl BeamSpriteState {
         // A held (DMA-off, Copper-repositioned) sprite carries its full
         // DMA-fetched words; a plain manual SPRxDATA write replicates one word
         // across the wide window.
-        if let Some(held) = self.held[sprite] {
+        if let Some(held) = held {
             return Some(SpriteLine {
                 hstart: sprite_hstart(pos, ctl),
                 hsub_70ns: sprite_hsub_70ns(ctl),
                 beam_y,
-                data: held.data,
-                datb: held.datb,
-                data_ext: held.data_ext,
-                datb_ext: held.datb_ext,
-                width_words: held.width_words,
+                data: held.line.data,
+                datb: held.line.datb,
+                data_ext: held.line.data_ext,
+                datb_ext: held.line.datb_ext,
+                width_words: held.line.width_words,
                 attached: ctl & 0x0080 != 0,
                 x_start,
                 x_stop,
@@ -2585,7 +2600,7 @@ fn manual_sprite_lines_from_events(
 fn manual_sprite_lines_from_events_with_visible_line0(
     initial_state: &RenderState,
     events: &[BeamRegisterWrite],
-    held: &[Option<CapturedSpriteLine>; 8],
+    held: &[Option<HeldSpriteLine>; 8],
     visible_line0: i32,
     rows: usize,
 ) -> Vec<Vec<SpriteLine>> {
@@ -2917,7 +2932,7 @@ pub struct RenderInput {
     chip_ram_writes: Vec<BeamChipRamWrite>,
     captured_bitplane_rows: Vec<Option<CapturedBitplaneRow>>,
     captured_sprite_lines: Vec<CapturedSpriteLine>,
-    held_sprites: [Option<CapturedSpriteLine>; 8],
+    held_sprites: [Option<HeldSpriteLine>; 8],
     sprite_display_enable_x_by_y: Vec<Option<usize>>,
     sprite_dma_observed: bool,
     // Agnus-derived blanking windows, sampled once per frame from the live
@@ -5059,6 +5074,30 @@ fn sprite_hsub_70ns(ctl: u16) -> bool {
     ctl & 0x0010 != 0
 }
 
+fn sprite_control_words_from_parts(
+    vstart: i32,
+    vstop: i32,
+    hstart: i32,
+    hsub_70ns: bool,
+    attached: bool,
+) -> (u16, u16) {
+    let vstart = vstart as u16;
+    let vstop = vstop as u16;
+    let hstart = hstart as u16;
+    let pos = ((vstart & 0x00FF) << 8) | ((hstart >> 1) & 0x00FF);
+    let mut ctl = ((vstop & 0x00FF) << 8)
+        | ((vstart & 0x0100) >> 6)
+        | ((vstop & 0x0100) >> 7)
+        | (hstart & 0x0001);
+    if hsub_70ns {
+        ctl |= 0x0010;
+    }
+    if attached {
+        ctl |= 0x0080;
+    }
+    (pos, ctl)
+}
+
 fn read_chip_word_wrapping(ram: &[u8], addr: u32) -> u16 {
     let mask = ram.len() - 1;
     let a = addr as usize & mask;
@@ -5657,7 +5696,7 @@ mod tests {
         // OSPRM=7 (odd sprites and attached pairs at 112..).
         let aga = ControlState {
             agnus_revision: AgnusRevision::AgaAlice,
-            bplcon4: 0x0072,
+            bplcon4: 0x0027,
             ..ControlState::default()
         };
         assert_eq!(sprite_color_entry(aga, 0, 1, false), 32 + 1);
@@ -7458,6 +7497,102 @@ mod tests {
         assert!(manual_sprite_lines[0]
             .iter()
             .any(|line| line.beam_y >= fmode_line));
+    }
+
+    #[test]
+    fn held_sprite_reposition_uses_dma_vertical_window() {
+        let mut initial_state = blank_state();
+        let held_vstart = PAL_VISIBLE_LINE0;
+        let held_vstop = PAL_VISIBLE_LINE0 + 4;
+        let live_vstart = PAL_VISIBLE_LINE0 + 32;
+        let live_vstop = PAL_VISIBLE_LINE0 + 40;
+        let live_hstart = DIW_HSTART_FB0 + 8;
+        let (pos, ctl) =
+            sprite_control_words(live_vstart as u16, live_vstop as u16, live_hstart as u16);
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+
+        let mut held = [None; 8];
+        held[0] = Some(HeldSpriteLine {
+            line: CapturedSpriteLine {
+                sprite: 0,
+                hstart: DIW_HSTART_FB0,
+                hsub_70ns: false,
+                beam_y: held_vstart,
+                data: 0x8000,
+                datb: 0,
+                data_ext: [0; 3],
+                datb_ext: [0; 3],
+                width_words: 1,
+                attached: false,
+            },
+            vstart: held_vstart,
+            vstop: held_vstop,
+        });
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[cpu_event(
+                held_vstart as u32,
+                COPPER_WAIT_HPOS_FB0 as u32,
+                0x140,
+                pos,
+            )],
+            &held,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
+
+        let line = manual_sprite_lines[0]
+            .iter()
+            .find(|line| line.beam_y == held_vstart)
+            .expect("held sprite remains visible in its DMA vertical window");
+        assert_eq!(line.hstart, live_hstart);
+        assert_eq!(line.x_start, 0);
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .all(|line| line.beam_y >= held_vstart && line.beam_y < held_vstop));
+    }
+
+    #[test]
+    fn held_sprite_starts_from_dma_loaded_position_and_control() {
+        let initial_state = blank_state();
+        let held_vstart = PAL_VISIBLE_LINE0;
+        let held_hstart = DIW_HSTART_FB0 + 16;
+
+        let mut held = [None; 8];
+        held[1] = Some(HeldSpriteLine {
+            line: CapturedSpriteLine {
+                sprite: 1,
+                hstart: held_hstart,
+                hsub_70ns: true,
+                beam_y: held_vstart,
+                data: 0x8000,
+                datb: 0,
+                data_ext: [0; 3],
+                datb_ext: [0; 3],
+                width_words: 1,
+                attached: true,
+            },
+            vstart: held_vstart,
+            vstop: held_vstart + 1,
+        });
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[],
+            &held,
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+        );
+
+        let line = manual_sprite_lines[1]
+            .iter()
+            .find(|line| line.beam_y == held_vstart)
+            .expect("held sprite keeps DMA-loaded position without a register write");
+        assert_eq!(line.hstart, held_hstart);
+        assert!(line.hsub_70ns);
+        assert!(line.attached);
     }
 
     #[test]

@@ -237,6 +237,13 @@ pub struct CapturedSpriteLine {
     pub attached: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct HeldSpriteLine {
+    pub line: CapturedSpriteLine,
+    pub vstart: i32,
+    pub vstop: i32,
+}
+
 #[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct DisplaySpriteDmaState {
     control: Option<DisplaySpriteControl>,
@@ -526,12 +533,12 @@ pub struct Bus {
     // visible window. The renderer's manual-sprite path consumes these so it
     // can clip each repositioned segment to the reposition interval (a
     // CapturedSpriteLine cannot be clipped); the bus bar path is suppressed for
-    // them. Carries the held pixel data only -- position/window come from the
-    // live SPRxPOS/CTL the manual path tracks.
+    // them. Carries the held pixel data and DMA-established control/window;
+    // later SPRxPOS/CTL writes can still reposition the held line.
     #[serde(skip)]
-    current_frame_held_sprites: [Option<CapturedSpriteLine>; 8],
+    current_frame_held_sprites: [Option<HeldSpriteLine>; 8],
     #[serde(skip)]
-    last_frame_held_sprites: [Option<CapturedSpriteLine>; 8],
+    last_frame_held_sprites: [Option<HeldSpriteLine>; 8],
     #[serde(with = "serde_big_array::BigArray")]
     current_frame_sprite_display_enable_x_by_y: [Option<usize>; MAX_VISIBLE_LINES],
     #[serde(with = "serde_big_array::BigArray")]
@@ -2943,7 +2950,7 @@ impl Bus {
         }
     }
 
-    pub fn frame_held_sprites(&self) -> [Option<CapturedSpriteLine>; 8] {
+    pub fn frame_held_sprites(&self) -> [Option<HeldSpriteLine>; 8] {
         if crate::envcfg::flag("COPPERLINE_RENDER_LIVE_CHIP_RAM") {
             return [None; 8];
         }
@@ -6279,17 +6286,24 @@ impl Bus {
             let Some(line_data) = state.last_line else {
                 continue;
             };
-            self.current_frame_held_sprites[sprite] = Some(CapturedSpriteLine {
-                sprite,
-                hstart: line_data.hstart,
-                hsub_70ns: line_data.hsub_70ns,
-                beam_y: 0,
-                data: line_data.data,
-                datb: line_data.datb,
-                data_ext: line_data.data_ext,
-                datb_ext: line_data.datb_ext,
-                width_words: line_data.width_words,
-                attached: line_data.attached,
+            let Some(control) = state.control else {
+                continue;
+            };
+            self.current_frame_held_sprites[sprite] = Some(HeldSpriteLine {
+                line: CapturedSpriteLine {
+                    sprite,
+                    hstart: line_data.hstart,
+                    hsub_70ns: line_data.hsub_70ns,
+                    beam_y: 0,
+                    data: line_data.data,
+                    datb: line_data.datb,
+                    data_ext: line_data.data_ext,
+                    datb_ext: line_data.datb_ext,
+                    width_words: line_data.width_words,
+                    attached: line_data.attached,
+                },
+                vstart: control.vstart,
+                vstop: control.vstop,
             });
         }
     }
