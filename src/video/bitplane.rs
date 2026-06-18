@@ -1844,6 +1844,7 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
             }
         }
 
+        let previous_control = control;
         apply_move(state, off, event.value);
         if matches!(
             off,
@@ -1864,7 +1865,27 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
                 | 0x1E4
                 | 0x1FC
         ) {
-            control = ControlState::from_render_state(state);
+            let next_control = ControlState::from_render_state(state);
+            if off == 0x10C && previous_control.aga() && !before_visible_lines {
+                // Lisa applies BPLCON4's sprite palette-base byte earlier
+                // than its bitplane XOR byte. Keep BPLAM on the normal
+                // control timeline while letting sprite colour lookup see the
+                // new ESPRM/OSPRM byte in the colour-output domain.
+                let sprite_x = color_write_framebuffer_x(event.hpos);
+                if sprite_x < beam_x {
+                    let mut sprite_control = previous_control;
+                    sprite_control.bplcon4 =
+                        (previous_control.bplcon4 & 0xFF00) | (next_control.bplcon4 & 0x00FF);
+                    push_control_segment(
+                        control_segments,
+                        line,
+                        sprite_x,
+                        base_controls[line],
+                        sprite_control,
+                    );
+                }
+            }
+            control = next_control;
             push_control_segment(control_segments, line, beam_x, base_controls[line], control);
             if matches!(off, 0x102 | 0x108 | 0x10A) {
                 if let Some(events_by_line) = display_line_events.as_deref_mut() {
@@ -3021,6 +3042,7 @@ fn sprite_pixel_diag_spec() -> Option<SpritePixelDiagSpec> {
 fn maybe_log_manual_sprite_intervals(
     emulated_seconds: f64,
     emulated_frames: u64,
+    state: &RenderState,
     events: &[BeamRegisterWrite],
     held: &[Option<HeldSpriteLine>; 8],
     lines: &[Vec<SpriteLine>],
@@ -3043,10 +3065,15 @@ fn maybe_log_manual_sprite_intervals(
                     line.line.hstart,
                     line.line.width_words,
                     line.line.attached,
+                    line.line.data,
+                    line.line.data_ext,
+                    line.line.datb,
+                    line.line.datb_ext,
                 )
             })
         })
         .collect();
+    let sprpt_align: Vec<_> = state.sprpt.iter().map(|ptr| ptr & 7).collect();
     let event_count = events
         .iter()
         .filter(|event| {
@@ -3057,9 +3084,10 @@ fn maybe_log_manual_sprite_intervals(
         })
         .count();
     log::info!(
-        "manual-sprite intervals secs={secs:.4} frame={} events={} held={held_summary:?}",
+        "manual-sprite intervals secs={secs:.4} frame={} events={} sprpt={:08X?} sprpt_align={sprpt_align:?} held={held_summary:?}",
         emulated_frames,
         event_count,
+        state.sprpt,
     );
 
     for event in events.iter().filter(|event| {
@@ -3485,6 +3513,7 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
     maybe_log_manual_sprite_intervals(
         input.emulated_seconds,
         input.emulated_frames,
+        &state,
         render_events,
         &input.held_sprites,
         &manual_sprite_lines,
@@ -10133,6 +10162,48 @@ mod tests {
         assert_eq!(base_controls[ham_line + 1].bplcon0, 0x6800);
         assert_eq!(control_segments[direct_line][0].control.bplcon0, 0x4000);
         assert_eq!(base_controls[direct_line + 1].bplcon0, 0x4000);
+    }
+
+    #[test]
+    fn aga_bplcon4_splits_sprite_base_from_bitplane_xor_timing() {
+        let mut state = blank_state();
+        state.agnus_revision = AgnusRevision::AgaAlice;
+        state.bplcon4 = 0xAA09;
+        let mut base_palettes = [state.palette; FB_HEIGHT];
+        let mut palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let mut base_controls = [ControlState::from_render_state(&state); FB_HEIGHT];
+        let mut control_segments = vec![Vec::new(); FB_HEIGHT];
+        let mut manual_bpl_segments = Vec::new();
+        let hpos = (COPPER_WAIT_HPOS_FB0 + 20) as u32;
+        let events = [beam_event(0x50, hpos, 0x010C, 0x5507)];
+
+        apply_render_events(
+            &mut state,
+            &events,
+            &mut base_palettes,
+            &mut palette_segments,
+            &mut base_controls,
+            &mut control_segments,
+            &mut manual_bpl_segments,
+        );
+
+        let line = (0x50 - 0x2C) as usize;
+        let sprite_x = color_write_framebuffer_x(hpos);
+        let beam_x = beam_to_framebuffer_x_unclamped(hpos) as usize;
+        assert!(sprite_x < beam_x);
+        assert_eq!(control_segments[line].len(), 2);
+        assert_eq!(control_segments[line][0].x, sprite_x);
+        assert_eq!(control_segments[line][0].control.bplcon4, 0xAA07);
+        assert_eq!(control_segments[line][1].x, beam_x);
+        assert_eq!(control_segments[line][1].control.bplcon4, 0x5507);
+        assert_eq!(
+            control_at_x(base_controls[line], &control_segments[line], beam_x - 1).bplcon4,
+            0xAA07
+        );
+        assert_eq!(
+            control_at_x(base_controls[line], &control_segments[line], beam_x).bplcon4,
+            0x5507
+        );
     }
 
     #[test]
