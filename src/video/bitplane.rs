@@ -611,6 +611,7 @@ impl ControlState {
             return fallback;
         };
         let unit = self.fetch_unit();
+        let start = crate::chipset::agnus::anchor_bitplane_fetch_start(start, unit);
         let blocks = crate::chipset::agnus::bitplane_fetch_blocks(u32::from(stop - start), unit);
         let words = blocks * (unit / self.fetch_cck_per_word()) as usize;
         words.max(1)

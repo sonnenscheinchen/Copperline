@@ -5429,17 +5429,21 @@ impl Bus {
         let quantum = bitplane_fetch_quantum(fmode);
         let period = bitplane_fetch_period(bplcon0, fmode);
         let unit = bitplane_fetch_unit(bplcon0, fmode);
-        // The sequencer completes whole 8-cck units: an FMODE=0 DDFSTOP
-        // inside a unit extends the fetch to the end of the unit starting
-        // at-or-after it (see agnus::bitplane_fetch_blocks), so the last
-        // slot can land past DDFSTOP+7.
-        let last_fetch_hpos = if unit == 8 {
-            let blocks =
-                crate::chipset::agnus::bitplane_fetch_blocks(u32::from(stop) - start, unit) as u32;
-            start + blocks * unit - 1
-        } else {
-            u32::from(stop) + 7
-        };
+        // Wide-FMODE units start on the absolute unit grid, so anchor the
+        // fetch start (and thus the slot positions) down to it, matching
+        // `bitplane_words_per_row` (see agnus::anchor_bitplane_fetch_start).
+        let start = u32::from(crate::chipset::agnus::anchor_bitplane_fetch_start(
+            start as u16,
+            unit,
+        ));
+        // The sequencer completes whole units from the (anchored) fetch start:
+        // a DDFSTOP inside a unit extends the fetch to the end of the unit
+        // starting at-or-after it (see agnus::bitplane_fetch_blocks), so the
+        // last slot can land past DDFSTOP. The block count is taken from the
+        // anchored start so wide-FMODE slots and `words_per_row` agree.
+        let blocks =
+            crate::chipset::agnus::bitplane_fetch_blocks(u32::from(stop) - start, unit) as u32;
+        let last_fetch_hpos = start + blocks * unit - 1;
         let words_per_row = bitplane_words_per_row(
             self.agnus.revision(),
             bplcon0,
@@ -7241,6 +7245,7 @@ fn bitplane_words_per_row(
         return fallback;
     };
     let unit = bitplane_fetch_unit(bplcon0, fmode);
+    let start = crate::chipset::agnus::anchor_bitplane_fetch_start(start, unit);
     let blocks = crate::chipset::agnus::bitplane_fetch_blocks(u32::from(stop - start), unit);
     let words = blocks * (unit / bitplane_fetch_cck_per_word(bplcon0)) as usize;
     words.max(1)
