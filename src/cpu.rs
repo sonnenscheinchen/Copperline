@@ -176,6 +176,9 @@ struct CpuBus {
     icache: Option<Box<crate::cache::CpuCache>>,
     /// 68030 data cache model (`[cpu] dcache`).
     dcache: Option<Box<crate::cache::CpuCache>>,
+    /// COPPERLINE_DBG_IRQ cached time window. Interrupt acknowledge can be hot
+    /// during IRQ storms, so parse the environment once at construction.
+    dbg_irq_window: Option<(f64, f64)>,
 }
 
 pub fn build(
@@ -213,6 +216,7 @@ impl M68kMachine {
                 dbg_memw_hit: None,
                 icache: None,
                 dcache: None,
+                dbg_irq_window: debug_irq_window_setting(),
             },
             hle: NoOpHleHandler,
             fpu_enabled,
@@ -1965,16 +1969,10 @@ impl AddressBus for CpuBus {
         );
         // COPPERLINE_DBG_IRQ: log every serviced interrupt (level + the enabled
         // pending source bits) with emulated time, to measure handler rates
-        // (VERTB=0x20, SOFT=0x04, COPER=0x10, PORTS=0x08, EXTER=0x2000).
+        // (VERTB=0x20, BLIT=0x40, SOFT=0x04, COPER=0x10, PORTS=0x08, EXTER=0x2000).
         // Bounded by COPPERLINE_DBG_AFTER/UNTIL.
-        if crate::envcfg::flag("COPPERLINE_DBG_IRQ") {
+        if let Some((after, until)) = self.dbg_irq_window {
             let secs = self.bus.emulated_seconds();
-            let after = crate::envcfg::var("COPPERLINE_DBG_AFTER")
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .unwrap_or(0.0);
-            let until = crate::envcfg::var("COPPERLINE_DBG_UNTIL")
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .unwrap_or(f64::INFINITY);
             if secs >= after && secs < until {
                 log::info!(
                     "irq lvl={level} pending={pending:#06X} secs={secs:.5} f={}",
@@ -2009,6 +2007,19 @@ fn address_mask_for_model(model: CpuModel) -> u32 {
 
 fn positive_cpu_cycles(cycles: i32) -> u32 {
     cycles.max(0) as u32
+}
+
+fn debug_irq_window_setting() -> Option<(f64, f64)> {
+    if !crate::envcfg::flag("COPPERLINE_DBG_IRQ") {
+        return None;
+    }
+    let after = crate::envcfg::var("COPPERLINE_DBG_AFTER")
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let until = crate::envcfg::var("COPPERLINE_DBG_UNTIL")
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(f64::INFINITY);
+    Some((after, until))
 }
 
 fn is_fpu_instruction_family(opword: u16) -> bool {
@@ -2360,6 +2371,7 @@ mod tests {
             dbg_memw_hit: None,
             icache: None,
             dcache: None,
+            dbg_irq_window: None,
         };
 
         assert_eq!(bus.read_long(0), 0x1111_4EF9);
@@ -2382,6 +2394,7 @@ mod tests {
             dbg_memw_hit: None,
             icache: None,
             dcache: None,
+            dbg_irq_window: None,
         };
         bus.bus.set_cpu_bus_arbitration_enabled(true);
         // Start on a refresh slot (0x003) so the fetch both waits for and then
@@ -2411,6 +2424,7 @@ mod tests {
             dbg_memw_hit: None,
             icache: None,
             dcache: None,
+            dbg_irq_window: None,
         };
         bus.bus.set_cpu_bus_arbitration_enabled(true);
 
@@ -2557,6 +2571,7 @@ mod tests {
             dbg_memw_hit: None,
             icache: None,
             dcache: Some(Box::new(dcache)),
+            dbg_irq_window: None,
         };
         bus.bus.set_cpu_bus_arbitration_enabled(true);
         let fast = FAST_RAM_BASE as u32 + 0x40;
@@ -2600,6 +2615,7 @@ mod tests {
             dbg_memw_hit: None,
             icache: None,
             dcache: None,
+            dbg_irq_window: None,
         };
         let before = bus.read_long(ROM_BASE as u32);
         bus.write_long(ROM_BASE as u32, 0xDEAD_BEEF);
@@ -2621,6 +2637,7 @@ mod tests {
             dbg_memw_hit: None,
             icache: None,
             dcache: None,
+            dbg_irq_window: None,
         };
         let addr = SLOW_RAM_BASE as u32 + 64 * 1024;
         // With nothing yet driven, the bus rests at 0.

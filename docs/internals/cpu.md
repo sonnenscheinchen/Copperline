@@ -109,18 +109,16 @@ a two-entry longword fetch latch). The 020's chip-bus cycle is modelled as 3
 CPU clocks, not the 68000's 4: after the granted colour-clock slot the access
 bills only the shorter remaining tail (one clock -- half a cck at the stock
 2-clock ratio, none at 14 MHz where the 3-clock cycle fits inside one slot),
-which is write-posting -- a write hands off to the chip bus and the CPU runs
-on. A read cannot: it stalls until the slow chip bus returns the data, so a
-020 read additionally bills a one-cck data-return wait
-(`Bus::bill_020_read_data_wait`, chip/slow/custom reads only). At the stock
-2-clock ratio that wait is hidden under the instruction's own cycle total, but
-at 14 MHz it dominates, making a chip read 8 CPU cycles rather than 6 and
-matching the FS-UAE A1200 reference exactly. The tail's fractional cck are
-carried so none are lost; the 68000/010 keep the full 4-clock (2-cck) cycle and
-no data-return wait (`Bus::cpu_short_bus_cycle`). Residuals: per-frame throughput still runs below
-the reference, and the cycle model does not reflect instruction-cache
-hit/miss *latency* (only its bus-traffic effect), so software that toggles
-CACR cache-on/off and depends on the exact transition timing can diverge.
+which is the whole chip-slot cost at the native 14 MHz ratio. Reads, writes,
+and custom-register reads all consume that granted slot without an additional
+colour-clock bubble; adding one over-stalls 020 chip-RAM read/modify/write
+loops, while the A1200 timing-test chip-read row remains aligned without it.
+The tail's fractional cck are carried so none are lost; the 68000/010 keep the
+full 4-clock (2-cck) cycle (`Bus::cpu_short_bus_cycle`). Residuals: per-frame
+throughput still runs below the reference, and the cycle model does not reflect
+instruction-cache hit/miss *latency* (only its bus-traffic effect), so software
+that toggles CACR cache-on/off and depends on the exact transition timing can
+diverge.
 MMU-dependent 030/040 accelerator setups are a non-goal.
 
 ## Interrupts and STOP

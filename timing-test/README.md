@@ -119,10 +119,10 @@ rows 23-26 = 9944 / 15308 / 383 / 16842 cck, timing the row-24 A->D fill at
 ~2 cck/word where FS-UAE (10004 / 18364 / 344 / 25095) and vAmiga
 (10070 / 18350 / 346 / 25097) agree on ~3 cck/word -- the too-fast fill let the
 display fetch an unfinished buffer. The fill cadence was corrected on 2026-06-09;
-Copperline now reads ~9944 / 18395 / 386 / 22228, matching the references on
-rows 23-24. Known residuals tracked by these rows: row 25 (line blit) is ~11%
-slow (386 vs ~345), and row 26's display-DMA contention (row 26 - row 24) is
-still under-modeled (~3800 vs ~6740 cck).
+Copperline now reads ~9922 / 18339 / 317 / 25074 against the current FS-UAE
+reference 9908 / 18357 / 262 / 25208, matching rows 23-24 and the row-26
+display-DMA contention. Known residual tracked by these rows: row 25 (line
+blit) is ~21% slow (317 vs 262).
 
 ### Rows 19-21: the cooperative-scheduler interrupt chain
 

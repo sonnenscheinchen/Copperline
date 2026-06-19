@@ -19,8 +19,8 @@ use crate::chipset::denise::{
 };
 use crate::chipset::keyboard::KeyboardMcu;
 use crate::chipset::paula::{
-    Paula, PotPins, DMACON_DMAEN, INT_COPER, INT_DSKBLK, INT_DSKSYNC, INT_EXTER, INT_PORTS,
-    INT_VERTB, NTSC_AUDIO_MIN_PERIOD_CCK, PAL_AUDIO_MIN_PERIOD_CCK, PAULA_CLOCK_HZ,
+    Paula, PotPins, DMACON_DMAEN, INT_BLIT, INT_COPER, INT_DSKBLK, INT_DSKSYNC, INT_EXTER,
+    INT_PORTS, INT_VERTB, NTSC_AUDIO_MIN_PERIOD_CCK, PAL_AUDIO_MIN_PERIOD_CCK, PAULA_CLOCK_HZ,
 };
 use crate::floppy::FloppyController;
 use crate::gayle::Gayle;
@@ -2096,7 +2096,7 @@ impl Bus {
         let fill = !line && con1 & 0x0018 != 0;
         let source = beam_write_source_name(source);
         let entry = format!(
-            "{{\"event\":\"{}\",\"source\":\"{}\",\"emu_secs\":{:.6},\"emu_frame\":{},\"vpos\":{},\"hpos\":{},\"bltsize\":{},\"h\":{},\"w\":{},\"line\":{},\"fill\":{},\"line_octant\":{},\"bltcon0\":{},\"bltcon1\":{},\"use_a\":{},\"use_b\":{},\"use_c\":{},\"use_d\":{},\"lf\":{},\"ash\":{},\"bsh\":{},\"sign\":{},\"sing\":{},\"desc\":{},\"ife\":{},\"efe\":{},\"fci\":{},\"bltafwm\":{},\"bltalwm\":{},\"bltapt\":{},\"bltbpt\":{},\"bltcpt\":{},\"bltdpt\":{},\"bltamod\":{},\"bltbmod\":{},\"bltcmod\":{},\"bltdmod\":{},\"bltadat\":{},\"bltbdat\":{},\"bltcdat\":{},\"dmacon\":{},\"bplcon0\":{},\"bplcon1\":{},\"bplcon2\":{},\"bpl1mod\":{},\"bpl2mod\":{},\"ddfstrt\":{},\"ddfstop\":{},\"diwstrt\":{},\"diwstop\":{},\"bplpt\":[{},{},{},{},{},{}]}}",
+            "{{\"event\":\"{}\",\"source\":\"{}\",\"emu_secs\":{:.6},\"emu_frame\":{},\"vpos\":{},\"hpos\":{},\"bltsize\":{},\"h\":{},\"w\":{},\"line\":{},\"fill\":{},\"line_octant\":{},\"bltcon0\":{},\"bltcon1\":{},\"use_a\":{},\"use_b\":{},\"use_c\":{},\"use_d\":{},\"lf\":{},\"ash\":{},\"bsh\":{},\"sign\":{},\"sing\":{},\"desc\":{},\"ife\":{},\"efe\":{},\"fci\":{},\"bltafwm\":{},\"bltalwm\":{},\"bltapt\":{},\"bltbpt\":{},\"bltcpt\":{},\"bltdpt\":{},\"bltamod\":{},\"bltbmod\":{},\"bltcmod\":{},\"bltdmod\":{},\"bltadat\":{},\"bltbdat\":{},\"bltcdat\":{},\"dmacon\":{},\"fmode\":{},\"bplcon0\":{},\"bplcon1\":{},\"bplcon2\":{},\"bpl1mod\":{},\"bpl2mod\":{},\"ddfstrt\":{},\"ddfstop\":{},\"diwstrt\":{},\"diwstop\":{},\"bplpt\":[{},{},{},{},{},{},{},{}]}}",
             event_name,
             source,
             self.emulated_seconds(),
@@ -2138,6 +2138,7 @@ impl Bus {
             self.blitter.bltbdat,
             self.blitter.bltcdat,
             self.agnus.dmacon,
+            self.agnus.fmode(),
             self.denise.bplcon0,
             self.denise.bplcon1,
             self.denise.bplcon2,
@@ -2153,6 +2154,8 @@ impl Bus {
             self.denise.bplpt[3],
             self.denise.bplpt[4],
             self.denise.bplpt[5],
+            self.denise.bplpt[6],
+            self.denise.bplpt[7],
         );
         if let Some(file) = self.blitter_trace.as_mut() {
             let _ = writeln!(file, "{entry}");
@@ -2173,6 +2176,29 @@ impl Bus {
         );
     }
 
+    fn trace_blitter_completion(&mut self, source: &'static str, intreq_before: u16) {
+        let secs = self.emulated_seconds();
+        let frames = self.emulated_frames;
+        let vpos = self.agnus.vpos;
+        let hpos = self.agnus.hpos;
+        let intreq = self.paula.intreq;
+        let intena = self.paula.intena;
+        let dmacon = self.agnus.dmacon;
+        let fmode = self.agnus.fmode();
+        let busy = self.blitter.busy;
+        let bzero = self.blitter.bzero;
+        let bltcon0 = self.blitter.bltcon0;
+        let bltcon1 = self.blitter.bltcon1;
+        let bltdpt = self.blitter.bltdpt;
+        let Some(file) = self.blitter_trace.as_mut() else {
+            return;
+        };
+        let _ = writeln!(
+            file,
+            "{{\"event\":\"completion\",\"source\":\"{source}\",\"emu_secs\":{secs:.6},\"emu_frame\":{frames},\"vpos\":{vpos},\"hpos\":{hpos},\"intreq_before\":{intreq_before},\"intreq\":{intreq},\"intena\":{intena},\"dmacon\":{dmacon},\"fmode\":{fmode},\"busy\":{busy},\"bzero\":{bzero},\"bltcon0\":{bltcon0},\"bltcon1\":{bltcon1},\"bltdpt\":{bltdpt}}}"
+        );
+    }
+
     fn trace_dmaconr_read(&mut self, value: u16) {
         let secs = self.emulated_seconds();
         let frames = self.emulated_frames;
@@ -2180,12 +2206,13 @@ impl Bus {
         let hpos = self.agnus.hpos;
         let busy = self.blitter.busy;
         let bzero = self.blitter.bzero;
+        let fmode = self.agnus.fmode();
         let Some(file) = self.blitter_trace.as_mut() else {
             return;
         };
         let _ = writeln!(
             file,
-            "{{\"event\":\"dmaconr_read\",\"emu_secs\":{secs:.6},\"emu_frame\":{frames},\"vpos\":{vpos},\"hpos\":{hpos},\"value\":{value},\"busy\":{busy},\"bzero\":{bzero}}}"
+            "{{\"event\":\"dmaconr_read\",\"emu_secs\":{secs:.6},\"emu_frame\":{frames},\"vpos\":{vpos},\"hpos\":{hpos},\"value\":{value},\"fmode\":{fmode},\"busy\":{busy},\"bzero\":{bzero}}}"
         );
     }
 
@@ -2409,30 +2436,6 @@ impl Bus {
                 self.record_slice_bus_advance(cck, tick);
             }
         }
-        // A 68020+ read also stalls the CPU while the slow chip bus returns the
-        // read data -- a clock-dependent latency the write-posting tail above
-        // does not cover (a write posts and the CPU moves on without the data).
-        // At the stock 2-clock ratio the read stays instruction-bound and this
-        // is hidden, but at 14 MHz (a 3-clock cycle that fits inside a 4-clock
-        // slot, so the tail above bills nothing) the data-return wait is the
-        // dominant read cost, which is what makes a 020 chip/custom read 8 CPU
-        // cycles rather than 6 against the cycle-exact A1200 reference.
-        if matches!(kind, CpuBusAccessKind::Read) {
-            self.bill_020_read_data_wait();
-        }
-    }
-
-    /// 68020+ read data-return wait: one extra colour clock the 020 stalls for
-    /// the slow chip bus to return read data. Billed only for the short (020)
-    /// bus cycle; the 68000/010's full 4-clock cycle already covers it, so this
-    /// is a no-op there and those paths stay byte-identical. Custom-register
-    /// reads call it directly because they share the `Custom` access kind with
-    /// custom writes (which post like any other write and must not wait).
-    fn bill_020_read_data_wait(&mut self) {
-        if self.cpu_short_bus_cycle {
-            let (cck, tick) = self.advance_one_chip_bus_quantum(None);
-            self.record_slice_bus_advance(cck, tick);
-        }
     }
 
     fn note_cpu_missed_chip_bus_cycle(&mut self) {
@@ -2462,9 +2465,16 @@ impl Bus {
     fn finish_pending_blitter(&mut self) {
         let was_busy = self.blitter.busy;
         if self.blitter.finish_scheduled_now(&mut self.mem.chip_ram) {
-            self.paula.intreq |= crate::chipset::paula::INT_BLIT;
+            self.latch_blitter_completion("forced");
             self.trace_blitter_forced_finish(was_busy);
         }
+    }
+
+    fn latch_blitter_completion(&mut self, source: &'static str) {
+        let intreq_before = self.paula.intreq;
+        self.paula.intreq |= INT_BLIT;
+        self.note_irq_latches_changed();
+        self.trace_blitter_completion(source, intreq_before);
     }
 
     #[cfg(test)]
@@ -2553,6 +2563,14 @@ impl Bus {
         // Drop any bits that are no longer pending (acked while still delayed).
         self.irq_latency_mask &= pending;
         self.irq_latency_last_pending = pending;
+    }
+
+    /// INTREQ/INTENA changes are edge-sensitive for the interrupt-recognition
+    /// delay. Device ticks call this once after their batched latch updates; CPU
+    /// register writes and synchronous blitter finishes call it immediately so a
+    /// source that is cleared and then reasserted gets a fresh recognition edge.
+    fn note_irq_latches_changed(&mut self) {
+        self.arm_irq_recognition_latency();
     }
 
     pub fn next_frame_event_cck(&self) -> u32 {
@@ -3133,11 +3151,6 @@ impl Bus {
 
     pub fn custom_read(&mut self, addr: u64, size: usize) -> u64 {
         self.grant_cpu_bus_access(size, CpuBusAccessKind::Custom);
-        // A custom-register read is a chip-bus read and stalls the 020 for the
-        // data-return wait just like a chip-RAM read; the shared Custom access
-        // kind means grant_cpu_bus_access_at cannot tell a read from a write,
-        // so bill it here. (A custom write posts and must not pay this.)
-        self.bill_020_read_data_wait();
         // Read-only custom registers (INTREQR, DSKBYTR, SERDATR, POTxDAT, ...)
         // reflect timed-device state, so apply the deferred device clocks before
         // reading.
@@ -3493,6 +3506,7 @@ impl Bus {
             0x030 => {
                 let irq = self.paula.write_serdat(val);
                 self.paula.intreq |= irq;
+                self.note_irq_latches_changed();
                 irq & self.paula.intena != 0
             }
             0x032 => {
@@ -3533,6 +3547,7 @@ impl Bus {
                 }
                 if self.floppy.write_dsklen(val, self.paula.adkcon) {
                     self.paula.intreq |= crate::chipset::paula::INT_DSKBLK;
+                    self.note_irq_latches_changed();
                     return self.paula.intena & crate::chipset::paula::INT_DSKBLK != 0;
                 }
                 false
@@ -3758,6 +3773,7 @@ impl Bus {
                 // via INTENA rather than relying on INTREQ acks while the blitter
                 // is idle.
                 self.paula.intreq &= !crate::chipset::paula::INT_BLIT;
+                self.note_irq_latches_changed();
                 // A blit over the exception-vector area is useful crash context:
                 // flag it so the CPU wrapper can dump the instruction history.
                 if self.blitter.bltcon0 & 0x0100 != 0 && self.blitter.bltdpt < 0x1000 {
@@ -3828,6 +3844,7 @@ impl Bus {
                 // Same as BLTSIZE: starting a new blit consumes a stale pending
                 // blitter-done interrupt request.
                 self.paula.intreq &= !crate::chipset::paula::INT_BLIT;
+                self.note_irq_latches_changed();
                 self.trace_blitter_start_ecs(val, source);
                 self.diag_blit_start(u32::from(self.blitter.bltsizv), (val as u32) & 0x07FF);
                 self.blitter.start_scheduled_ecs(val, &self.mem.chip_ram);
@@ -3870,6 +3887,7 @@ impl Bus {
             0x07E => {
                 if self.floppy.write_dsksync(val) {
                     self.paula.intreq |= INT_DSKSYNC;
+                    self.note_irq_latches_changed();
                     return self.paula.intena & INT_DSKSYNC != 0;
                 }
                 false
@@ -3889,6 +3907,7 @@ impl Bus {
                     );
                 }
                 self.paula.write_intena(val);
+                self.note_irq_latches_changed();
                 false
             }
             0x09C => {
@@ -3917,6 +3936,7 @@ impl Bus {
                 }
                 let coper_was_pending = self.paula.intreq & INT_COPER != 0;
                 let asserted = self.paula.write_intreq(val);
+                self.note_irq_latches_changed();
                 if matches!(source, BeamWriteSource::Copper)
                     && val & 0x8000 != 0
                     && val & INT_COPER != 0
@@ -4383,18 +4403,21 @@ impl Bus {
         if !matches!(owner, ChipBusOwner::Copper) {
             self.process_chip_bus_owner(owner);
         }
-        // A busy blitter's idle pipeline cycles elapse in real time no matter
-        // who used the bus this color clock: advance the pipeline through them
-        // so the blit's wall-clock duration matches hardware. Access cycles
-        // that lost arbitration still stall the pipeline (the owner is only
-        // Blitter when an access slot was granted).
+        // A busy blitter's idle pipeline cycles leave the chip bus free, but
+        // they still advance on Agnus slots that are available to the
+        // CPU/blitter/Copper arbitration domain. Fixed DMA slots stall even an
+        // idle blitter phase; otherwise display DMA would not slow area fills.
         if !matches!(owner, ChipBusOwner::Blitter)
+            && matches!(
+                owner,
+                ChipBusOwner::Idle | ChipBusOwner::Cpu | ChipBusOwner::Copper
+            )
             && self.blitter.busy
             && self.blitter_dma_enabled()
             && !self.blitter.current_slot_needs_bus()
             && self.blitter.tick_scheduled_slot(&mut self.mem.chip_ram)
         {
-            self.paula.intreq |= crate::chipset::paula::INT_BLIT;
+            self.latch_blitter_completion("idle_pipeline");
         }
         let tick = self.advance_beam(cck);
         self.audio_pending_cck = self.audio_pending_cck.saturating_add(cck);
@@ -4978,7 +5001,7 @@ impl Bus {
             // gap accounting), so it never reaches here.
             ChipBusOwner::Blitter => {
                 if self.blitter.tick_scheduled_slot(&mut self.mem.chip_ram) {
-                    self.paula.intreq |= crate::chipset::paula::INT_BLIT;
+                    self.latch_blitter_completion("bus_slot");
                 }
             }
             ChipBusOwner::Audio => self.step_audio_dma_slot(),
@@ -5194,8 +5217,9 @@ impl Bus {
             let slot_consumed = if slot_needs_bus {
                 slot_grantable && !copper_blocks
             } else {
-                // Idle pipeline cycle: elapses regardless of who owns the bus.
-                quantum >= CHIP_BUS_SLOT_CCK
+                // Idle pipeline cycle: bus-free, but still stalled by fixed DMA
+                // slots just like the live path.
+                slot_grantable
             };
             if slot_consumed {
                 slot_idx += 1;
@@ -15067,6 +15091,35 @@ mod tests {
     }
 
     #[test]
+    fn bltsize_stale_blit_clear_rearms_interrupt_recognition_for_next_completion() {
+        let mut bus = empty_bus();
+        bus.irq_latency_setting = 65;
+        bus.paula.intena = INT_MASTER | INT_BLIT;
+        bus.paula.intreq = INT_BLIT;
+        bus.arm_irq_recognition_latency();
+        assert_eq!(bus.irq_latency_last_pending & INT_BLIT, INT_BLIT);
+
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_BLTEN;
+        bus.agnus.hpos = 0x20;
+        bus.blitter.bltcon0 = 0x0100;
+        bus.begin_cpu_slice();
+
+        assert!(!bus.custom_write(0x058, 2, (1 << 6) | 1));
+        assert_eq!(bus.paula.intreq & INT_BLIT, 0);
+        assert_eq!(bus.irq_latency_last_pending & INT_BLIT, 0);
+        assert_eq!(bus.irq_latency_mask & INT_BLIT, 0);
+
+        let completion_cck = bus.next_blitter_completion_cck().unwrap();
+        bus.advance_chipset(completion_cck);
+        assert_ne!(bus.paula.intreq & INT_BLIT, 0);
+        assert_eq!(bus.irq_latency_mask & INT_BLIT, INT_BLIT);
+        assert_eq!(bus.cpu_visible_intreq() & INT_BLIT, 0);
+
+        bus.advance_chipset(65);
+        assert_ne!(bus.cpu_visible_intreq() & INT_BLIT, 0);
+    }
+
+    #[test]
     fn busy_blitter_register_writes_finish_current_blit_before_latching_next_state() {
         assert_busy_blitter_register_write_drains_current_blit(0x044, 0x0FF0, |bus| {
             assert_eq!(bus.blitter.bltafwm, 0x0FF0);
@@ -15407,6 +15460,31 @@ mod tests {
         assert_eq!(tick.new_lines, 0);
         assert_eq!(bus.agnus.hpos, 0x23);
         assert_eq!(bus.last_chip_bus_owner(), ChipBusOwner::Idle);
+    }
+
+    #[test]
+    fn aga_68020_chip_and_custom_reads_use_alice_slot_without_extra_wait() {
+        let mut bus = empty_bus();
+        bus.set_chipset_revisions(AgnusRevision::AgaAlice, DeniseRevision::AgaLisa);
+        bus.set_cpu_clocks_per_cck(4);
+        bus.set_cpu_short_bus_cycle(true);
+        bus.set_cpu_bus_arbitration_enabled(true);
+
+        bus.agnus.hpos = 0x20;
+        bus.grant_cpu_bus_access_at(Some(0x0002_0000), 2, CpuBusAccessKind::Read);
+        let (chip_read_cck, _) = bus.take_slice_bus_advance();
+        assert_eq!(chip_read_cck, 1);
+        assert_eq!(bus.last_chip_bus_owner(), ChipBusOwner::Cpu);
+
+        bus.grant_cpu_bus_access_at(Some(0x0002_0000), 2, CpuBusAccessKind::Write);
+        let (chip_write_cck, _) = bus.take_slice_bus_advance();
+        assert_eq!(chip_write_cck, 1);
+        assert_eq!(bus.last_chip_bus_owner(), ChipBusOwner::Cpu);
+
+        let _ = bus.custom_read(0x002, 2);
+        let (custom_read_cck, _) = bus.take_slice_bus_advance();
+        assert_eq!(custom_read_cck, 1);
+        assert_eq!(bus.last_chip_bus_owner(), ChipBusOwner::Cpu);
     }
 
     #[test]

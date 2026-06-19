@@ -99,6 +99,7 @@ authoritative list. The most useful ones:
 | `COPPERLINE_DIAG_MANUAL_SPRITES` | `=BEAMY` or `=all`: log manually replayed sprite intervals, sprite register writes, BPLCON3/BPLCON4/FMODE/COLOR timing, sprite pointer alignment, and held wide-sprite words |
 | `COPPERLINE_DIAG_SPRITE_PIXELS` | `=BEAMY[,STEP]`: sample non-transparent sprite pixels on one beam line, including sprite or attached-pair index, palette entry, RGB, BPLCON3, and BPLCON4; STEP defaults to 32 framebuffer pixels |
 | `COPPERLINE_DIAG_BLITREGS` | `=START:END` (emulated seconds): log the full blitter register set at every blit start (classic BLTSIZE and ECS BLTSIZH); pairs with `COPPERLINE_DUMP_BLITMEM` snapshots for offline blit verification |
+| `COPPERLINE_TRACE_BLITTER` | Path to a JSONL trace of blitter starts, forced finishes, DMACONR polls, and completion IRQ latches; start records include minterm/control registers, DMA/display context, FMODE, and all eight bitplane pointers |
 | `COPPERLINE_DIAG_DISK` | Disk DMA state changes (DSKLEN writes) |
 | `COPPERLINE_DIAG_AUDIO_NOTES` | Paula channel note on/off events |
 | `COPPERLINE_DIAG_CRASH` | CPU exception/halt conditions |
