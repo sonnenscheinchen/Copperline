@@ -176,9 +176,7 @@ fn diag_caprow() -> Option<CaprowDiag> {
     use std::sync::OnceLock;
     static V: OnceLock<Option<CaprowDiag>> = OnceLock::new();
     *V.get_or_init(|| {
-        let Some(raw) = crate::envcfg::var("COPPERLINE_DIAG_CAPROW") else {
-            return None;
-        };
+        let raw = crate::envcfg::var("COPPERLINE_DIAG_CAPROW")?;
         let raw = raw.trim();
         if raw.is_empty() || raw == "1" || raw.eq_ignore_ascii_case("all") {
             return Some(CaprowDiag {
