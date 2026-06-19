@@ -845,6 +845,73 @@ impl SpriteLine {
     }
 }
 
+const SPRITE_LINE_MAX_BITS: usize = 64;
+
+struct SpriteLineSampler<'a> {
+    line: &'a SpriteLine,
+    bit_stops: [i32; SPRITE_LINE_MAX_BITS + 1],
+    bit_values: [u8; SPRITE_LINE_MAX_BITS],
+    bit_count: usize,
+}
+
+impl<'a> SpriteLineSampler<'a> {
+    fn new(
+        line: &'a SpriteLine,
+        base_control: ControlState,
+        control_segments: &[ControlSegment],
+    ) -> Self {
+        let base_x =
+            sprite_base_framebuffer_x(line.hstart, line.hsub_70ns, base_control, control_segments);
+        let mut bit_stops = [0i32; SPRITE_LINE_MAX_BITS + 1];
+        let mut bit_values = [0u8; SPRITE_LINE_MAX_BITS];
+        let mut bit_count = 0usize;
+        let mut x_cursor = base_x;
+        bit_stops[0] = base_x;
+
+        for w in 0..line.width_words() {
+            let (data, datb) = line.word(w);
+            for bit in (0..16).rev() {
+                let sample_x = x_cursor.clamp(0, FB_WIDTH.saturating_sub(1) as i32) as usize;
+                let sprite_pixel_repeat =
+                    control_at_x(base_control, control_segments, sample_x).sprite_pixel_repeat();
+                let lo = u8::from(data & (1 << bit) != 0);
+                let hi = u8::from(datb & (1 << bit) != 0);
+                bit_values[bit_count] = lo | (hi << 1);
+                x_cursor += sprite_pixel_repeat;
+                bit_count += 1;
+                bit_stops[bit_count] = x_cursor;
+            }
+        }
+
+        Self {
+            line,
+            bit_stops,
+            bit_values,
+            bit_count,
+        }
+    }
+
+    fn framebuffer_range(&self) -> Option<(i32, i32)> {
+        let start = self.bit_stops[0].max(self.line.x_start as i32).max(0);
+        let stop = self.bit_stops[self.bit_count]
+            .min(self.line.x_stop as i32)
+            .min(FB_WIDTH as i32);
+        (start < stop).then_some((start, stop))
+    }
+
+    fn pixel_bits_at(&self, x: i32) -> u8 {
+        if x < self.line.x_start as i32
+            || x >= self.line.x_stop as i32
+            || x < self.bit_stops[0]
+            || x >= self.bit_stops[self.bit_count]
+        {
+            return 0;
+        }
+        let bit_idx = self.bit_stops[1..=self.bit_count].partition_point(|stop| *stop <= x);
+        self.bit_values[bit_idx]
+    }
+}
+
 /// Sprite colour entry in the palette store. AGA bases the lookup on the
 /// BPLCON4 ESPRM low nibble (even sprites / attached pairs) or OSPRM high
 /// nibble (odd sprites); pre-AGA uses the classic 16..31 block. Attached pairs
@@ -5008,16 +5075,21 @@ fn render_attached_sprite_pair_lines(
             continue;
         }
 
+        let even_beam_lines: Vec<SpriteLineSampler<'_>> = even_lines
+            .iter()
+            .filter(|line| line.beam_y == beam_y)
+            .map(|line| SpriteLineSampler::new(line, base_controls[y], &control_segments[y]))
+            .collect();
+        let odd_beam_lines: Vec<SpriteLineSampler<'_>> = odd_lines
+            .iter()
+            .filter(|line| line.beam_y == beam_y)
+            .map(|line| SpriteLineSampler::new(line, base_controls[y], &control_segments[y]))
+            .collect();
+
         let mut x_start = FB_WIDTH as i32;
         let mut x_stop = 0i32;
-        for line in even_lines
-            .iter()
-            .chain(odd_lines.iter())
-            .filter(|line| line.beam_y == beam_y)
-        {
-            if let Some((start, stop)) =
-                sprite_line_framebuffer_range(line, base_controls[y], &control_segments[y])
-            {
+        for line in even_beam_lines.iter().chain(odd_beam_lines.iter()) {
+            if let Some((start, stop)) = line.framebuffer_range() {
                 x_start = x_start.min(start);
                 x_stop = x_stop.max(stop);
             }
@@ -5030,22 +5102,8 @@ fn render_attached_sprite_pair_lines(
 
         for x in x_start..x_stop {
             let x_usize = x as usize;
-            let even_idx = sprite_lines_pixel_bits_at(
-                even_lines,
-                beam_y,
-                y,
-                x,
-                base_controls,
-                control_segments,
-            );
-            let odd_idx = sprite_lines_pixel_bits_at(
-                odd_lines,
-                beam_y,
-                y,
-                x,
-                base_controls,
-                control_segments,
-            );
+            let even_idx = sprite_line_samplers_pixel_bits_at(&even_beam_lines, x);
+            let odd_idx = sprite_line_samplers_pixel_bits_at(&odd_beam_lines, x);
             let idx = even_idx | (odd_idx << 2);
             if idx == 0 {
                 continue;
@@ -5100,23 +5158,6 @@ fn sprite_pair_attach_active_for_beam(
         .any(|line| line.beam_y == beam_y && line.attached)
 }
 
-fn sprite_line_framebuffer_range(
-    line: &SpriteLine,
-    base_control: ControlState,
-    control_segments: &[ControlSegment],
-) -> Option<(i32, i32)> {
-    let base_x =
-        sprite_base_framebuffer_x(line.hstart, line.hsub_70ns, base_control, control_segments);
-    let mut x_cursor = base_x;
-    for _ in 0..(16 * line.width_words()) {
-        let sample_x = x_cursor.clamp(0, FB_WIDTH.saturating_sub(1) as i32) as usize;
-        x_cursor += control_at_x(base_control, control_segments, sample_x).sprite_pixel_repeat();
-    }
-    let start = base_x.max(line.x_start as i32).max(0);
-    let stop = x_cursor.min(line.x_stop as i32).min(FB_WIDTH as i32);
-    (start < stop).then_some((start, stop))
-}
-
 fn sprite_lines_pixel_bits_at(
     lines: &[SpriteLine],
     beam_y: i32,
@@ -5130,6 +5171,16 @@ fn sprite_lines_pixel_bits_at(
         .filter(|line| line.beam_y == beam_y)
         .find_map(|line| {
             let idx = sprite_line_pixel_bits_at(line, x, base_controls[y], &control_segments[y]);
+            (idx != 0).then_some(idx)
+        })
+        .unwrap_or(0)
+}
+
+fn sprite_line_samplers_pixel_bits_at(lines: &[SpriteLineSampler<'_>], x: i32) -> u8 {
+    lines
+        .iter()
+        .find_map(|line| {
+            let idx = line.pixel_bits_at(x);
             (idx != 0).then_some(idx)
         })
         .unwrap_or(0)

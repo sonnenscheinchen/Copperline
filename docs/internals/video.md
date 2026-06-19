@@ -154,7 +154,11 @@ Two presentation-only adjustments (they never alter the emulated
 framebuffer):
 
 - **Overscan mask**: `[display] overscan = "tv"` masks deep-overscan
-  margins in black like a CRT bezel; `"full"` shows the entire field.
+  margins in black like a CRT bezel; `"full"` shows the entire field. The
+  default TV mask is presentation-only and asymmetric vertically: it keeps a
+  little top overscan but crops the lower edge at the standard display bottom,
+  matching the common case where lower-border sprite/effect junk is hidden by
+  the display crop.
 - **Horizontal recentring**: a standard (non-overscan) display is recentred
   for presentation, since the framebuffer captures a deep slab of left
   overscan that would otherwise push the picture right of centre compared
