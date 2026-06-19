@@ -619,11 +619,7 @@ impl Blitter {
         let mut dpt = self.bltdpt;
 
         let mut a_prev: u16 = 0;
-        let mut b_prev: u16 = if !self.bltbold_init {
-            self.bltbold
-        } else {
-            0
-        };
+        let mut b_prev: u16 = if !self.bltbold_init { self.bltbold } else { 0 };
         for _row in 0..h {
             let mut fill_state: u16 = fci;
             // Buffer this row's D words so fill mode can process them
@@ -1725,7 +1721,12 @@ mod tests {
     #[test]
     fn scheduled_shift_carry_crosses_normal_mode_row_boundary() {
         let mut ram = vec![0u8; 256];
-        for (addr, word) in [(0x10, 0x1111), (0x12, 0x2222), (0x14, 0x3333), (0x16, 0x4444)] {
+        for (addr, word) in [
+            (0x10, 0x1111),
+            (0x12, 0x2222),
+            (0x14, 0x3333),
+            (0x16, 0x4444),
+        ] {
             write_word(&mut ram, addr, word);
         }
 
