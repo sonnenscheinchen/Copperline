@@ -93,8 +93,9 @@ cargo build --release
 
 The binary looks for `./copperline.toml`; if it isn't present, built-in
 defaults are used (68000 at ~7.09 MHz, OCS, PAL, real speed, and the bundled
-[AROS](https://www.aros.org/) ROM on a 1 MB A500). Boot your own ROM with a
-positional argument, or point at a config file:
+[AROS](https://www.aros.org/) ROM on a 1 MB A500: 512 KiB chip plus 512 KiB
+trapdoor slow RAM). Boot your own ROM with a positional argument, or point at a
+config file:
 
 ```sh
 ./target/release/copperline path/to/kickstart.rom
@@ -127,7 +128,7 @@ model = "68000"       # 68000, 68EC020, 68020, 68030, 68040
 [memory]
 chip = "512K"         # OCS 512K, ECS/AGA up to 2M
 fast = "0"            # Zorro II autoconfig fast RAM, up to 8M
-slow = "0"            # A500 trapdoor RAM at $C00000, up to 512K
+slow = "512K"         # A500 trapdoor RAM at $C00000, up to 512K
 
 [chipset]
 revision = "OCS"      # OCS, ECS, or AGA (picks the Agnus/Denise revisions)

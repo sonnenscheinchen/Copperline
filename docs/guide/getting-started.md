@@ -81,11 +81,10 @@ With no arguments, Copperline looks for `./copperline.toml` in the current
 directory. If it is not present, built-in defaults are used: a 68000 at
 ~7.09 MHz with 512 KiB chip RAM, OCS, PAL, and the bundled AROS ROM (when no
 ROM is named, Copperline locates the AROS image that ships with it -- see
-[](configuration#top-level)). Because AROS needs more than a bare 512 KiB
-A500, the default machine is fitted with 512 KiB of trapdoor (slow) RAM in
-this case -- a stock 1 MB A500 -- so it boots to the AROS "waiting for
-bootable media" screen. Naming your own ROM, machine, or memory turns this
-off.
+[](configuration#top-level)). The default machine is a 1 MB A500: 512 KiB
+chip RAM plus 512 KiB of trapdoor slow RAM, matching the memory expansion
+many OCS demos expect. Use `--slow 0` or `[memory] slow = "0"` for a bare
+512 KiB A500.
 
 You can boot your own ROM with a positional argument, or point at a specific
 config file:
@@ -97,7 +96,7 @@ config file:
 
 The common machine knobs can also be set straight on the command line,
 without writing a config file at all -- the machine model, chipset, CPU
-(and its clock/FPU), and the chip/fast RAM sizes:
+(and its clock/FPU), and the chip/fast/slow RAM sizes:
 
 ```sh
 ./target/release/copperline --model A1200 --fast 8M KICK31.ROM

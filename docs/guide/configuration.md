@@ -86,17 +86,17 @@ A machine profile bundles the chipset, CPU, memory, gate array, and
 peripheral defaults of a real machine. The key is `profile` (the deprecated
 `model` alias still parses) so it never collides with `[cpu] model`. Explicit `[cpu]`, `[chipset]`, and
 `[memory]` sections override individual profile defaults. Without a
-`[machine]` section you get legacy A500-like defaults (OCS, 68000, 512K
-chip RAM).
+`[machine]` section you get A500-like defaults (OCS, 68000, 512K chip RAM,
+512K trapdoor slow RAM).
 
-| Profile | Chipset | CPU | Chip RAM | Extras |
-|---|---|---|---|---|
-| `A500` | OCS | 68000 @ 7.09 MHz | 512K | -- |
-| `A500Plus` | ECS (8372A Agnus, ECS Denise) | 68000 @ 7.09 MHz | 1M | -- |
-| `A600` | ECS (8375 Agnus, ECS Denise) | 68000 @ 7.09 MHz | 1M | Gayle IDE, RTC |
-| `A1200` | AGA (Alice/Lisa) | 68EC020 @ 14.18 MHz | 2M | Gayle IDE, RTC |
-| `CDTV` | ECS | 68000 @ 7.09 MHz | 1M | DMAC CD controller, 256K extended ROM |
-| `CD32` | AGA (Alice/Lisa) | 68EC020 @ 14.18 MHz | 2M | Akiko, CD32 pad, NVRAM, 512K extended ROM |
+| Profile | Chipset | CPU | Chip RAM | Slow RAM | Extras |
+|---|---|---|---|---|---|
+| `A500` | OCS | 68000 @ 7.09 MHz | 512K | 512K | -- |
+| `A500Plus` | ECS (8372A Agnus, ECS Denise) | 68000 @ 7.09 MHz | 1M | 0 | -- |
+| `A600` | ECS (8375 Agnus, ECS Denise) | 68000 @ 7.09 MHz | 1M | 0 | Gayle IDE, RTC |
+| `A1200` | AGA (Alice/Lisa) | 68EC020 @ 14.18 MHz | 2M | 0 | Gayle IDE, RTC |
+| `CDTV` | ECS | 68000 @ 7.09 MHz | 1M | 0 | DMAC CD controller, 256K extended ROM |
+| `CD32` | AGA (Alice/Lisa) | 68EC020 @ 14.18 MHz | 2M | 0 | Akiko, CD32 pad, NVRAM, 512K extended ROM |
 
 `rtc` exists because some machines shipped both ways: the base A600 had no
 RTC while the A600HD did. The default keeps it fitted so the Workbench
@@ -180,7 +180,7 @@ clock_mhz = 14.0    # optional; defaults to the model's stock speed
 [memory]
 chip = "512K"   # OCS max 512K; ECS/AGA max 2M
 fast = "0"      # Zorro II fast RAM at $200000: 64K..8M board sizes
-slow = "0"      # A500 trapdoor RAM at $C00000: up to 512K
+slow = "512K"   # A500 trapdoor RAM at $C00000: 0 or up to 512K
 z3   = "0"      # Zorro III RAM (needs a 32-bit CPU): 64K..1G, power of two
 ```
 

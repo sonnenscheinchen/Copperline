@@ -76,7 +76,8 @@ model = "68000"
 # Optional machine profile: a validated bundle of chipset revisions, CPU,
 # memory sizes, RTC presence, and gate array. Explicit [cpu]/[chipset]/
 # [memory] sections still override the profile defaults. Without this
-# section the legacy A500-like defaults apply.
+# section the A500-like defaults apply (512 KiB chip plus 512 KiB
+# trapdoor slow RAM).
 # [machine]
 # profile = "A600"      # A500 | A500Plus | A600 | A1200 | CDTV | CD32
 # rtc = true            # $DC0000 RTC fitted (base A600 shipped without)
@@ -124,7 +125,7 @@ fast = "0"
 # A500 trapdoor/fake-fast RAM mapped at $00C00000. Some OCS demos probe
 # this address directly instead of using Zorro II autoconfig memory.
 # Set to 0 to disable.
-slow = "0"
+slow = "512K"
 
 # Zorro III autoconfig RAM. Kickstart assigns the base address (usually
 # $40000000). Needs a CPU with a 32-bit address bus (68020/68030/68040;

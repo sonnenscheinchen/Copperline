@@ -292,8 +292,8 @@ pub enum Chipset {
 /// clock, memory sizes, RTC presence, and gate array. Explicit `[cpu]`/
 /// `[chipset]`/`[memory]` sections override the profile defaults where
 /// compatible; the profile owns what those sections cannot express (Gayle,
-/// RTC presence). With no `[machine]` section the defaults are the legacy
-/// A500-like behaviour, so existing configs are untouched.
+/// RTC presence). With no `[machine]` section the defaults are A500-like:
+/// OCS, 68000, 512 KiB chip RAM, and 512 KiB trapdoor slow RAM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MachineModel {
     A500,
@@ -499,6 +499,8 @@ impl GateArray {
     }
 }
 
+const A500_TRAPDOOR_RAM_BYTES: usize = 512 * 1024;
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -515,7 +517,7 @@ impl Default for Config {
             },
             chip_ram_bytes: 512 * 1024,
             fast_ram_bytes: 0,
-            slow_ram_bytes: 0,
+            slow_ram_bytes: A500_TRAPDOOR_RAM_BYTES,
             z3_ram_bytes: 0,
             zorro_boards: Vec::new(),
             chipset: Chipset::Ocs,
@@ -627,10 +629,11 @@ fn raw_from_path(path: &Path) -> Result<RawConfig> {
 
 /// Command-line overrides for the handful of machine knobs it is convenient
 /// to set without writing a config file: the machine model, the chipset
-/// preset, the CPU and its FPU/clock, and the chip/fast RAM sizes. Each field
-/// is `None` when the corresponding flag was not given, leaving the file (or
-/// profile default) value untouched. The string fields carry the same syntax
-/// the matching TOML fields accept and are validated by the same parsers.
+/// preset, the CPU and its FPU/clock, and the chip/fast/slow RAM sizes. Each
+/// field is `None` when the corresponding flag was not given, leaving the file
+/// (or profile default) value untouched. The string fields carry the same
+/// syntax the matching TOML fields accept and are validated by the same
+/// parsers.
 #[derive(Debug, Default, Clone)]
 pub struct ConfigOverrides {
     pub model: Option<String>,
@@ -1171,20 +1174,25 @@ fn machine_profile_defaults(model: MachineModel) -> Config {
         ..Config::default()
     };
     match model {
-        // The classic OCS A500: identical to the legacy defaults.
+        // The common expanded OCS A500: 512 KiB chip plus 512 KiB trapdoor
+        // slow RAM. A bare 512 KiB machine is still available with
+        // `[memory] slow = "0"` or `--slow 0`.
         MachineModel::A500 => {}
         MachineModel::A500Plus => {
             d.chipset = Chipset::Ecs;
             d.chip_ram_bytes = 1024 * 1024;
+            d.slow_ram_bytes = 0;
         }
         MachineModel::A600 => {
             d.chipset = Chipset::Ecs;
             d.chip_ram_bytes = 1024 * 1024;
+            d.slow_ram_bytes = 0;
             d.gate_array = GateArray::GayleA600;
         }
         MachineModel::A1200 => {
             d.chipset = Chipset::Aga;
             d.chip_ram_bytes = 2 * 1024 * 1024;
+            d.slow_ram_bytes = 0;
             d.cpu = CpuModel::M68EC020;
             d.cpu_clock_mhz = 14.18;
             d.gate_array = GateArray::GayleA1200;
@@ -1195,6 +1203,7 @@ fn machine_profile_defaults(model: MachineModel) -> Config {
         MachineModel::Cdtv => {
             d.chipset = Chipset::Ecs;
             d.chip_ram_bytes = 1024 * 1024;
+            d.slow_ram_bytes = 0;
             d.cdtv_cd = true;
         }
         // CD32: AGA, 68EC020 at 14 MHz, 2 MB chip RAM, Akiko, and the
@@ -1202,6 +1211,7 @@ fn machine_profile_defaults(model: MachineModel) -> Config {
         MachineModel::Cd32 => {
             d.chipset = Chipset::Aga;
             d.chip_ram_bytes = 2 * 1024 * 1024;
+            d.slow_ram_bytes = 0;
             d.cpu = CpuModel::M68EC020;
             d.cpu_clock_mhz = 14.18;
             d.akiko = true;
@@ -1613,11 +1623,34 @@ mod tests {
 
     #[test]
     fn machine_profiles_supply_defaults_and_keep_overrides() -> Result<()> {
-        // No [machine] section: legacy defaults, no gate array, RTC fitted.
+        // No [machine] section: A500-like defaults, no gate array, RTC fitted.
         let cfg = parse_config("")?;
         assert_eq!(cfg.machine, None);
         assert_eq!(cfg.gate_array, GateArray::None);
+        assert_eq!(cfg.chip_ram_bytes, 512 * 1024);
+        assert_eq!(cfg.slow_ram_bytes, 512 * 1024);
         assert!(cfg.rtc_present);
+
+        let cfg = parse_config(
+            r#"
+            [machine]
+            profile = "A500"
+            "#,
+        )?;
+        assert_eq!(cfg.machine, Some(MachineModel::A500));
+        assert_eq!(cfg.chipset, Chipset::Ocs);
+        assert_eq!(cfg.chip_ram_bytes, 512 * 1024);
+        assert_eq!(cfg.slow_ram_bytes, 512 * 1024);
+
+        let cfg = parse_config(
+            r#"
+            [machine]
+            profile = "A500"
+            [memory]
+            slow = "0"
+            "#,
+        )?;
+        assert_eq!(cfg.slow_ram_bytes, 0);
 
         let cfg = parse_config(
             r#"
@@ -1629,6 +1662,7 @@ mod tests {
         assert_eq!(cfg.gate_array, GateArray::GayleA600);
         assert_eq!(cfg.chipset, Chipset::Ecs);
         assert_eq!(cfg.chip_ram_bytes, 1024 * 1024);
+        assert_eq!(cfg.slow_ram_bytes, 0);
         // The A600 board carries the 2 MB-capable 8375 even with 1 MB fitted.
         assert_eq!(cfg.agnus_revision, AgnusRevision::Ecs8375);
         assert_eq!(cfg.denise_revision, DeniseRevision::Ecs8373);
@@ -1656,6 +1690,7 @@ mod tests {
         )?;
         assert_eq!(cfg.chipset, Chipset::Ecs);
         assert_eq!(cfg.chip_ram_bytes, 1024 * 1024);
+        assert_eq!(cfg.slow_ram_bytes, 0);
         assert_eq!(cfg.agnus_revision, AgnusRevision::Ecs8372Rev4);
         assert_eq!(cfg.gate_array, GateArray::None);
 
@@ -1666,6 +1701,7 @@ mod tests {
             "#,
         )?;
         assert_eq!(cfg.cpu, CpuModel::M68EC020);
+        assert_eq!(cfg.slow_ram_bytes, 0);
         assert_eq!(cfg.gate_array, GateArray::GayleA1200);
         assert_eq!(cfg.agnus_revision, AgnusRevision::AgaAlice);
         assert_eq!(cfg.denise_revision, DeniseRevision::AgaLisa);
@@ -2341,6 +2377,7 @@ mod tests {
         assert!(cfg.fpu);
         assert_eq!(cfg.cpu_clock_mhz, 28.0);
         assert_eq!(cfg.fast_ram_bytes, 4 * 1024 * 1024);
+        assert_eq!(cfg.slow_ram_bytes, 512 * 1024);
         Ok(())
     }
 

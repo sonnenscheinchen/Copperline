@@ -680,8 +680,8 @@ fn print_help() {
          \n\
          If ROM is given on the command line it overrides the rom path from\n\
          the config. If no config file exists, built-in defaults are used:\n  \
-         CPU: 68000   chip RAM: 512K   fast RAM: 0   chipset: OCS   ROM: bundled AROS\n  \
-         (the bundled AROS default also fits 512K slow RAM for a 1 MB A500)"
+         CPU: 68000   chip RAM: 512K   slow RAM: 512K   fast RAM: 0   chipset: OCS\n  \
+         ROM: bundled AROS"
     );
 }
 
@@ -1271,15 +1271,6 @@ fn resolve_bundled_rom(cfg: &mut Config) -> Result<()> {
     );
     cfg.rom_path = aros.main;
     cfg.extended_rom_path.get_or_insert(aros.extended);
-    // AROS needs more than the bare 512 KiB A500. When the user picked no
-    // machine profile and added no expansion RAM, fit the 512 KiB trapdoor
-    // (slow) RAM of a stock 1 MB A500 so a zero-argument run boots AROS
-    // instead of sitting on a black screen. Any explicit machine or memory
-    // choice is left untouched.
-    if cfg.machine.is_none() && cfg.slow_ram_bytes == 0 && cfg.fast_ram_bytes == 0 {
-        cfg.slow_ram_bytes = 512 * 1024;
-        info!("bundled AROS: fitting 512 KiB trapdoor RAM (1 MB A500) for the default machine");
-    }
     Ok(())
 }
 
