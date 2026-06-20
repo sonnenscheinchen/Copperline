@@ -51,8 +51,11 @@ Sprite DMA retains its latched POS/CTL descriptor independently from the
 SPRxPT registers. If software fetches a descriptor off-screen, then writes
 SPRxPT before the sprite's VSTART, Agnus retargets the data pointer for
 the retained descriptor instead of requiring a new descriptor at the new
-address. The frame-start replay path mirrors this by replaying off-screen
-DMACON and SPRxPT writes in beam order before rendering the visible field.
+address. Software can also write SPRxPOS/SPRxCTL directly and let sprite
+DMA fetch data from the current SPRxPT stream; in that case SPRxPT names
+the first data word pair, not a memory descriptor. The frame-start replay
+path mirrors descriptor retargeting by replaying off-screen DMACON and
+SPRxPT writes in beam order before rendering the visible field.
 
 A modelling note that catches people out: OCS lo-res with BPU=7 is an
 overprogrammed mode. Denise still decodes six BPLDAT latches, but Agnus
