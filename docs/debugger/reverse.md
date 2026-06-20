@@ -9,8 +9,8 @@ forward. The reconstruction is byte-identical as long as the determinism
 preconditions below hold.
 
 The same machinery backs two surfaces: a headless "last writer" reverse
-watchpoint for automated root-cause hunts, and **&lt; Step** / **&lt; Run**
-controls in the [debugger window](window).
+watchpoint for automated root-cause hunts, and **&lt; Step** /
+**&lt; Frame** / **&lt; Run** controls in the [debugger window](window).
 
 ## What it is good for
 
@@ -71,11 +71,12 @@ or blitter between two instructions lands on the next CPU instruction's PC.
 
 Opening the debugger arms the ring automatically (at a conservatively large
 snapshot interval, since captures only accrue while the machine advances --
-**Run** or **Frame**, not while paused). Two reverse controls then sit at
+**Run** or **Frame**, not while paused). Three reverse controls then sit at
 the right of the transport row:
 
 | Control | Effect |
 |---|---|
+| **&lt; Frame** | Step backward to the previous emulated video frame |
 | **&lt; Step** | Step one instruction backward |
 | **&lt; Run** | Run backward to the previous PC breakpoint hit |
 

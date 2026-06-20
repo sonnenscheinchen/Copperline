@@ -727,6 +727,51 @@ impl Emulator {
         })
     }
 
+    /// Step backward to the first instruction boundary in the previous
+    /// emulated video frame. The target is the Agnus frame counter crossing,
+    /// not a host scheduler quantum.
+    pub fn tt_reverse_frame(&mut self) -> Result<crate::timetravel::ReverseOutcome<u64>> {
+        use crate::timetravel::ReverseOutcome;
+        let current_frame = self.bus().emulated_frames();
+        let Some(target_frame) = current_frame.checked_sub(1) else {
+            return Ok(ReverseOutcome::NotFound);
+        };
+        let saved_pos = self.retired_instructions;
+        let saved_blob = self.snapshot_blob()?;
+        let mut interval_end = self.retired_instructions;
+        let outcome = loop {
+            let anchor = match self
+                .tt_ring
+                .as_ref()
+                .and_then(|r| r.nearest_before(interval_end))
+            {
+                Some(s) => (s.pos, s.frame, s.blob.clone()),
+                None => break ReverseOutcome::BeyondHistory,
+            };
+            let anchor_is_oldest =
+                self.tt_ring.as_ref().and_then(|r| r.oldest_pos()) == Some(anchor.0);
+            self.restore_blob(&anchor.2, anchor.0)?;
+            self.tt_begin_replay_input(anchor.0);
+            if target_frame == 0 && anchor.0 == 0 && anchor.1 == 0 {
+                break ReverseOutcome::Found(0);
+            }
+            if anchor.1 < target_frame {
+                if let Some(pos) = self.tt_scan_frame_start(target_frame, interval_end)? {
+                    self.tt_restore_to(pos)?;
+                    break ReverseOutcome::Found(pos);
+                }
+            }
+            if anchor_is_oldest {
+                break ReverseOutcome::BeyondHistory;
+            }
+            interval_end = anchor.0;
+        };
+        if !matches!(outcome, ReverseOutcome::Found(_)) {
+            self.restore_blob(&saved_blob, saved_pos)?;
+        }
+        Ok(outcome)
+    }
+
     /// Run backward to the previous interactive breakpoint hit: the latest
     /// instruction boundary strictly before the current position whose PC is
     /// an armed breakpoint. On `Found` the machine is left parked there.
@@ -798,6 +843,34 @@ impl Emulator {
             }
         }
         Ok(best)
+    }
+
+    /// Replay the just-restored interval up to `end_pos`, returning the first
+    /// instruction boundary whose Agnus frame counter has reached
+    /// `target_frame`.
+    fn tt_scan_frame_start(&mut self, target_frame: u64, end_pos: u64) -> Result<Option<u64>> {
+        self.tt_apply_due_input(self.retired_instructions);
+        if self.machine.bus().emulated_frames() >= target_frame {
+            return Ok(Some(self.retired_instructions));
+        }
+        let mut cpu_idle = false;
+        let mut guard: u64 = 0;
+        while self.retired_instructions < end_pos {
+            let before = self.retired_instructions;
+            self.run_one_step(&mut cpu_idle, INSTRUCTIONS_PER_SLICE)?;
+            self.tt_apply_due_input(self.retired_instructions);
+            if self.machine.bus().emulated_frames() >= target_frame {
+                return Ok(Some(self.retired_instructions));
+            }
+            if self.retired_instructions == before && !cpu_idle {
+                break;
+            }
+            guard += 1;
+            if guard > TT_REPLAY_STEP_CAP {
+                break;
+            }
+        }
+        Ok(None)
     }
 
     /// Find the last instruction before position `before_pos` that changed the

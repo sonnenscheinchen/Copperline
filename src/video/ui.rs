@@ -290,6 +290,8 @@ pub enum UiControl {
     /// Reverse-debug: step one instruction backward (reconstructed from the
     /// snapshot ring).
     DebugReverseStep,
+    /// Reverse-debug: step to the previous Agnus frame counter crossing.
+    DebugReverseFrame,
     /// Reverse-debug: run backward to the previous breakpoint/watch hit.
     DebugReverseRun,
     DebugMemPrev,
@@ -387,7 +389,7 @@ fn debug_tab_rect(rect: Rect, index: usize) -> Rect {
     }
 }
 
-fn debug_button_rects(rect: Rect) -> [(UiControl, Rect); 9] {
+fn debug_button_rects(rect: Rect) -> [(UiControl, Rect); 10] {
     let y = rect.y + rect.h - DEBUG_BUTTON_H - 6;
     let button = |x: usize, w: usize| Rect {
         x: rect.x + x,
@@ -404,8 +406,9 @@ fn debug_button_rects(rect: Rect) -> [(UiControl, Rect); 9] {
         (UiControl::DebugMemPrev, button(398, 28)),
         (UiControl::DebugMemNext, button(430, 28)),
         // Reverse-debug transport, in the free space at the row's right end.
-        (UiControl::DebugReverseStep, button(466, 86)),
-        (UiControl::DebugReverseRun, button(556, 92)),
+        (UiControl::DebugReverseFrame, button(466, 76)),
+        (UiControl::DebugReverseStep, button(546, 66)),
+        (UiControl::DebugReverseRun, button(616, 60)),
     ]
 }
 
@@ -964,6 +967,7 @@ fn draw_debugger(
                     UiControl::DebugStepFrame => "Frame",
                     UiControl::DebugRunTo => "Run to $",
                     UiControl::DebugReverseStep => "< Step",
+                    UiControl::DebugReverseFrame => "< Frame",
                     UiControl::DebugReverseRun => "< Run",
                     UiControl::DebugMemPrev => "<",
                     UiControl::DebugMemNext => ">",
@@ -974,9 +978,9 @@ fn draw_debugger(
                         panel.tab == DebugTab::Memory
                     }
                     UiControl::DebugRunTo => panel.entry_addr().is_some(),
-                    UiControl::DebugReverseStep | UiControl::DebugReverseRun => {
-                        view.reverse_available
-                    }
+                    UiControl::DebugReverseStep
+                    | UiControl::DebugReverseFrame
+                    | UiControl::DebugReverseRun => view.reverse_available,
                     _ => true,
                 };
                 draw_text_button(

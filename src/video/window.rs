@@ -4241,6 +4241,7 @@ impl App {
             UiControl::DebugStepFrame => self.debugger_step_frame(),
             UiControl::DebugRunTo => self.debugger_run_to(),
             UiControl::DebugReverseStep => self.debugger_reverse_step(),
+            UiControl::DebugReverseFrame => self.debugger_reverse_frame(),
             UiControl::DebugReverseRun => self.debugger_reverse_continue(),
             UiControl::DebugMemPrev => self.debugger_mem_page(-1),
             UiControl::DebugMemNext => self.debugger_mem_page(1),
@@ -4713,6 +4714,26 @@ impl App {
             Ok(ReverseOutcome::BeyondHistory) => self.show_osd("Reverse: beyond recorded history"),
             Ok(ReverseOutcome::NotFound) => self.show_osd("Reverse: nothing earlier to step to"),
             Err(e) => error!("reverse step halted: {e:?}"),
+        }
+        self.finish_render_for_current_frame();
+    }
+
+    /// Step one emulated video frame backward, reconstructed from the
+    /// snapshot ring.
+    fn debugger_reverse_frame(&mut self) {
+        use crate::timetravel::ReverseOutcome;
+        self.paused = true;
+        self.sync_live_audio_suspension();
+        self.last_debug_stop = None;
+        match self.emu.tt_reverse_frame() {
+            Ok(ReverseOutcome::Found(_)) => {}
+            Ok(ReverseOutcome::BeyondHistory) => {
+                self.show_osd("Reverse frame: beyond recorded history")
+            }
+            Ok(ReverseOutcome::NotFound) => {
+                self.show_osd("Reverse frame: no earlier frame to step to")
+            }
+            Err(e) => error!("reverse frame step halted: {e:?}"),
         }
         self.finish_render_for_current_frame();
     }
@@ -7561,6 +7582,22 @@ mod tests {
             app.debugger_step_frame();
         }
         assert!(app.emu.retired_instructions() >= pos_before);
+        let frame_before = app.emu.bus().emulated_frames();
+        let pos_before_frame = app.emu.retired_instructions();
+        assert!(frame_before > 0, "frame history should have advanced");
+
+        // Reverse Frame moves to the previous Agnus frame counter value.
+        app.activate_ui_control(super::ui::UiControl::DebugReverseFrame);
+        assert_eq!(
+            app.emu.bus().emulated_frames(),
+            frame_before - 1,
+            "stepped back exactly one emulated video frame"
+        );
+        assert!(
+            app.emu.retired_instructions() < pos_before_frame,
+            "reverse frame should move to an earlier instruction boundary"
+        );
+
         // And reverse-continue with no breakpoints is a no-op (reports, does
         // not move): position is unchanged afterward.
         let pos = app.emu.retired_instructions();

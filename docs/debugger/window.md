@@ -74,6 +74,7 @@ message.
 | Step | `S` | Execute exactly one instruction |
 | Frame | `F` | Run to the next video frame and re-render the display |
 | Run to `$` | -- | Run until the PC reaches the address in the box |
+| &lt; Frame | -- | Step one video frame *backward* |
 | &lt; Step | -- | Step one instruction *backward* (see [](reverse)) |
 | &lt; Run | -- | Run *backward* to the previous breakpoint hit |
 
