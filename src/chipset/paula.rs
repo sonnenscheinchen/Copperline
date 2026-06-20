@@ -614,6 +614,10 @@ impl Paula {
         self.audio.set_live_output_suspended(suspended);
     }
 
+    pub fn reset_live_audio_after_timeline_jump(&mut self) {
+        self.audio.reset_live_output_after_timeline_jump();
+    }
+
     /// SERDAT write: bits 7..0 are the data byte; bit 8 is either the
     /// ninth data bit or the first stop bit depending on SERPER. The
     /// model keeps a one-word transmit buffer and a timed shift register.

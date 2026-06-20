@@ -43,6 +43,7 @@ pub struct AudioRuntimeStatus {
     pub callback_underrun_frames: u64,
     pub dropped_overrun_frames: u64,
     pub skipped_stale_frames: u64,
+    pub prebuffering: bool,
 }
 
 // Note: this trait is intentionally *not* `Send`. CpalSink owns a
@@ -59,6 +60,10 @@ pub trait AudioSink {
     /// Suspend only the host live-output stream while emulation is
     /// intentionally not producing samples. Offline sinks can ignore this.
     fn set_live_output_suspended(&mut self, _suspended: bool) {}
+    /// Discard host-side live-output frames that belong to an abandoned
+    /// emulated timeline. The emulated Paula/CD/floppy audio state is not
+    /// touched; only queued cpal presentation samples are reset.
+    fn reset_live_output_after_timeline_jump(&mut self) {}
     fn live_output_lead_seconds(&self) -> f64 {
         0.0
     }
@@ -97,6 +102,7 @@ pub struct CpalSink {
     // Keep the stream alive for the lifetime of the sink.
     _stream: cpal::Stream,
     playback_started: Arc<AtomicBool>,
+    clear_buffer: Arc<AtomicBool>,
     drop_old_frames: Arc<AtomicUsize>,
     dropped_old_frames: Arc<AtomicU64>,
     total_dropped_old_frames: Arc<AtomicU64>,
@@ -149,6 +155,8 @@ impl CpalSink {
         let prebuffer_frames = CPAL_PREBUFFER_FRAMES;
         let playback_started = Arc::new(AtomicBool::new(false));
         let playback_started_for_cb = Arc::clone(&playback_started);
+        let clear_buffer = Arc::new(AtomicBool::new(false));
+        let clear_buffer_for_cb = Arc::clone(&clear_buffer);
         let drop_old_frames = Arc::new(AtomicUsize::new(0));
         let drop_old_frames_for_cb = Arc::clone(&drop_old_frames);
         let dropped_old_frames = Arc::new(AtomicU64::new(0));
@@ -189,12 +197,9 @@ impl CpalSink {
                             Ordering::Relaxed,
                         );
                     }
-                    if live_output_suspended_for_cb.load(Ordering::Relaxed) {
+                    if clear_buffer_for_cb.swap(false, Ordering::Relaxed) {
+                        consumer.clear();
                         resampler.reset();
-                        for sample in data {
-                            *sample = 0.0;
-                        }
-                        return;
                     }
                     let requested_drop = drop_old_frames_for_cb.swap(0, Ordering::Relaxed);
                     if requested_drop != 0 {
@@ -205,6 +210,13 @@ impl CpalSink {
                                 .fetch_add(skipped as u64, Ordering::Relaxed);
                             resampler.reset();
                         }
+                    }
+                    if live_output_suspended_for_cb.load(Ordering::Relaxed) {
+                        resampler.reset();
+                        for sample in data {
+                            *sample = 0.0;
+                        }
+                        return;
                     }
                     for frame in data.chunks_mut(chans) {
                         let (l, r) = if playback_started_for_cb.load(Ordering::Relaxed) {
@@ -253,6 +265,7 @@ impl CpalSink {
             producer,
             _stream: stream,
             playback_started,
+            clear_buffer,
             drop_old_frames,
             dropped_old_frames,
             total_dropped_old_frames,
@@ -440,6 +453,16 @@ impl AudioSink for CpalSink {
         self.last_log = Instant::now();
     }
 
+    fn reset_live_output_after_timeline_jump(&mut self) {
+        self.playback_started.store(false, Ordering::Relaxed);
+        self.clear_buffer.store(true, Ordering::Relaxed);
+        self.drop_old_frames.store(0, Ordering::Relaxed);
+        self.underruns.store(0, Ordering::Relaxed);
+        self.dropped_old_frames.store(0, Ordering::Relaxed);
+        self.overruns = 0;
+        self.last_log = Instant::now();
+    }
+
     fn live_output_lead_seconds(&self) -> f64 {
         live_output_lead_seconds_for_state(
             self.playback_started.load(Ordering::Relaxed),
@@ -449,12 +472,19 @@ impl AudioSink for CpalSink {
     }
 
     fn runtime_status(&self) -> AudioRuntimeStatus {
+        let playback_started = self.playback_started.load(Ordering::Relaxed);
+        let occupied_frames = self.producer.occupied_len();
         AudioRuntimeStatus {
-            queue_depth_frames: self.producer.occupied_len(),
+            queue_depth_frames: occupied_frames,
             output_lead_seconds: self.live_output_lead_seconds(),
             callback_underrun_frames: self.total_underruns.load(Ordering::Relaxed),
             dropped_overrun_frames: self.total_overruns,
             skipped_stale_frames: self.total_dropped_old_frames.load(Ordering::Relaxed),
+            prebuffering: live_output_prebuffering(
+                playback_started,
+                occupied_frames,
+                CPAL_TARGET_BUFFER_FRAMES,
+            ),
         }
     }
 }
@@ -535,7 +565,7 @@ fn live_output_lead_seconds_for_state(
 ) -> f64 {
     if !playback_started && occupied_frames == 0 {
         0.0
-    } else if playback_started && occupied_frames < target_frames {
+    } else if occupied_frames < target_frames {
         let refill_frames = target_frames - occupied_frames;
         (target_frames + refill_frames) as f64 / MIX_SAMPLE_RATE as f64
     } else {
@@ -545,6 +575,14 @@ fn live_output_lead_seconds_for_state(
 
 fn live_audio_should_rebuffer(occupied_frames: usize) -> bool {
     occupied_frames <= CPAL_REBUFFER_THRESHOLD_FRAMES
+}
+
+fn live_output_prebuffering(
+    playback_started: bool,
+    occupied_frames: usize,
+    target_frames: usize,
+) -> bool {
+    !playback_started && occupied_frames > 0 && occupied_frames < target_frames
 }
 
 fn callback_device_cck(output_frames: usize, output_sample_rate: u32) -> u64 {
@@ -557,7 +595,8 @@ fn callback_device_cck(output_frames: usize, output_sample_rate: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        callback_device_cck, sample_is_audible, stale_live_audio_frames_to_skip, CpalResampler,
+        callback_device_cck, live_output_prebuffering, sample_is_audible,
+        stale_live_audio_frames_to_skip, CpalResampler,
     };
     use ringbuf::traits::{Producer, Split};
     use ringbuf::HeapRb;
@@ -619,13 +658,24 @@ mod tests {
     }
 
     #[test]
+    fn live_audio_reports_prebuffering_before_playback_starts() {
+        assert!(!live_output_prebuffering(false, 0, 4096));
+        assert!(live_output_prebuffering(false, 1, 4096));
+        assert!(live_output_prebuffering(false, 4095, 4096));
+        assert!(!live_output_prebuffering(false, 4096, 4096));
+        assert!(!live_output_prebuffering(true, 1, 4096));
+    }
+
+    #[test]
     fn live_audio_lead_reports_started_queue_deficit_for_refill() {
         let target_seconds = 4096.0 / super::MIX_SAMPLE_RATE as f64;
         let underfilled_seconds = super::live_output_lead_seconds_for_state(true, 1024, 4096);
+        let prebuffer_seconds = super::live_output_lead_seconds_for_state(false, 1024, 4096);
         let full_seconds = super::live_output_lead_seconds_for_state(true, 4096, 4096);
         let overfilled_seconds = super::live_output_lead_seconds_for_state(true, 8192, 4096);
 
         assert!(underfilled_seconds > target_seconds);
+        assert_eq!(prebuffer_seconds, underfilled_seconds);
         assert_eq!(full_seconds, target_seconds);
         assert_eq!(overfilled_seconds, target_seconds);
     }

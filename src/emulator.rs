@@ -434,6 +434,13 @@ impl Emulator {
         self.bus_mut().set_live_audio_suspended(suspended);
     }
 
+    /// Discard live-output samples queued for an emulated timeline that has
+    /// just been abandoned. This is host presentation state only; Paula's
+    /// serialized DMA/mixer state is left untouched.
+    pub fn reset_live_audio_after_timeline_jump(&mut self) {
+        self.bus_mut().reset_live_audio_after_timeline_jump();
+    }
+
     pub fn keyboard_reset(&mut self) -> Result<()> {
         log::info!("keyboard reset pulse");
         self.bus_mut().reset_for_keyboard_reset();
@@ -514,6 +521,7 @@ impl Emulator {
         // The CPU clock travels with the state; re-derive the host pacing math
         // from it so an accelerated/slower restored CPU is paced correctly.
         self.reconfigure_pacing_for_cpu_clock();
+        self.reset_live_audio_after_timeline_jump();
         self.reanchor_realtime_clock();
         Ok(StateLoadOutcome {
             reconfigured,
@@ -626,6 +634,7 @@ impl Emulator {
         let mut cursor = std::io::Cursor::new(blob);
         self.machine.apply_state(&mut cursor)?;
         self.retired_instructions = pos;
+        self.reset_live_audio_after_timeline_jump();
         self.reanchor_realtime_clock();
         Ok(())
     }
@@ -1224,10 +1233,11 @@ impl Emulator {
             return;
         };
         let now = Instant::now();
+        let live_audio_lead_seconds = self.bus().live_audio_output_lead_seconds();
         let target = realtime_device_time_target(
             started_at,
             self.bus().emulated_seconds(),
-            self.bus().live_audio_output_lead_seconds(),
+            live_audio_lead_seconds,
         );
         if let Some(wait) = target.and_then(|target| target.checked_duration_since(now)) {
             let sleep_started = Instant::now();
@@ -1248,7 +1258,7 @@ impl Emulator {
                     // by advancing the pacing anchor forward by the lag, so we
                     // resume pacing from "now" instead of sprinting to catch
                     // up. The overrun telemetry above is still recorded.
-                    if lag > MAX_REALTIME_CATCHUP {
+                    if lag > realtime_catchup_limit(live_audio_lead_seconds) {
                         if let Some(anchor) = self.stats.started_at {
                             self.stats.started_at = Some(anchor + lag);
                         }
@@ -1385,12 +1395,22 @@ fn realtime_device_time_target(
     started_at.checked_add(Duration::from_secs_f64(target_seconds))
 }
 
+fn realtime_catchup_limit(live_output_lead_seconds: f64) -> Duration {
+    let lead = live_output_lead_seconds.max(0.0);
+    if lead.is_finite() {
+        MAX_REALTIME_CATCHUP + Duration::from_secs_f64(lead)
+    } else {
+        MAX_REALTIME_CATCHUP
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         cck_for_instructions, cpu_cycles_per_instruction_for_clock, instructions_for_cck_value,
-        real_cpu_cycles_per_instruction, real_slice_accounting, realtime_budget, ExecutedSlice,
-        RealPacingBudgetMode, RealPacingProfile, DEFAULT_CPU_CYCLES_PER_INSTRUCTION,
+        real_cpu_cycles_per_instruction, real_slice_accounting, realtime_budget,
+        realtime_catchup_limit, ExecutedSlice, RealPacingBudgetMode, RealPacingProfile,
+        DEFAULT_CPU_CYCLES_PER_INSTRUCTION,
     };
     use crate::audio::AudioRuntimeStatus;
 
@@ -1652,6 +1672,7 @@ mod tests {
                 callback_underrun_frames: 2,
                 dropped_overrun_frames: 3,
                 skipped_stale_frames: 4,
+                prebuffering: false,
             },
             0,
         );
@@ -1704,5 +1725,74 @@ mod tests {
             super::realtime_device_time_wait(started_at, now, 1.2, 0.2),
             Some(Duration::from_millis(100))
         );
+    }
+
+    #[test]
+    fn large_stall_guard_allows_live_audio_prebuffer_lead() {
+        assert_eq!(realtime_catchup_limit(0.0), Duration::from_millis(100));
+        assert_eq!(realtime_catchup_limit(0.150), Duration::from_millis(250));
+        assert_eq!(realtime_catchup_limit(0.300), Duration::from_millis(400));
+    }
+
+    struct ResetTrackingAudio {
+        resets: std::rc::Rc<std::cell::RefCell<u32>>,
+    }
+
+    impl crate::audio::AudioSink for ResetTrackingAudio {
+        fn push(&mut self, _left: f32, _right: f32) {}
+
+        fn flush(&mut self) {}
+
+        fn reset_live_output_after_timeline_jump(&mut self) {
+            *self.resets.borrow_mut() += 1;
+        }
+    }
+
+    fn emulator_with_audio(audio: Box<dyn crate::audio::AudioSink>) -> super::Emulator {
+        let mut rom = vec![0u8; crate::memory::ROM_SIZE];
+        rom[0..4].copy_from_slice(&0x0000_4000u32.to_be_bytes());
+        rom[4..8].copy_from_slice(&0x00F8_0010u32.to_be_bytes());
+        rom[0x10..0x12].copy_from_slice(&0x60FEu16.to_be_bytes());
+
+        let bus = crate::bus::Bus::new(
+            crate::memory::Memory {
+                chip_ram: vec![0u8; 512 * 1024],
+                slow_ram: Vec::new(),
+                rom,
+                overlay: false,
+                zorro: crate::zorro::ZorroChain::default(),
+                extended_rom: Vec::new(),
+                extended_rom_base: 0,
+            },
+            crate::chipset::paula::Paula::new(Box::new(crate::serial::NullSerialSink), audio),
+            crate::floppy::FloppyController::default(),
+        );
+        super::Emulator::new(
+            bus,
+            crate::config::CpuModel::M68000,
+            false,
+            crate::config::PacingBudget::Cycles,
+            2,
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn save_state_load_resets_live_audio_queue_for_new_timeline() {
+        let resets = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let mut emu = emulator_with_audio(Box::new(ResetTrackingAudio {
+            resets: std::rc::Rc::clone(&resets),
+        }));
+        let path = std::env::temp_dir().join(format!(
+            "copperline-emulator-audio-reset-{}.clstate",
+            std::process::id()
+        ));
+
+        emu.save_state(&path).unwrap();
+        emu.load_state(&path).unwrap();
+
+        assert_eq!(*resets.borrow(), 1);
+        let _ = std::fs::remove_file(path);
     }
 }

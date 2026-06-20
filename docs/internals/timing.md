@@ -360,7 +360,10 @@ moment. Two threads are latency-critical: the **pacer** (the main thread,
 which advances the core and calls `thread::sleep` in
 `Emulator::sleep_until_realtime_device_time`) and the **cpal audio callback**
 (which drains the sample ring buffer the pacer keeps ~150 ms ahead of the
-device clock). The `copperline-render` worker ([](architecture)) is a
+device clock). During live-audio startup and rebuffering, the pacer treats the
+unfilled prebuffer as additional required lead; the large-stall self-heal
+allows for that lead so it does not cancel the refill as if it were a host
+pause. The `copperline-render` worker ([](architecture)) is a
 throughput thread, not a latency one, and is left at normal priority. When the
 host is busy, a scheduler that preempts the pacer shows up as frame stutter,
 and one that preempts the audio callback shows up as an audible underrun.

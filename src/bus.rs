@@ -1953,6 +1953,10 @@ impl Bus {
         self.paula.set_live_audio_suspended(suspended);
     }
 
+    pub fn reset_live_audio_after_timeline_jump(&mut self) {
+        self.paula.reset_live_audio_after_timeline_jump();
+    }
+
     pub fn output_volume_percent(&self) -> u8 {
         self.paula.output_volume_percent()
     }

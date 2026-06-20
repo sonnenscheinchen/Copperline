@@ -154,6 +154,19 @@ time; the live sink resamples and buffers against wall-clock. The
 `CPAL_*` lead/prebuffer/stale-drop targets in `audio.rs` are fixed rather
 than adaptive (currently a 131072-frame ring, a ~150 ms prebuffer equal to
 the ~150 ms steady lead, and a ~300 ms stale-drop threshold at 44.1 kHz).
+Playback starts only after the first audible frames have filled that
+prebuffer, so silent boot/load periods do not queue seconds of zeros. If the
+cpal callback later drains near empty, it stops playback before the queue runs
+dry, outputs silence, and waits for the same prebuffer depth before restarting.
+During both startup and rebuffering the sink reports the missing buffer depth
+as extra live-audio lead, so the real-time pacer runs ahead until the cushion
+is restored instead of sleeping through the refill.
+
+The live queue is host presentation state, not Paula state. A save-state or
+reverse-debug timeline jump keeps the restored Paula/CD/floppy mixer state but
+discards queued cpal frames from the abandoned timeline, then rebuilds the live
+prebuffer from the restored emulated audio stream. Offline WAV capture is not
+affected by any of this buffering policy.
 
 Two profiling knobs cover the audio/pacing boundary, both emitting one
 `info` line per second:

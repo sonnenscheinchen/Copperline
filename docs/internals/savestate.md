@@ -48,7 +48,10 @@ Deliberately excluded, with the mechanism in parentheses:
   `realtime_cck_due` lazily re-anchors to the host clock on first use.
   `Emulator::load_state` additionally re-baselines the frame pacer
   (`reanchor_realtime_clock`) so the run does not sprint to "catch up"
-  the emulated-time jump.
+  the emulated-time jump. Live cpal output also drops any queued host
+  frames from the abandoned timeline and rebuilds its prebuffer from the
+  restored Paula stream; this is host presentation state, not serialized
+  audio hardware.
 - **Memo caches and transient diagnostics**: the bitplane slot-plan `Cell`
   cache and the pending debugger-window register hit (skipped; rebuilt or
   irrelevant).
@@ -195,8 +198,9 @@ guarantees and it keeps presentation state trivially rebuildable.
 
 `savestate::save` takes `&M68kMachine` and does not mutate emulated
 state. `savestate::load` parses fully before applying, then moves host
-resources across; on success the window forces power on, clears any CPU
-halt latch, and invalidates `last_rendered_emulated_frame` so the next
+resources across and resets any queued live-audio presentation frames from
+the old timeline; on success the window forces power on, clears any CPU halt
+latch, and invalidates `last_rendered_emulated_frame` so the next
 presentation re-renders from the restored Bus.
 
 ## Verification
