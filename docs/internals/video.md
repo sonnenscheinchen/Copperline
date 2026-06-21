@@ -56,7 +56,9 @@ replay clips those position intervals in the sprite-comparator domain
 sprite words can abut at their HSTARTs and staggered even/odd attached-pair
 position writes do not create artificial half-pair strips. Once a manual
 sprite word has started shifting, a later same-line SPRxPOS write can arm a
-future compare but does not truncate that active word.
+future compare but does not truncate that active word. A POS write that
+lands exactly on the HSTART compare boundary is on the already-started side
+of that rule.
 
 When sprite DMA was observed for the frame, captured DMA lines are the
 authoritative data source for DMA-fetched spans. Manual replay is seeded by

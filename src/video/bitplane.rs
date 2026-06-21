@@ -3094,7 +3094,7 @@ fn flush_manual_sprite_lines(
             let pos = regs.sprpos[sprite];
             let ctl = regs.sprctl[sprite];
             let base_x = (sprite_hstart(pos, ctl) - DIW_HSTART_FB0) * 2;
-            if x_stop as i32 > base_x {
+            if x_stop as i32 >= base_x {
                 x_stop = FB_WIDTH;
             }
         }
@@ -8685,6 +8685,49 @@ mod tests {
         assert_eq!(
             sprite_line_pixel_bits_at(second_line, second_base_x, base_control, &[]),
             1
+        );
+    }
+
+    #[test]
+    fn manual_sprite_position_write_on_compare_boundary_preserves_started_word() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0;
+        let initial_hstart = 64;
+        let first_hstart = 126;
+        let second_hstart = 142;
+        let (initial_pos, ctl) =
+            sprite_control_words(beam_y as u16, beam_y as u16 + 1, initial_hstart);
+        let (first_pos, _) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, first_hstart);
+        let (second_pos, _) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, second_hstart);
+        initial_state.sprpos[0] = initial_pos;
+        initial_state.sprctl[0] = ctl;
+        initial_state.sprdata[0] = 0xFFFF;
+        initial_state.spr_armed[0] = true;
+
+        let boundary_hpos = u32::from(first_hstart / 2) + SPRITE_POSITION_WRITE_PIPELINE_CCK;
+        let manual_sprite_lines = manual_sprite_lines_from_events(
+            &initial_state,
+            &[
+                cpu_event(beam_y as u32, 64, 0x140, first_pos),
+                cpu_event(beam_y as u32, boundary_hpos, 0x140, second_pos),
+            ],
+        );
+
+        let first_line = manual_sprite_lines[0]
+            .iter()
+            .find(|line| line.beam_y == beam_y && line.hstart == first_hstart as i32)
+            .expect("first position interval");
+        let base_control = ControlState::from_render_state(&initial_state);
+        let first_base_x = (first_hstart as i32 - DIW_HSTART_FB0) * 2;
+
+        assert_eq!(
+            sprite_position_write_framebuffer_x(boundary_hpos),
+            first_base_x as usize
+        );
+        assert_eq!(
+            sprite_line_pixel_bits_at(first_line, first_base_x, base_control, &[]),
+            1,
+            "a POS write on the comparator boundary must not cancel the word"
         );
     }
 

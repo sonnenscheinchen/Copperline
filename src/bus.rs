@@ -8369,6 +8369,14 @@ fn live_manual_sprite_collision_sources(
         } else {
             live_manual_sprite_event_x(*event)
         };
+        let source_stop = live_manual_sprite_preserved_source_stop(
+            *event,
+            sprpos[sprite],
+            sprctl[sprite],
+            bitplane_shres(frame_base.bplcon0),
+            event_x,
+            x_stop,
+        );
         push_live_manual_sprite_source(
             &mut sources,
             sprite,
@@ -8380,7 +8388,7 @@ fn live_manual_sprite_collision_sources(
             bitplane_shres(frame_base.bplcon0),
             beam_y,
             interval_start[sprite].max(x_start),
-            event_x.min(x_stop),
+            source_stop.min(x_stop),
         );
         apply_live_manual_sprite_event(
             &mut sprpos,
@@ -8410,6 +8418,27 @@ fn live_manual_sprite_collision_sources(
     }
 
     combine_live_manual_sprite_collision_sources(sources)
+}
+
+fn live_manual_sprite_preserved_source_stop(
+    event: BeamRegisterWrite,
+    sprpos: u16,
+    sprctl: u16,
+    shres: bool,
+    event_x: i32,
+    query_x_stop: i32,
+) -> i32 {
+    let off = event.offset & 0x01FE;
+    if !(0x140..=0x17F).contains(&off) || (off - 0x140) & 0x0006 != 0 {
+        return event_x;
+    }
+    let base_x = (sprite_hstart_from_words(sprpos, sprctl) - RENDER_DIW_HSTART_FB0) * 2
+        + i32::from(shres && sprite_hsub_70ns_from_ctl(sprctl));
+    if event_x >= base_x {
+        query_x_stop
+    } else {
+        event_x
+    }
 }
 
 fn live_manual_sprite_event_x(event: BeamRegisterWrite) -> i32 {
@@ -14881,6 +14910,45 @@ mod tests {
 
         assert_eq!(super::live_manual_sprite_event_x(event), sprite_compare_x);
         assert_ne!(super::live_manual_sprite_event_x(event), colour_output_x);
+    }
+
+    #[test]
+    fn manual_sprite_position_write_on_compare_boundary_preserves_live_source() {
+        let mut bus = empty_bus();
+        let first_hstart = 0x007E;
+        let second_hstart = 0x008E;
+        let (first_pos, ctl) = sprite_control_words(0x2C, 0x2D, first_hstart);
+        let (second_pos, _) = sprite_control_words(0x2C, 0x2D, second_hstart);
+        bus.denise.sprpos[0] = first_pos;
+        bus.denise.sprctl[0] = ctl;
+        bus.denise.sprdata[0] = 0xFFFF;
+        bus.denise.spr_armed[0] = true;
+        let frame_base = bus.capture_render_snapshot();
+        let boundary_hpos = u32::from(first_hstart / 2) + DENISE_HPOS_LAG_CCK;
+        let event = BeamRegisterWrite {
+            vpos: RENDER_VISIBLE_START_VPOS,
+            hpos: boundary_hpos,
+            offset: 0x0140,
+            value: second_pos,
+            source: BeamWriteSource::Cpu,
+        };
+        let event_index = BeamEventIndex::from_register_writes(&[event]);
+        let first_base_x = (i32::from(first_hstart) - RENDER_DIW_HSTART_FB0) * 2;
+
+        let sources = live_manual_sprite_collision_sources(
+            frame_base,
+            &event_index,
+            0x2C,
+            first_base_x,
+            first_base_x + 2,
+        );
+
+        assert!(sources.iter().any(|source| {
+            source.sprite == 0
+                && source.x_start == first_base_x
+                && source.x_stop == first_base_x + 2
+                && source.source.words == [0xFFFF, 0, 0, 0]
+        }));
     }
 
     #[test]
