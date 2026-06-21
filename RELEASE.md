@@ -66,12 +66,22 @@ curl -fsSL "https://github.com/LinuxJedi/Copperline/archive/refs/tags/v$VER.tar.
 ```
 
 Set `url` to the `v$VER.tar.gz` tarball and `sha256` to the printed digest.
-Smoke-test the formula locally before pushing:
+Check the edited formula before committing:
 
 ```sh
-brew install --build-from-source ./Formula/copperline.rb
-brew test copperline
-brew audit --strict --formula ./Formula/copperline.rb
+ruby -c Formula/copperline.rb
+brew style ./Formula/copperline.rb
+```
+
+After pushing the formula update, refresh the tap and smoke-test the named
+formula. Recent Homebrew releases reject path-based formula audit/install
+commands unless the formula is loaded from a tap.
+
+```sh
+brew update
+brew audit --strict --formula linuxjedi/copperline/copperline
+brew upgrade --build-from-source linuxjedi/copperline/copperline
+brew test linuxjedi/copperline/copperline
 ```
 
 ## Linux: Flatpak and AppImage
