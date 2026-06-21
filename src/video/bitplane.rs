@@ -4534,6 +4534,7 @@ fn render_planned_playfield_line(
     visible_line0: i32,
 ) {
     let mut ham_color = rgb12_to_rgb24(color_rgb12(palette[0]));
+    let mut next_ham_native_x = 0usize;
     let mut x = plan.x_start;
     // The bitplane scroll (BPLCON1) feeds the bitplane shifter, so a scroll
     // write applies to the pixels it controls only after the Agnus-fetch ->
@@ -4611,6 +4612,7 @@ fn render_planned_playfield_line(
         let background_rgb24 = rgb12_to_rgb24(color_rgb12(palette[0]));
         let nplanes = sample_control.nplanes().min(plan.plane_words.len());
         let delays = std::array::from_fn(|plane| sample_control.scroll_for_plane(plane));
+        let ham_mode = sample_control.hold_and_modify();
 
         let collision_dual = pixel_control.dual_playfield();
         let collision_key_now = (
@@ -4648,9 +4650,22 @@ fn render_planned_playfield_line(
                     let pixel_x = x + dx;
                     pixel_x < plan.x_stop && pixel_x >= win_x_start && pixel_x < win_x_stop
                 });
+            if ham_mode {
+                let preroll_stop = native_x.min(plan.fetched_pixels);
+                while next_ham_native_x < preroll_stop {
+                    let skipped = plan.sample_prepared(nplanes, &delays, next_ham_native_x);
+                    denise_playfield_output(sample_control, palette, skipped.idx, &mut ham_color);
+                    next_ham_native_x += 1;
+                }
+            }
             if !visible_sample {
-                if !shres {
+                if ham_mode {
+                    let sample = plan.sample_prepared(nplanes, &delays, native_x);
+                    denise_playfield_output(sample_control, palette, sample.idx, &mut ham_color);
+                    next_ham_native_x = next_ham_native_x.max(native_x + 1);
+                } else if !shres {
                     ham_color = background_rgb24;
+                    next_ham_native_x = next_ham_native_x.max(native_x + 1);
                 }
                 x += pixel_repeat;
                 if x >= run_stop {
@@ -4672,6 +4687,9 @@ fn render_planned_playfield_line(
                     denise_playfield_output(pixel_control, palette, sample.idx, &mut ham_color),
                 )
             };
+            if ham_mode || !shres {
+                next_ham_native_x = next_ham_native_x.max(native_x + 1);
+            }
             // Collision classification is identical for every framebuffer
             // pixel of this native sample, so look it up once. CLXDAT only
             // accumulates set bits, so ORing it here (rather than once per
@@ -10348,6 +10366,46 @@ mod tests {
         assert_eq!(fb[70], rgb12_to_rgba8(0x0000));
         assert_eq!(fb[71], rgb12_to_rgba8(0x0000));
         assert_eq!(&playfield_mask[68..72], &[0x02, 0x02, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn planned_ham_dma_advances_hold_through_edge_fetch_phase() {
+        let mut row_words = vec![vec![0; 1]; 6];
+        row_words[0][0] |= 0x8000; // native x 0: direct palette entry 1
+        row_words[1][0] |= 0x4000; // native x 1: HAM blue := 2
+        row_words[4][0] |= 0x4000;
+        let line_plan = DenisePlannedPlayfieldLine::new(0, 64, 66, &row_words, 2);
+        let mut control = visible_lowres_control(0x6800);
+        control.diwstrt = ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16;
+        control.diwstop =
+            (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | (STANDARD_DIW_HSTART as u16 + 1);
+        let mut palette = Palette::new();
+        palette.write_ocs(1, 0x0123);
+        let mut fb = vec![0; FB_PIXELS];
+        let mut playfield_mask = vec![0; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut clxdat = 0;
+
+        render_planned_playfield_line(
+            &line_plan,
+            &mut fb,
+            &mut playfield_mask,
+            &mut collision_pixels,
+            &mut clxdat,
+            palette,
+            &[],
+            0,
+            control,
+            &[],
+            0,
+            control.bplcon1,
+            PAL_VISIBLE_LINE0,
+        );
+
+        assert_eq!(control.native_x_offset(control.diw_h_start(), 2), 1);
+        assert_eq!(fb[64], rgb12_to_rgba8(0x0122));
+        assert_eq!(fb[65], rgb12_to_rgba8(0x0122));
+        assert_eq!(&playfield_mask[62..64], &[0x00, 0x00]);
     }
 
     #[test]

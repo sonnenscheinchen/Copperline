@@ -29,6 +29,12 @@ decoded through EHB / HAM / HAM8 / dual-playfield rules (the pixel
 pipeline carries 24-bit colour end to end; OCS/ECS paths keep their exact
 12-bit maths and expand by nibble), composited with the eight sprites
 under playfield priority, and CLXDAT collisions are accumulated.
+For DMA-fetched HAM playfields, the display window gates framebuffer output
+and collision recording, but it does not rewind the HAM component history:
+fetched native samples that sit just before DIW, or inside a closed portion
+of DIW, still advance the HAM hold colour. Standard lo-res DDF timing starts
+the first visible output one native sample into the fetched stream, so replay
+pre-advances that hidden sample before painting the DIW edge.
 
 The playfield pixel loop runs in control-run chunks: recorded control,
 scroll, and palette events take effect at output-pixel boundaries, so
