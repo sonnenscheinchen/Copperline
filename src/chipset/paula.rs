@@ -1080,7 +1080,6 @@ impl Paula {
         0
     }
 
-    #[cfg(test)]
     pub fn peek_audio_reg_latch(&self, reg_off: u16) -> Option<u16> {
         let ch_idx = (reg_off / 0x10) as usize;
         if ch_idx >= 4 {

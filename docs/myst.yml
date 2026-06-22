@@ -27,6 +27,7 @@ project:
         - file: debugger/window.md
         - file: debugger/headless.md
         - file: debugger/reverse.md
+        - file: debugger/gdb.md
     - title: Internals
       children:
         - file: internals/architecture.md
@@ -51,6 +52,7 @@ project:
         - debugger/window.md
         - debugger/headless.md
         - debugger/reverse.md
+        - debugger/gdb.md
         - internals/architecture.md
         - internals/timing.md
         - internals/chipset.md
@@ -62,4 +64,5 @@ project:
 site:
   template: book-theme
   options:
+    favicon: ../assets/brand/copperline.ico
     hide_authors: true
