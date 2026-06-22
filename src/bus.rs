@@ -4573,7 +4573,14 @@ impl Bus {
         // any sleeping WAIT cycle) to the blitter/CPU. `allow_fetch` is false
         // when a forced owner (a granted CPU access) already holds this cycle.
         let hpos = self.agnus.hpos;
-        let fixed_dma_owner = self.fixed_dma_owner_at(self.agnus.vpos, hpos);
+        let fixed_dma_owner = if matches!(forced_owner, Some(ChipBusOwner::Cpu)) {
+            // A forced CPU owner is only used after `cpu_can_use_current_slot`
+            // has already proved that fixed DMA does not own this color clock.
+            // The Copper comparator still advances below with `allow_fetch=false`.
+            None
+        } else {
+            self.fixed_dma_owner_at(self.agnus.vpos, hpos)
+        };
         let copper_runs = cck >= CHIP_BUS_SLOT_CCK && self.copper_comparator_runs_at(hpos);
         let eligible = copper_runs && fixed_dma_owner.is_none();
         let copper_took_bus = eligible && self.step_copper_eligible_slot(forced_owner.is_none());
@@ -5680,6 +5687,20 @@ impl Bus {
     }
 
     fn bitplane_slot_active_at(&self, vpos: u32, hpos: u32) -> bool {
+        // Bitplane DMA only runs inside the vertical display window (set at
+        // DIWSTRT.V, cleared at DIWSTOP.V), so the top-border and vertical-
+        // blank lines are free for the blitter/CPU. Rejecting this before the
+        // DDF/BPLCON0 plan lookup avoids per-color-clock cache probes on lines
+        // that cannot fetch bitplanes.
+        if !display_window_contains_vpos(
+            self.denise.diwstrt,
+            self.denise.diwstop,
+            self.effective_diwhigh(),
+            vpos,
+        ) {
+            return false;
+        }
+
         let mut bplcon0 = self.effective_bitplane_bplcon0();
         let mut plan = self.bitplane_slot_plan_for_bplcon0(bplcon0);
         if plan.is_none() {
@@ -5691,20 +5712,6 @@ impl Bus {
         let Some(mut plan) = plan else {
             return false;
         };
-        // Bitplane DMA only runs inside the vertical display window (set at
-        // DIWSTRT.V, cleared at DIWSTOP.V), so the top-border and vertical-
-        // blank lines are free for the blitter/CPU. Without this gate the
-        // arbiter reserved bitplane slots on all 313 lines, starving a busy
-        // blitter on the ~28 off-window lines. Mirrors the capture path's
-        // display_window_contains_vpos check so the two cannot drift.
-        if !display_window_contains_vpos(
-            self.denise.diwstrt,
-            self.denise.diwstop,
-            self.effective_diwhigh(),
-            vpos,
-        ) {
-            return false;
-        }
         if self.bitplane_ddfstart_missed_on_line(vpos, plan.start) {
             return false;
         }
