@@ -6657,6 +6657,7 @@ impl Bus {
         }
 
         let quantum = sprite_fetch_quantum(self.agnus.fmode());
+        let line_bytes = 4 * quantum;
         let data_lines = if sprite_scan_doubled(self.agnus.fmode()) {
             (height as u32).div_ceil(2)
         } else {
@@ -6670,7 +6671,7 @@ impl Bus {
             hsub_70ns: bitplane_shres(self.denise.bplcon0) && sprite_hsub_70ns_from_ctl(ctl),
             data_vstart: vstart,
             data_base,
-            next_ptr: data_base.wrapping_add(data_lines.saturating_mul(4 * quantum))
+            next_ptr: data_base.wrapping_add(data_lines.saturating_mul(line_bytes))
                 & self.chip_dma_mask
                 & !1,
             attached: ctl & 0x0080 != 0,
@@ -6689,12 +6690,29 @@ impl Bus {
             !sprite_dma_enabled && in_window && state.data_dma_active && state.last_line.is_some();
         let keep_active_dma_line =
             sprite_dma_enabled && in_window && state.data_dma_active && state.last_line.is_some();
+        let keep_pending_dma_origin = sprite_dma_enabled
+            && !state.data_dma_active
+            && state.last_line.is_none()
+            && previous_control
+                .map(|previous| beam_y < previous.vstop)
+                .unwrap_or(false);
 
         if keep_held_line || keep_active_dma_line {
             if let Some(previous_control) = previous_control {
                 control.data_vstart = previous_control.effective_data_vstart();
                 control.data_base = previous_control.data_base;
                 control.next_ptr = previous_control.next_ptr;
+            }
+        } else if keep_pending_dma_origin {
+            if let Some(previous_control) = previous_control {
+                // A pending descriptor has already consumed POS/CTL; direct
+                // control writes retime the comparators, not the data stream.
+                control.data_base = previous_control.data_base;
+                control.next_ptr = control
+                    .data_base
+                    .wrapping_add(data_lines.saturating_mul(line_bytes))
+                    & self.chip_dma_mask
+                    & !1;
             }
         }
 
@@ -14870,6 +14888,49 @@ mod tests {
         assert_eq!(lines[0].hstart, 0x0083);
         assert_eq!(lines[0].data, 0x5555);
         assert_eq!(lines[0].datb, 0x6666);
+    }
+
+    #[test]
+    fn pending_sprite_control_rewrite_preserves_descriptor_data_origin() {
+        let mut bus = empty_bus();
+        let sprite_ptr = 0x0100usize;
+        let vstart = RENDER_VISIBLE_START_VPOS as u16 + 10;
+        let vstop = vstart + 1;
+        let (pos, ctl) = sprite_control_words(vstart, vstop, 0x0083);
+        let (moved_pos, moved_ctl) = sprite_control_words(vstart, vstop, 0x00A1);
+        write_chip_word(&mut bus, sprite_ptr, pos);
+        write_chip_word(&mut bus, sprite_ptr + 2, ctl);
+        write_chip_word(&mut bus, sprite_ptr + 4, 0x1111);
+        write_chip_word(&mut bus, sprite_ptr + 6, 0x2222);
+        write_chip_word(&mut bus, sprite_ptr + 8, 0);
+        write_chip_word(&mut bus, sprite_ptr + 10, 0);
+
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.current_frame_render_base.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.current_frame_render_base.sprpt[0] = sprite_ptr as u32;
+        bus.agnus.vpos = RENDER_VISIBLE_START_VPOS;
+        bus.agnus.hpos = 0;
+        bus.denise.sprpt[0] = sprite_ptr as u32;
+        bus.display_dma_sprpt[0] = sprite_ptr as u32;
+
+        bus.capture_current_frame_display_start();
+
+        bus.agnus.vpos = RENDER_VISIBLE_START_VPOS + 2;
+        bus.agnus.hpos = 0;
+        assert!(!bus.write_custom_word_from(0x140, moved_pos, BeamWriteSource::Copper));
+        assert!(!bus.write_custom_word_from(0x142, moved_ctl, BeamWriteSource::Copper));
+
+        bus.agnus.vpos = vstart as u32;
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1;
+        bus.advance_chipset(2);
+
+        let lines = bus.frame_captured_sprite_lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].sprite, 0);
+        assert_eq!(lines[0].beam_y, vstart as i32);
+        assert_eq!(lines[0].hstart, 0x00A1);
+        assert_eq!(lines[0].data, 0x1111);
+        assert_eq!(lines[0].datb, 0x2222);
     }
 
     #[test]
