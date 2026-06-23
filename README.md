@@ -49,9 +49,9 @@ against real hardware.
 - **Peripherals**: a bit-timed keyboard (6500/1 MCU), mouse, USB gamepad
   (via the pure-Rust `gilrs`, no SDL2), 4-channel Paula audio, floppy
   (ADF / ADZ / DMS, read-only SCP), Gayle IDE, A2091 SCSI, and CDTV/CD32 CD.
-- **Tooling**: an in-window debugger, deterministic save states, input
-  recording/replay, and headless screenshot/frame-dump capture -- the
-  deterministic core makes every replay byte-identical.
+- **Tooling**: an in-window debugger, remote GDB support, deterministic save
+  states, input recording/replay, and headless screenshot/frame-dump capture
+  -- the deterministic core makes every replay byte-identical.
 
 ## Requirements
 
@@ -178,11 +178,11 @@ images, validation rules, and audio options -- is in the
 ## Documentation
 
 User and developer documentation -- getting started, the UI and shortcuts,
-headless capture, save states, input recording, both debuggers, the
-configuration reference, and the internals (timing model, chipset, CPU,
-video pipeline) -- is published at [copperline.dev](https://copperline.dev/)
-and lives under `docs/` as a [MyST](https://mystmd.org/) project you can also
-build locally:
+headless capture, save states, input recording, the debugger frontends
+(window, headless, and remote GDB), the configuration reference, and the
+internals (timing model, chipset, CPU, video pipeline) -- is published at
+[copperline.dev](https://copperline.dev/) and lives under `docs/` as a
+[MyST](https://mystmd.org/) project you can also build locally:
 
 ```sh
 npm install -g mystmd

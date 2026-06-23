@@ -590,6 +590,16 @@ impl Emulator {
         self.tt_ring.as_ref()
     }
 
+    /// Capture an initial reverse-debug anchor if reverse mode is armed but no
+    /// snapshot has been retained yet. Remote debuggers call this when a GDB
+    /// session starts so early reverse-step operations can replay from reset.
+    pub fn debug_ensure_time_travel_anchor(&mut self) -> Result<()> {
+        if self.tt_ring.as_ref().is_some_and(|ring| !ring.is_empty()) {
+            return Ok(());
+        }
+        self.tt_capture_if_due()
+    }
+
     /// Record an input action at the current position for deterministic
     /// reverse replay. No-op unless reverse mode is armed; the live forward
     /// application is unchanged and still done by the caller.
@@ -780,8 +790,19 @@ impl Emulator {
     /// may exist before the oldest snapshot. (Watch-based reverse-continue is
     /// not yet modelled; breakpoints only.)
     pub fn tt_reverse_continue(&mut self) -> Result<crate::timetravel::ReverseOutcome<u64>> {
-        use crate::timetravel::ReverseOutcome;
         let breakpoints = self.machine.ui_breaks().breakpoints.clone();
+        self.tt_reverse_continue_to(&breakpoints)
+    }
+
+    /// Run backward to the previous PC breakpoint in `breakpoints`. This is
+    /// the same operation as `tt_reverse_continue`, but takes an explicit
+    /// breakpoint list so remote debugger frontends can keep their protocol
+    /// breakpoints independent from the in-window debugger state.
+    pub fn tt_reverse_continue_to(
+        &mut self,
+        breakpoints: &[u32],
+    ) -> Result<crate::timetravel::ReverseOutcome<u64>> {
+        use crate::timetravel::ReverseOutcome;
         if breakpoints.is_empty() {
             return Ok(ReverseOutcome::NotFound);
         }
@@ -799,7 +820,7 @@ impl Emulator {
                 self.tt_ring.as_ref().and_then(|r| r.oldest_pos()) == Some(anchor.0);
             self.restore_blob(&anchor.1, anchor.0)?;
             self.tt_begin_replay_input(anchor.0);
-            if let Some(pos) = self.tt_scan_breakpoint(&breakpoints, interval_end)? {
+            if let Some(pos) = self.tt_scan_breakpoint(breakpoints, interval_end)? {
                 self.tt_restore_to(pos)?;
                 return Ok(ReverseOutcome::Found(pos));
             }
@@ -1063,6 +1084,28 @@ impl Emulator {
         for _ in 0..count {
             self.execute_cpu_slice(1)?;
             self.machine.refresh_irq_line();
+        }
+        Ok(())
+    }
+
+    /// Execute one debugger-controlled step using the same STOP/idle handling
+    /// as the real-time loop. The caller owns `cpu_idle` across repeated calls
+    /// so a CPU halted in STOP can advance devices to the next wake-up event
+    /// without spinning on zero-instruction slices.
+    pub fn debug_step_for_gdb(&mut self, cpu_idle: &mut bool) -> Result<()> {
+        if self.stats.started_at.is_none() {
+            self.stats.started_at = Some(std::time::Instant::now());
+        }
+        let frame_before = self.bus().emulated_frames();
+        self.run_one_step(cpu_idle, INSTRUCTIONS_PER_REALTIME_SLICE)?;
+        let frame_after = self.bus().emulated_frames();
+        if frame_after != frame_before {
+            self.stats.frames = self
+                .stats
+                .frames
+                .saturating_add(frame_after.saturating_sub(frame_before));
+            self.tt_capture_if_due()?;
+            self.tt_poll_reverse_watch()?;
         }
         Ok(())
     }

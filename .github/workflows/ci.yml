@@ -78,6 +78,16 @@ jobs:
           path: docs/_build/exports/copperline.pdf
           if-no-files-found: ignore
 
+  gdb-remote:
+    name: GDB remote protocol tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: RSP unit tests
+        run: cargo test --locked gdbstub
+
   diagrom-smoke:
     name: DiagROM boot smoke
     needs: build-test

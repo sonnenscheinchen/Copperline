@@ -44,8 +44,9 @@ running in Copperline.
   dumps, scripted input, and WAV capture.
 - [](zorro) -- describing additional Zorro II/III expansion boards in
   TOML metadata files.
-- [](debugger/window) and [](debugger/headless) -- the interactive
-  debugger window and the environment-driven headless debugger.
+- [](debugger/window), [](debugger/headless), and [](debugger/gdb) -- the
+  interactive debugger window, environment-driven headless debugger, and
+  remote GDB frontend.
 - [](internals/architecture) -- how the emulator works inside, for
   contributors.
 

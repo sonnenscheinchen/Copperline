@@ -1009,6 +1009,54 @@ impl M68kMachine {
         self.cpu.d(reg)
     }
 
+    /// Return one GDB-style core register: D0-D7, A0-A7, SR, PC.
+    pub fn debug_register(&self, reg: usize) -> Option<u32> {
+        match reg {
+            0..=7 => Some(self.cpu.d(reg)),
+            8..=15 => Some(self.cpu.a(reg - 8)),
+            16 => Some(u32::from(self.cpu.get_sr())),
+            17 => Some(self.cpu.pc),
+            _ => None,
+        }
+    }
+
+    /// Set one GDB-style core register: D0-D7, A0-A7, SR, PC.
+    pub fn debug_set_register(&mut self, reg: usize, value: u32) -> bool {
+        match reg {
+            0..=7 => self.cpu.set_d(reg, value),
+            8..=15 => self.cpu.set_a(reg - 8, value),
+            16 => self.cpu.set_sr(value as u16),
+            17 => self.cpu.pc = value & self.bus.address_mask,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Side-effect-free CPU-visible memory read for remote debuggers. This
+    /// respects the current address width and boot ROM overlay, but does not
+    /// access device registers or charge bus time.
+    pub fn debug_read_memory(&self, addr: u32, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|idx| self.bus.peek_byte(addr.wrapping_add(idx as u32)))
+            .collect()
+    }
+
+    /// Side-effect-free CPU-visible memory write for remote debuggers. Only
+    /// RAM-backed regions are mutated; ROM, overlay ROM, and device windows are
+    /// ignored. Returns the number of bytes actually written.
+    pub fn debug_write_memory(&mut self, addr: u32, bytes: &[u8]) -> usize {
+        let mut written = 0usize;
+        for (idx, byte) in bytes.iter().enumerate() {
+            if self
+                .bus
+                .debug_write_byte(addr.wrapping_add(idx as u32), *byte)
+            {
+                written += 1;
+            }
+        }
+        written
+    }
+
     pub fn cpu_type(&self) -> CpuType {
         self.cpu.cpu_type
     }
@@ -1462,6 +1510,38 @@ impl CpuBus {
             return self.bus.mem.extended_rom[off];
         }
         0xFF
+    }
+
+    fn debug_write_byte(&mut self, address: u32, value: u8) -> bool {
+        let addr = self.mask(address);
+        if self.overlay_rom_offset(addr, 1).is_some() {
+            return false;
+        }
+        if let Some(off) = region_offset(self.bus.mem.chip_ram.len(), CHIP_RAM_BASE, addr, 1) {
+            self.bus.mem.chip_ram[off] = value;
+            self.invalidate_debug_write(addr, 1);
+            return true;
+        }
+        if let Some((board, off)) = self.bus.mem.zorro.region_at(addr, 1) {
+            self.bus.mem.zorro.board_ram_mut(board)[off] = value;
+            self.invalidate_debug_write(addr, 1);
+            return true;
+        }
+        if let Some(off) = region_offset(self.bus.mem.slow_ram.len(), SLOW_RAM_BASE, addr, 1) {
+            self.bus.mem.slow_ram[off] = value;
+            self.invalidate_debug_write(addr, 1);
+            return true;
+        }
+        false
+    }
+
+    fn invalidate_debug_write(&mut self, addr: u32, size: usize) {
+        if let Some(cache) = self.icache.as_deref_mut() {
+            cache.invalidate_write(addr, size);
+        }
+        if let Some(cache) = self.dcache.as_deref_mut() {
+            cache.invalidate_write(addr, size);
+        }
     }
 
     /// Word-granular bus cycles for a CPU access of `size` bytes (the 68000

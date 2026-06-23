@@ -27,6 +27,7 @@ mod envcfg;
 mod floppy;
 mod gamepad;
 mod gayle;
+mod gdbstub;
 mod harddrive;
 mod inputrec;
 mod inputsched;
@@ -77,6 +78,9 @@ pub struct CliArgs {
     /// `--benchmark-until SECS`: run frames directly, without opening a
     /// window, until the absolute emulated-time target is reached.
     pub benchmark_until: Option<f32>,
+    /// `--gdb ADDR`: run a headless GDB remote-protocol server on ADDR,
+    /// `:PORT`, or `PORT`, pausing at reset until the debugger resumes.
+    pub gdb: Option<gdbstub::Config>,
     /// Dump consecutive rendered frames after an emulated-time delay. This
     /// is intended for debugging flicker and frame-to-frame palette
     /// changes that a single screenshot cannot show.
@@ -243,6 +247,7 @@ where
     let mut save_state_after: Option<(f32, PathBuf)> = None;
     let mut load_state: Option<PathBuf> = None;
     let mut benchmark_until: Option<f32> = None;
+    let mut gdb: Option<gdbstub::Config> = None;
     let mut dump_dir: Option<PathBuf> = None;
     let mut dump_start_secs: f32 = 0.0;
     let mut dump_count: Option<u32> = None;
@@ -497,6 +502,12 @@ where
                 }
                 benchmark_until = Some(secs);
             }
+            "--gdb" | "--gdb-listen" => {
+                let listen = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--gdb requires ADDR, :PORT, or PORT"))?;
+                gdb = Some(gdbstub::Config::new(listen));
+            }
             "--dump-frames" => {
                 let path = args
                     .next()
@@ -574,7 +585,7 @@ where
             "--profile-live-audio and --noaudio are mutually exclusive"
         ));
     }
-    if benchmark_until.is_some() && !explicit_audio_live && audio_wav.is_none() {
+    if (benchmark_until.is_some() || gdb.is_some()) && !explicit_audio_live && audio_wav.is_none() {
         audio_live = false;
     }
     let frame_dump = match (dump_dir, dump_count) {
@@ -599,6 +610,7 @@ where
         save_state_after,
         load_state,
         benchmark_until,
+        gdb,
         frame_dump,
         press_after,
         click_after,
@@ -639,6 +651,8 @@ fn print_help() {
          \x20                            its emulated timeline\n  \
          --benchmark-until SECS         run frames with no window until absolute emulated\n  \
          \x20                            time SECS, report counters, then exit\n  \
+         --gdb ADDR                     run a headless GDB remote server on ADDR,\n  \
+         \x20                            :PORT, or PORT; port-only forms bind 127.0.0.1\n  \
          --dump-frames DIR              dump consecutive PNG frames into DIR, then exit\n  \
          --dump-start SECS              start frame dumping after SECS seconds (default: 0)\n  \
          --dump-count COUNT             number of frames to dump with --dump-frames\n  \
@@ -774,6 +788,48 @@ fn validate_benchmark_args(cli: &CliArgs) -> Result<()> {
     Ok(())
 }
 
+fn validate_gdb_args(cli: &CliArgs) -> Result<()> {
+    if cli.gdb.is_none() {
+        return Ok(());
+    }
+
+    if cli.benchmark_until.is_some() {
+        return Err(anyhow!("--gdb cannot be combined with --benchmark-until"));
+    }
+    if cli.screenshot_after.is_some() {
+        return Err(anyhow!("--gdb cannot be combined with --screenshot-after"));
+    }
+    if cli.save_state_after.is_some() {
+        return Err(anyhow!("--gdb cannot be combined with --save-state-after"));
+    }
+    if cli.frame_dump.is_some() {
+        return Err(anyhow!("--gdb cannot be combined with --dump-frames"));
+    }
+    if cli.live_audio_profile_secs.is_some() {
+        return Err(anyhow!(
+            "--gdb cannot be combined with --profile-live-audio"
+        ));
+    }
+    if !cli.press_after.is_empty()
+        || !cli.click_after.is_empty()
+        || !cli.joy_after.is_empty()
+        || !cli.mouse_after.is_empty()
+    {
+        return Err(anyhow!(
+            "--gdb cannot be combined with scheduled input events"
+        ));
+    }
+    if cli.record_input.is_some() {
+        return Err(anyhow!("--gdb cannot be combined with --record-input"));
+    }
+    if !cli.disk_insert_after.is_empty() {
+        return Err(anyhow!(
+            "--gdb cannot be combined with scheduled disk inserts"
+        ));
+    }
+    Ok(())
+}
+
 fn run_headless_benchmark(mut emu: Emulator, target_secs: f32) -> Result<()> {
     emu.set_paced(false);
     emu.reset_stats();
@@ -833,6 +889,7 @@ fn main() -> Result<()> {
 
     let cli = parse_args()?;
     validate_benchmark_args(&cli)?;
+    validate_gdb_args(&cli)?;
     if cli.calibrate_gamepad {
         return gamepad::run_calibration();
     }
@@ -1000,8 +1057,10 @@ fn main() -> Result<()> {
     // Headless capture runs (screenshot / frame dump) advance the
     // deterministic core unthrottled; the interactive window paces to
     // wall-clock time. The emulated result is identical either way.
-    let headless_capture =
-        cli.screenshot_after.is_some() || cli.frame_dump.is_some() || cli.benchmark_until.is_some();
+    let headless_capture = cli.screenshot_after.is_some()
+        || cli.frame_dump.is_some()
+        || cli.benchmark_until.is_some()
+        || cli.gdb.is_some();
     let paced = !headless_capture;
     info!("emulation timing: deterministic core, paced={paced}");
     let cpu_clocks_per_cck = crate::config::clocks_per_cck_for_mhz(cfg.cpu_clock_mhz);
@@ -1041,6 +1100,9 @@ fn main() -> Result<()> {
     }
     if let Some(target_secs) = cli.benchmark_until {
         return run_headless_benchmark(emu, target_secs);
+    }
+    if let Some(gdb) = cli.gdb {
+        return gdbstub::run(emu, gdb);
     }
     let disk_write_protected = std::array::from_fn(|idx| {
         cfg.floppy.drives[idx]
@@ -1466,6 +1528,36 @@ mod tests {
             "/tmp/x",
         ])?;
         let err = validate_benchmark_args(&args).unwrap_err();
+        assert!(err.to_string().contains("--screenshot-after"), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn gdb_mode_parses_and_defaults_to_null_audio() -> Result<()> {
+        let args = parse(&["--gdb", ":2345"])?;
+        assert_eq!(
+            args.gdb,
+            Some(crate::gdbstub::Config::new(":2345".to_string()))
+        );
+        assert!(!args.audio_live);
+        validate_gdb_args(&args)?;
+        Ok(())
+    }
+
+    #[test]
+    fn gdb_mode_rejects_window_scheduled_work() -> Result<()> {
+        let args = parse(&["--gdb", ":2345", "--press-after", "1.0", "ctrl"])?;
+        let err = validate_gdb_args(&args).unwrap_err();
+        assert!(err.to_string().contains("scheduled input"), "{err:#}");
+
+        let args = parse(&[
+            "--gdb",
+            ":2345",
+            "--screenshot-after",
+            "1.0",
+            "/tmp/gdb.png",
+        ])?;
+        let err = validate_gdb_args(&args).unwrap_err();
         assert!(err.to_string().contains("--screenshot-after"), "{err:#}");
         Ok(())
     }

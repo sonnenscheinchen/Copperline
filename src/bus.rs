@@ -6131,6 +6131,45 @@ impl Bus {
         )
     }
 
+    /// Side-effect-free debugger view of a custom-register word.
+    ///
+    /// This is intentionally not the CPU-visible custom bus read path:
+    /// inspecting state from GDB or the in-window debugger must not acknowledge
+    /// interrupts, advance collision latches, flush audio, or return an
+    /// undriven-bus value for write-only registers whose internal latch is
+    /// useful to inspect.
+    pub fn debug_custom_word(&self, off: u16) -> Option<u16> {
+        let off = off & 0x1FE;
+        let value = match off {
+            0x002 => {
+                let mut r = self.agnus.dmacon & 0x07FF;
+                if self.blitter.busy {
+                    r |= 1 << 14;
+                }
+                if self.blitter.bzero {
+                    r |= 1 << 13;
+                }
+                r
+            }
+            0x004 => self.agnus.read_vposr(),
+            0x006 => self.agnus.read_vhposr(),
+            0x010 => self.paula.adkcon,
+            0x01C => self.paula.intena,
+            0x01E => self.cpu_visible_intreq(),
+            0x080 => ((self.agnus.cop1lc >> 16) & 0x001F) as u16,
+            0x082 => (self.agnus.cop1lc & 0xFFFE) as u16,
+            0x084 => ((self.agnus.cop2lc >> 16) & 0x001F) as u16,
+            0x086 => (self.agnus.cop2lc & 0xFFFE) as u16,
+            0x096 => self.agnus.dmacon,
+            0x09A => self.paula.intena,
+            0x09C => self.cpu_visible_intreq(),
+            0x09E => self.paula.adkcon,
+            audio @ 0x0A0..=0x0DF => self.paula.peek_audio_reg_latch(audio - 0x0A0)?,
+            other => self.custom_byte_write_latch(other)?,
+        };
+        Some(value)
+    }
+
     /// Read a 16-bit big-endian word from whichever RAM/ROM region maps
     /// `addr` (chip, fast, slow, or ROM), for the debugger's memory dumps.
     /// Returns 0 for unmapped addresses.
