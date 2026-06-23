@@ -725,6 +725,12 @@ pub struct Bus {
     dbg_slotmap: Vec<Vec<u8>>,
     dbg_slotmap_on: bool,
     dbg_slotmap_dumped: bool,
+    #[serde(skip)]
+    frame_analyzer_enabled: bool,
+    #[serde(skip)]
+    current_frame_bus_trace: FrameBusTrace,
+    #[serde(skip)]
+    last_frame_bus_trace: Option<FrameBusTrace>,
     /// Debugger-window custom-register watch offsets ($000-$1FE, word
     /// aligned), mirrored from the CPU machine's InteractiveBreaks, and
     /// the first pending hit since the debugger last polled. Recorded in
@@ -935,9 +941,12 @@ pub enum ChipBusOwner {
     Idle,
 }
 
-const CHIP_BUS_OWNER_NAMES: [&str; 9] = [
+pub const CHIP_BUS_OWNER_NAMES: [&str; 9] = [
     "refresh", "bitplane", "sprite", "disk", "audio", "copper", "blitter", "cpu", "idle",
 ];
+
+pub const FRAME_ANALYZER_MAX_VPOS: usize = MAX_VISIBLE_LINES;
+pub const FRAME_ANALYZER_MAX_HPOS: usize = 512;
 
 // Single-char codes for the COPPERLINE_DIAG_SLOTMAP per-color-clock owner map,
 // chosen to line up with vAmiga's DMA-Debugger slot colours for visual diffing.
@@ -968,6 +977,141 @@ impl ChipBusOwner {
             ChipBusOwner::Cpu => 7,
             ChipBusOwner::Idle => 8,
         }
+    }
+}
+
+/// Per-frame chip-bus ownership trace for the interactive frame analyzer.
+///
+/// One byte records the owner for one Agnus colour clock at `(vpos, hpos)`.
+/// It is deliberately compact because it is filled from the bus-arbitration
+/// hot path while the analyzer is open.
+#[derive(Clone, Debug)]
+pub struct FrameBusTrace {
+    pub frame: u64,
+    pub seconds: f64,
+    pub rows: usize,
+    pub cols: usize,
+    pub line_cck: u32,
+    pub visible_start_vpos: u32,
+    pub visible_lines: usize,
+    pub display_hpos_start: u32,
+    pub display_hpos_end: u32,
+    pub owner_cck: [u64; 9],
+    pub blitter_busy_cck: u64,
+    pub blitter_starve_cck: [u64; 9],
+    pub partial: bool,
+    owners: Vec<u8>,
+}
+
+impl Default for FrameBusTrace {
+    fn default() -> Self {
+        Self {
+            frame: 0,
+            seconds: 0.0,
+            rows: 0,
+            cols: 0,
+            line_cck: COLORCLOCKS_PER_LINE,
+            visible_start_vpos: RENDER_VISIBLE_START_VPOS,
+            visible_lines: RENDER_VISIBLE_LINES,
+            display_hpos_start: RENDER_COPPER_WAIT_HPOS_FB0,
+            display_hpos_end: RENDER_COPPER_WAIT_HPOS_FB0 + (RENDER_FRAMEBUFFER_WIDTH as u32 / 4),
+            owner_cck: [0; 9],
+            blitter_busy_cck: 0,
+            blitter_starve_cck: [0; 9],
+            partial: false,
+            owners: Vec::new(),
+        }
+    }
+}
+
+impl FrameBusTrace {
+    fn reset_for_frame(
+        &mut self,
+        frame: u64,
+        seconds: f64,
+        frame_lines: u32,
+        line_cck: u32,
+        visible_start_vpos: u32,
+        visible_lines: usize,
+        partial: bool,
+    ) {
+        self.frame = frame;
+        self.seconds = seconds;
+        self.rows = (frame_lines as usize).clamp(1, FRAME_ANALYZER_MAX_VPOS);
+        self.cols = (line_cck as usize).clamp(1, FRAME_ANALYZER_MAX_HPOS);
+        self.line_cck = line_cck;
+        self.visible_start_vpos = visible_start_vpos;
+        self.visible_lines = visible_lines.min(FRAME_ANALYZER_MAX_VPOS);
+        self.display_hpos_start = RENDER_COPPER_WAIT_HPOS_FB0;
+        self.display_hpos_end = (RENDER_COPPER_WAIT_HPOS_FB0
+            + (RENDER_FRAMEBUFFER_WIDTH as u32 / 4))
+            .min(self.cols as u32);
+        self.owner_cck = [0; 9];
+        self.blitter_busy_cck = 0;
+        self.blitter_starve_cck = [0; 9];
+        self.partial = partial;
+        self.owners.resize(self.rows * self.cols, b'.');
+        self.owners.fill(b'.');
+    }
+
+    fn finish_window(&mut self, visible_start_vpos: u32, visible_lines: usize) {
+        self.visible_start_vpos = visible_start_vpos.min(self.rows.saturating_sub(1) as u32);
+        self.visible_lines = visible_lines.min(self.rows);
+    }
+
+    fn clear(&mut self) {
+        self.rows = 0;
+        self.cols = 0;
+        self.owners.clear();
+        self.owner_cck = [0; 9];
+        self.blitter_busy_cck = 0;
+        self.blitter_starve_cck = [0; 9];
+        self.partial = false;
+    }
+
+    fn record(&mut self, vpos: u32, hpos: u32, cck: u32, owner: ChipBusOwner, blitter_busy: bool) {
+        if self.rows == 0 || self.cols == 0 {
+            return;
+        }
+        let v = vpos as usize;
+        let h = hpos as usize;
+        if v >= self.rows || h >= self.cols {
+            return;
+        }
+        let idx = owner.accounting_index();
+        self.owner_cck[idx] = self.owner_cck[idx].saturating_add(u64::from(cck));
+        if blitter_busy {
+            self.blitter_busy_cck = self.blitter_busy_cck.saturating_add(u64::from(cck));
+            if !matches!(owner, ChipBusOwner::Blitter) {
+                self.blitter_starve_cck[idx] =
+                    self.blitter_starve_cck[idx].saturating_add(u64::from(cck));
+            }
+        }
+        let code = chip_bus_owner_code(owner);
+        let row = &mut self.owners[v * self.cols..(v + 1) * self.cols];
+        let end = (h + cck as usize).min(self.cols);
+        for slot in row.iter_mut().take(end).skip(h) {
+            *slot = code;
+        }
+    }
+
+    pub fn owner_code_at(&self, vpos: usize, hpos: usize) -> u8 {
+        if vpos >= self.rows || hpos >= self.cols {
+            return b'.';
+        }
+        self.owners[vpos * self.cols + hpos]
+    }
+
+    pub fn owner_row(&self, vpos: usize) -> Option<&[u8]> {
+        if vpos >= self.rows || self.cols == 0 {
+            return None;
+        }
+        let start = vpos * self.cols;
+        Some(&self.owners[start..start + self.cols])
+    }
+
+    pub fn has_samples(&self) -> bool {
+        self.owner_cck.iter().any(|&v| v != 0)
     }
 }
 
@@ -1630,6 +1774,9 @@ impl Bus {
             dbg_slotmap: Vec::new(),
             dbg_slotmap_on: crate::envcfg::flag("COPPERLINE_DIAG_SLOTMAP"),
             dbg_slotmap_dumped: false,
+            frame_analyzer_enabled: false,
+            current_frame_bus_trace: FrameBusTrace::default(),
+            last_frame_bus_trace: None,
             ui_reg_watches: Vec::new(),
             ui_reg_hit: None,
             blitter_slowdown_cpu_misses: 0,
@@ -1920,6 +2067,8 @@ impl Bus {
         self.last_frame_geometry = FrameGeometry::standard(RENDER_VISIBLE_START_VPOS, false);
         self.lazy_collision_vpos = RENDER_VISIBLE_START_VPOS;
         self.lazy_collision_hpos = RENDER_COPPER_WAIT_HPOS_FB0;
+        self.current_frame_bus_trace.clear();
+        self.last_frame_bus_trace = None;
         self.cpu_bus_arbitration_enabled = false;
         self.blitter_slowdown_cpu_misses = 0;
         self.slice_bus_advanced_cck = 0;
@@ -2049,6 +2198,8 @@ impl Bus {
         self.current_frame_sprite_dma_observed = false;
         self.last_frame_sprite_dma_observed = false;
         self.display_dma_sprite_state = [DisplaySpriteDmaState::default(); 8];
+        self.current_frame_bus_trace.clear();
+        self.last_frame_bus_trace = None;
     }
 
     pub fn emulated_seconds(&self) -> f64 {
@@ -3084,6 +3235,30 @@ impl Bus {
         } else {
             self.current_frame_geometry
         }
+    }
+
+    pub fn set_frame_analyzer_enabled(&mut self, enabled: bool) {
+        if self.frame_analyzer_enabled == enabled {
+            return;
+        }
+        self.frame_analyzer_enabled = enabled;
+        if enabled {
+            self.reset_current_frame_bus_trace(true);
+        } else {
+            self.current_frame_bus_trace.clear();
+            self.last_frame_bus_trace = None;
+        }
+    }
+
+    pub fn frame_bus_trace(&self) -> Option<&FrameBusTrace> {
+        self.last_frame_bus_trace
+            .as_ref()
+            .filter(|trace| trace.has_samples())
+            .or_else(|| {
+                self.current_frame_bus_trace
+                    .has_samples()
+                    .then_some(&self.current_frame_bus_trace)
+            })
     }
 
     pub fn current_render_events(&self) -> &[BeamRegisterWrite] {
@@ -4629,6 +4804,15 @@ impl Bus {
                     *slot = code;
                 }
             }
+        }
+        if self.frame_analyzer_enabled {
+            self.current_frame_bus_trace.record(
+                self.agnus.vpos,
+                hpos,
+                cck,
+                owner,
+                self.blitter.busy,
+            );
         }
         // The Copper was already stepped above (or is held without fetching at
         // the end-of-line lockout); only drive the other owners here.
@@ -6268,6 +6452,36 @@ impl Bus {
         self.bus_accounting.reset_frame();
     }
 
+    fn reset_current_frame_bus_trace(&mut self, partial: bool) {
+        if !self.frame_analyzer_enabled {
+            return;
+        }
+        self.current_frame_bus_trace.reset_for_frame(
+            self.emulated_frames,
+            self.emulated_seconds(),
+            self.agnus.current_frame_lines(),
+            self.agnus.current_line_cck(),
+            self.current_frame_visible_start_vpos,
+            self.current_frame_geometry.visible_lines,
+            partial,
+        );
+    }
+
+    fn finish_frame_bus_trace(&mut self) {
+        if !self.frame_analyzer_enabled {
+            self.current_frame_bus_trace.clear();
+            self.last_frame_bus_trace = None;
+            return;
+        }
+        self.current_frame_bus_trace.finish_window(
+            self.current_frame_visible_start_vpos,
+            self.current_frame_geometry.visible_lines,
+        );
+        if self.current_frame_bus_trace.has_samples() {
+            self.last_frame_bus_trace = Some(self.current_frame_bus_trace.clone());
+        }
+    }
+
     fn begin_new_beam_frame(&mut self) {
         if crate::envcfg::flag("COPPERLINE_DIAG_DISPLAY") {
             let lines: Vec<usize> = self
@@ -6488,6 +6702,7 @@ impl Bus {
         }
         self.accumulate_live_collisions_to_frame_end();
         self.log_bus_accounting_frame();
+        self.finish_frame_bus_trace();
         self.last_frame_render_base = Some(self.current_frame_render_base);
         self.last_frame_visible_start_vpos = self.current_frame_visible_start_vpos;
         self.last_frame_geometry = self.current_frame_geometry;
@@ -6568,6 +6783,7 @@ impl Bus {
         }
         self.pending_copper_frame_start = Some(self.agnus.cop1lc);
         self.copper.stop();
+        self.reset_current_frame_bus_trace(false);
     }
 
     pub(crate) fn record_cpu_chip_ram_write(&mut self, offset: usize, size: usize, value: u32) {
@@ -10050,13 +10266,13 @@ mod tests {
         live_sprite_playfield_collision_bits_in_range, live_sprite_sprite_collision_bits,
         visible_start_vpos_for_diw, BeamChipRamWrite, BeamRegisterWrite, BeamWriteSource, Bus,
         CapturedBitplaneRow, CapturedSpriteLine, ChipBusOwner, CpuBusAccessKind, DeviceClock,
-        DisplaySpriteControl, DisplaySpriteDmaState, DisplaySpriteLineData, LiveCollisionControl,
-        LiveCollisionLineReplay, LiveSpriteCollisionSource, RenderRegisterSnapshot,
-        BLITTER_SLOWDOWN_CPU_MISS_LIMIT, BLTCON1_DOFF, BPLCON0_ECSENA, BPLCON3_BRDSPRT,
-        BPLCON3_SPRES_HIRES, COPPER_BUS_LOCKOUT_HPOS, DENISE_HPOS_LAG_CCK, DMACON_AUD_MASK,
-        DMACON_BLTEN, DMACON_BLTPRI, DMACON_BPLEN, DMACON_SPREN, RENDER_COPPER_WAIT_HPOS_FB0,
-        RENDER_DIW_HSTART_FB0, RENDER_MIN_OVERSCAN_START_VPOS, RENDER_VISIBLE_LINES,
-        RENDER_VISIBLE_START_VPOS, SPRITE_DMA_PAIR_CAPTURE_HPOS,
+        DisplaySpriteControl, DisplaySpriteDmaState, DisplaySpriteLineData, FrameBusTrace,
+        LiveCollisionControl, LiveCollisionLineReplay, LiveSpriteCollisionSource,
+        RenderRegisterSnapshot, BLITTER_SLOWDOWN_CPU_MISS_LIMIT, BLTCON1_DOFF, BPLCON0_ECSENA,
+        BPLCON3_BRDSPRT, BPLCON3_SPRES_HIRES, COPPER_BUS_LOCKOUT_HPOS, DENISE_HPOS_LAG_CCK,
+        DMACON_AUD_MASK, DMACON_BLTEN, DMACON_BLTPRI, DMACON_BPLEN, DMACON_SPREN,
+        RENDER_COPPER_WAIT_HPOS_FB0, RENDER_DIW_HSTART_FB0, RENDER_MIN_OVERSCAN_START_VPOS,
+        RENDER_VISIBLE_LINES, RENDER_VISIBLE_START_VPOS, SPRITE_DMA_PAIR_CAPTURE_HPOS,
     };
     use crate::audio::AudioSink;
     use crate::chipset::agnus::{
@@ -10087,6 +10303,49 @@ mod tests {
     const STANDARD_VISIBLE_X0: usize = ((STANDARD_DIW_HSTART - RENDER_DIW_HSTART_FB0) * 2) as usize;
     const RENDER_COLOR_WRITE_HPOS_FB0: u32 = 0x34;
     static BUS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn frame_analyzer_records_owner_spans_and_blitter_wait_cck() {
+        let mut trace = FrameBusTrace::default();
+        trace.reset_for_frame(7, 0.140, 4, 16, 1, 2, false);
+
+        trace.record(1, 2, 3, ChipBusOwner::Bitplane, false);
+        trace.record(1, 5, 2, ChipBusOwner::Copper, true);
+        trace.record(1, 7, 2, ChipBusOwner::Blitter, true);
+        trace.record(8, 0, 4, ChipBusOwner::Cpu, true);
+        trace.finish_window(2, 1);
+
+        assert_eq!(trace.frame, 7);
+        assert_eq!(trace.rows, 4);
+        assert_eq!(trace.cols, 16);
+        assert_eq!(trace.visible_start_vpos, 2);
+        assert_eq!(trace.visible_lines, 1);
+        assert!(trace.has_samples());
+
+        let row = trace.owner_row(1).expect("recorded beam row");
+        assert_eq!(row[1], b'.');
+        assert_eq!(&row[2..5], &[b'B'; 3]);
+        assert_eq!(&row[5..7], &[b'C'; 2]);
+        assert_eq!(&row[7..9], &[b'L'; 2]);
+        assert_eq!(trace.owner_code_at(3, 0), b'.');
+
+        assert_eq!(
+            trace.owner_cck[ChipBusOwner::Bitplane.accounting_index()],
+            3
+        );
+        assert_eq!(trace.owner_cck[ChipBusOwner::Copper.accounting_index()], 2);
+        assert_eq!(trace.owner_cck[ChipBusOwner::Blitter.accounting_index()], 2);
+        assert_eq!(trace.owner_cck[ChipBusOwner::Cpu.accounting_index()], 0);
+        assert_eq!(trace.blitter_busy_cck, 4);
+        assert_eq!(
+            trace.blitter_starve_cck[ChipBusOwner::Copper.accounting_index()],
+            2
+        );
+        assert_eq!(
+            trace.blitter_starve_cck[ChipBusOwner::Blitter.accounting_index()],
+            0
+        );
+    }
 
     #[test]
     fn bitplane_slot_plan_key_ignores_denise_only_bplcon0_bits() {

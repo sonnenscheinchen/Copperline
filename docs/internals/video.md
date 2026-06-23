@@ -218,9 +218,10 @@ framebuffer):
   is still recentred, while a display that genuinely fetches bitplane data into
   the overscan border is left exactly as rendered.
 
-`ui.rs` implements the status bar widgets, the pop-up menu, and the
-overlay windows (About, Shortcuts, Calibration, Debugger) drawn over the
-display with the 8x8 `font.rs` glyphs. `COPPERLINE_UI_PREVIEW=1 cargo test
+`ui.rs` implements the status bar widgets, the pop-up menu, the smaller
+overlay panels (About, Shortcuts, Calibration), and the shared debugger/tool
+panel drawing used by the native debugger and frame-analyzer windows. The UI
+uses the 8x8 `font.rs` glyphs. `COPPERLINE_UI_PREVIEW=1 cargo test
 panels_render_into_their_rects` renders every panel into
 `target/ui-preview-*.png` -- the screenshots in this documentation come
 from there -- and the `test_app()` fixture drives the debugger window

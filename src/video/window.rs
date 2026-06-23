@@ -434,6 +434,7 @@ pub struct App {
     present_fb: Vec<u32>,
     present_rows: usize,
     render: Option<Render>,
+    tool_window: Option<ToolWindow>,
     render_worker: Option<RenderWorker>,
     render_recycle_fb: Vec<u32>,
     cpu_halted: bool,
@@ -530,6 +531,9 @@ pub struct App {
     /// Host pause state before the debugger forced a pause, restored when
     /// the debugger window closes (unless Run was used inside it).
     paused_before_debugger: bool,
+    /// Host pause state before the frame analyzer forced a pause, restored
+    /// when the analyzer pane closes unless Run was used inside it.
+    paused_before_analyzer: bool,
     /// The reason for the last interactive breakpoint/watchpoint stop,
     /// shown on the debugger's Break tab until execution resumes.
     last_debug_stop: Option<String>,
@@ -588,6 +592,13 @@ struct Render {
     window: Arc<Window>,
     pixels: Pixels<'static>,
     texture_scale: usize,
+}
+
+struct ToolWindow {
+    window: Arc<Window>,
+    pixels: Pixels<'static>,
+    texture_scale: usize,
+    cursor_pos: Option<(i32, i32)>,
 }
 
 struct RenderJob {
@@ -710,6 +721,7 @@ impl App {
             present_fb: vec![0u32; FB_WIDTH * OUT_HEIGHT],
             present_rows: OUT_HEIGHT,
             render: None,
+            tool_window: None,
             render_worker,
             render_recycle_fb: Vec::new(),
             cpu_halted: false,
@@ -761,6 +773,7 @@ impl App {
             ui: UiState::default(),
             about_machine_lines,
             paused_before_debugger: false,
+            paused_before_analyzer: false,
             last_debug_stop: None,
             recorder: None,
             record_fb: Vec::new(),
@@ -954,13 +967,7 @@ impl ApplicationHandler for App {
         #[cfg(target_os = "macos")]
         set_macos_dock_icon();
         let inner = window.inner_size();
-        let surface = SurfaceTexture::new(inner.width.max(1), inner.height.max(1), window.clone());
         let texture_scale = texture_scale_for_window(&window);
-        let builder = PixelsBuilder::new(
-            texture_width(texture_scale) as u32,
-            texture_height(texture_scale) as u32,
-            surface,
-        );
         // On Linux, restrict wgpu to the Vulkan backend. wgpu's GL fallback
         // initializes its EGL instance without a display handle (pixels uses
         // InstanceDescriptor::new_without_display_handle), so EGL drops to the
@@ -974,14 +981,7 @@ impl ApplicationHandler for App {
         // Other platforms keep wgpu's default backend set (Metal on macOS,
         // DX12/Vulkan on Windows). cfg!() (not #[cfg]) keeps the Linux branch
         // type-checked on every host.
-        let builder = if cfg!(target_os = "linux") {
-            builder.wgpu_backend(
-                pixels::wgpu::Backends::from_env().unwrap_or(pixels::wgpu::Backends::VULKAN),
-            )
-        } else {
-            builder
-        };
-        let mut pixels = match builder.build() {
+        let pixels = match build_pixels_for_window(window.clone(), texture_scale) {
             Ok(p) => p,
             Err(e) => {
                 error!("pixels init failed: {e}");
@@ -997,12 +997,6 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        // Scale the display continuously with the window (preserving the
-        // 4:3 presentation aspect, letterboxing as needed) instead of the
-        // default pixel-perfect mode, which only steps at whole integer
-        // multiples and otherwise leaves a fixed-size image in a growing
-        // black border.
-        pixels.set_scaling_mode(ScalingMode::Fill);
         info!(
             "window + pixels surface ready ({}x{}, texture {}x{})",
             inner.width,
@@ -1132,9 +1126,20 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
+        if Some(window_id) == self.tool_window_id() {
+            self.handle_tool_window_event(event_loop, event);
+            return;
+        }
+        if self
+            .render
+            .as_ref()
+            .is_some_and(|render| render.window.id() != window_id)
+        {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -1192,7 +1197,8 @@ impl ApplicationHandler for App {
                     (KeyCode::KeyB, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers) =>
                     {
-                        self.toggle_debugger()
+                        self.toggle_debugger();
+                        self.ensure_tool_window_for_current_panel(event_loop);
                     }
                     (KeyCode::KeyJ, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers) =>
@@ -1260,7 +1266,7 @@ impl ApplicationHandler for App {
                 }
                 let layout = bar_layout(&self.media_bar());
                 if bar_hover_changed(&layout, previous_cursor_pos, self.cursor_pos)
-                    || ui_hover_changed(&self.ui, previous_cursor_pos, self.cursor_pos)
+                    || self.main_ui_hover_changed(previous_cursor_pos, self.cursor_pos)
                 {
                     self.request_redraw();
                 }
@@ -1287,8 +1293,11 @@ impl ApplicationHandler for App {
                 }
                 if pressed && !self.mouse_captured && self.ui.active() {
                     if button == MouseButton::Left {
-                        if let Some(control) = self.cursor_pos.and_then(|p| self.ui.control_at(p)) {
+                        if let Some(control) =
+                            self.cursor_pos.and_then(|p| self.main_ui_control_at(p))
+                        {
                             self.activate_ui_control(control);
+                            self.ensure_tool_window_for_current_panel(event_loop);
                             return;
                         }
                     }
@@ -1383,11 +1392,16 @@ impl ApplicationHandler for App {
                     hover,
                 };
                 let osd = self.active_osd_text();
-                let ui_hover = self.cursor_pos.and_then(|p| self.ui.control_at(p));
-                let ui_data = self.build_panel_view_data();
+                let ui_hover = self.cursor_pos.and_then(|p| self.main_ui_control_at(p));
                 let warp = !self.emu.paced();
                 let recording = self.recorder.is_some();
                 let input_recording = self.input_recorder.is_some();
+                let panel_in_tool_window = self.tool_window.is_some();
+                let ui_data = if panel_in_tool_window {
+                    None
+                } else {
+                    self.build_panel_view_data()
+                };
                 if let Some(r) = self.render.as_mut() {
                     let frame = r.pixels.frame_mut();
                     copy_present_frame(&self.present_fb, self.present_rows, frame, r.texture_scale);
@@ -1400,17 +1414,35 @@ impl ApplicationHandler for App {
                     if let Some(text) = &osd {
                         draw_osd(frame, text, r.texture_scale);
                     }
-                    ui::draw(
-                        frame,
-                        r.texture_scale,
-                        &self.ui,
-                        ui_hover,
-                        ui_data.as_ref(),
-                        warp,
-                        recording,
-                        input_recording,
-                        self.joystick_input_mode,
-                    );
+                    if panel_in_tool_window {
+                        let main_ui = UiState {
+                            menu_open: self.ui.menu_open,
+                            panel: None,
+                        };
+                        ui::draw(
+                            frame,
+                            r.texture_scale,
+                            &main_ui,
+                            ui_hover,
+                            None,
+                            warp,
+                            recording,
+                            input_recording,
+                            self.joystick_input_mode,
+                        );
+                    } else {
+                        ui::draw(
+                            frame,
+                            r.texture_scale,
+                            &self.ui,
+                            ui_hover,
+                            ui_data.as_ref(),
+                            warp,
+                            recording,
+                            input_recording,
+                            self.joystick_input_mode,
+                        );
+                    }
                     if let Err(e) = r.pixels.render() {
                         error!("pixels.render: {e}");
                     }
@@ -1494,6 +1526,7 @@ impl ApplicationHandler for App {
             // A breakpoint/watchpoint hit pauses the machine and brings
             // the debugger window up with the reason.
             self.surface_debug_stop();
+            self.ensure_tool_window_for_current_panel(event_loop);
         }
         let now = Instant::now();
         // While powered off, leave the parked test screen in place; the
@@ -1509,9 +1542,7 @@ impl ApplicationHandler for App {
         // as fast as the host allows. Emulated state is identical either way.
         let headless_capture = self.auto_shot.is_some() || self.frame_dump.is_some();
         if rendered && !headless_capture {
-            if let Some(r) = self.render.as_ref() {
-                r.window.request_redraw();
-            }
+            self.request_redraw();
         }
 
         if self.dump_frame_if_due(now, event_loop) {
@@ -2040,6 +2071,29 @@ fn texture_scale_for_window(window: &Window) -> usize {
     (window.scale_factor().round() as usize).clamp(1, MAX_TEXTURE_SCALE)
 }
 
+fn build_pixels_for_window(
+    window: Arc<Window>,
+    texture_scale: usize,
+) -> std::result::Result<Pixels<'static>, pixels::Error> {
+    let inner = window.inner_size();
+    let surface = SurfaceTexture::new(inner.width.max(1), inner.height.max(1), window);
+    let builder = PixelsBuilder::new(
+        texture_width(texture_scale) as u32,
+        texture_height(texture_scale) as u32,
+        surface,
+    );
+    let builder = if cfg!(target_os = "linux") {
+        builder.wgpu_backend(
+            pixels::wgpu::Backends::from_env().unwrap_or(pixels::wgpu::Backends::VULKAN),
+        )
+    } else {
+        builder
+    };
+    let mut pixels = builder.build()?;
+    pixels.set_scaling_mode(ScalingMode::Fill);
+    Ok(pixels)
+}
+
 pub(super) fn texture_width(scale: usize) -> usize {
     FB_WIDTH * scale
 }
@@ -2094,6 +2148,20 @@ fn volume_scroll_steps(delta: MouseScrollDelta) -> Option<i16> {
         Some(-1)
     } else {
         None
+    }
+}
+
+fn owner_name_from_code(code: u8) -> &'static str {
+    match code {
+        b'R' => "refresh",
+        b'B' => "bitplane",
+        b'S' => "sprite",
+        b'D' => "disk",
+        b'A' => "audio",
+        b'C' => "copper",
+        b'L' => "blitter",
+        b'P' => "cpu",
+        _ => "idle",
     }
 }
 
@@ -2724,15 +2792,6 @@ fn bar_hover_changed(
 ) -> bool {
     previous.and_then(|pos| control_at(pos, layout))
         != current.and_then(|pos| control_at(pos, layout))
-}
-
-fn ui_hover_changed(
-    ui: &UiState,
-    previous: Option<(i32, i32)>,
-    current: Option<(i32, i32)>,
-) -> bool {
-    ui.active()
-        && previous.and_then(|pos| ui.control_at(pos)) != current.and_then(|pos| ui.control_at(pos))
 }
 
 fn draw_fdd_track_counter(frame: &mut [u8], track: Option<u8>, texture_scale: usize) {
@@ -4214,6 +4273,136 @@ impl App {
         MediaBar { drives, cd }
     }
 
+    fn main_ui_control_at(&self, pos: (i32, i32)) -> Option<UiControl> {
+        if self.tool_window.is_some() && !self.ui.menu_open {
+            return None;
+        }
+        self.ui.control_at(pos)
+    }
+
+    fn main_ui_hover_changed(
+        &self,
+        previous: Option<(i32, i32)>,
+        current: Option<(i32, i32)>,
+    ) -> bool {
+        previous.and_then(|pos| self.main_ui_control_at(pos))
+            != current.and_then(|pos| self.main_ui_control_at(pos))
+    }
+
+    fn tool_panel_control_at(&self, pos: (i32, i32)) -> Option<UiControl> {
+        self.ui
+            .panel
+            .as_ref()
+            .and_then(|panel| ui::panel_control_at(panel, pos))
+    }
+
+    fn tool_hover_changed(
+        &self,
+        previous: Option<(i32, i32)>,
+        current: Option<(i32, i32)>,
+    ) -> bool {
+        previous.and_then(|pos| self.tool_panel_control_at(pos))
+            != current.and_then(|pos| self.tool_panel_control_at(pos))
+    }
+
+    fn tool_window_id(&self) -> Option<WindowId> {
+        self.tool_window.as_ref().map(|tool| tool.window.id())
+    }
+
+    fn handle_tool_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => self.close_panel(),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state,
+                        physical_key: PhysicalKey::Code(code),
+                        repeat,
+                        ..
+                    },
+                ..
+            } => {
+                if repeat || state != ElementState::Pressed {
+                    return;
+                }
+                if code == KeyCode::KeyQ && host_shortcut_modifier_pressed(self.modifiers) {
+                    event_loop.exit();
+                } else if !self.ui_handle_key(code) {
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let previous = self.tool_window.as_ref().and_then(|tool| tool.cursor_pos);
+                let pos = self.tool_window.as_ref().and_then(|tool| {
+                    cursor_texture_position(&tool.pixels, position, tool.texture_scale)
+                });
+                if let Some(tool) = self.tool_window.as_mut() {
+                    tool.cursor_pos = pos;
+                }
+                if self.tool_hover_changed(previous, pos) {
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                let previous = self.tool_window.as_ref().and_then(|tool| tool.cursor_pos);
+                if let Some(tool) = self.tool_window.as_mut() {
+                    tool.cursor_pos = None;
+                }
+                if self.tool_hover_changed(previous, None) {
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if state != ElementState::Pressed || button != MouseButton::Left {
+                    return;
+                }
+                let control = self
+                    .tool_window
+                    .as_ref()
+                    .and_then(|tool| tool.cursor_pos)
+                    .and_then(|pos| self.tool_panel_control_at(pos));
+                if let Some(control) = control {
+                    self.activate_ui_control(control);
+                    self.ensure_tool_window_for_current_panel(event_loop);
+                }
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(tool) = self.tool_window.as_mut() {
+                    let _ = tool
+                        .pixels
+                        .resize_surface(size.width.max(1), size.height.max(1));
+                }
+                self.request_redraw();
+            }
+            WindowEvent::RedrawRequested => self.draw_tool_window(),
+            _ => {}
+        }
+    }
+
+    fn draw_tool_window(&mut self) {
+        let Some(panel) = self.ui.panel.as_ref() else {
+            self.tool_window = None;
+            return;
+        };
+        let ui_data = self.build_panel_view_data();
+        let hover = self
+            .tool_window
+            .as_ref()
+            .and_then(|tool| tool.cursor_pos)
+            .and_then(|pos| ui::panel_control_at(panel, pos));
+        if let Some(tool) = self.tool_window.as_mut() {
+            let frame = tool.pixels.frame_mut();
+            frame.fill(0);
+            ui::draw_panel_layer(frame, tool.texture_scale, panel, hover, ui_data.as_ref());
+            if let Err(e) = tool.pixels.render() {
+                error!("tool pixels.render: {e}");
+            }
+        }
+    }
+
     /// Run the action behind a clicked status-bar control (volume is
     /// handled separately because it starts a drag).
     fn activate_bar_control(&mut self, control: BarControl) {
@@ -4241,6 +4430,7 @@ impl App {
             UiControl::MenuItem(item) => {
                 self.ui.menu_open = false;
                 match item {
+                    ui::MenuItem::FrameAnalyzer => self.open_frame_analyzer(),
                     ui::MenuItem::About => self.ui.panel = Some(Panel::About),
                     ui::MenuItem::Shortcuts => self.ui.panel = Some(Panel::Shortcuts),
                     ui::MenuItem::Calibration => {
@@ -4291,6 +4481,11 @@ impl App {
                 self.emu.machine.ui_breaks_clear();
                 self.last_debug_stop = None;
                 self.show_osd("Cleared all breakpoints and watchpoints");
+            }
+            UiControl::AnalyzerRun => self.frame_analyzer_toggle_run(),
+            UiControl::AnalyzerFrame => self.frame_analyzer_step_frame(),
+            UiControl::AnalyzerPick { x, y, scanline } => {
+                self.frame_analyzer_select(x, y, scanline)
             }
         }
         self.request_redraw();
@@ -4358,6 +4553,17 @@ impl App {
                 }
             }
         }
+        if matches!(self.ui.panel, Some(Panel::FrameAnalyzer(_))) {
+            let control = match code {
+                KeyCode::KeyF => Some(UiControl::AnalyzerFrame),
+                KeyCode::KeyR => Some(UiControl::AnalyzerRun),
+                _ => None,
+            };
+            if let Some(control) = control {
+                self.activate_ui_control(control);
+                return true;
+            }
+        }
         false
     }
 
@@ -4375,6 +4581,9 @@ impl App {
 
     fn open_debugger(&mut self) {
         if !matches!(self.ui.panel, Some(Panel::Debugger(_))) {
+            if matches!(self.ui.panel, Some(Panel::FrameAnalyzer(_))) {
+                self.emu.bus_mut().set_frame_analyzer_enabled(false);
+            }
             // The debugger shortcut can arrive while the mouse is captured;
             // release it so the window's controls are reachable.
             self.set_mouse_captured(false);
@@ -4399,6 +4608,121 @@ impl App {
         }
     }
 
+    fn tool_window_title(panel: &Panel) -> &'static str {
+        match panel {
+            Panel::Debugger(_) => "Copperline Debugger",
+            Panel::FrameAnalyzer(_) => "Copperline Frame Analyzer",
+            Panel::About => "Copperline About",
+            Panel::Shortcuts => "Copperline Keyboard Shortcuts",
+            Panel::Calibration(_) => "Copperline Gamepad Calibration",
+        }
+    }
+
+    fn panel_prefers_tool_window(panel: &Panel) -> bool {
+        matches!(panel, Panel::Debugger(_) | Panel::FrameAnalyzer(_))
+    }
+
+    fn ensure_tool_window_for_current_panel(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(panel) = self.ui.panel.as_ref() else {
+            return;
+        };
+        if !Self::panel_prefers_tool_window(panel) {
+            return;
+        }
+        let title = Self::tool_window_title(panel);
+        if let Some(tool) = self.tool_window.as_ref() {
+            tool.window.set_title(title);
+            tool.window.request_redraw();
+            return;
+        }
+
+        let size = LogicalSize::new(FB_WIDTH as f64, WINDOW_PRESENT_HEIGHT as f64);
+        let attrs = WindowAttributes::default()
+            .with_title(title)
+            .with_window_icon(copperline_window_icon())
+            .with_inner_size(size)
+            .with_min_inner_size(LogicalSize::new(
+                FB_WIDTH as f64 / 2.0,
+                WINDOW_PRESENT_HEIGHT as f64 / 2.0,
+            ));
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                warn!("create tool window failed: {e}");
+                return;
+            }
+        };
+        let texture_scale = texture_scale_for_window(&window);
+        let pixels = match build_pixels_for_window(window.clone(), texture_scale) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("tool window pixels init failed: {e}");
+                return;
+            }
+        };
+        info!(
+            "tool window ready: {title} (texture {}x{})",
+            texture_width(texture_scale),
+            texture_height(texture_scale)
+        );
+        self.tool_window = Some(ToolWindow {
+            window,
+            pixels,
+            texture_scale,
+            cursor_pos: None,
+        });
+        self.request_redraw();
+    }
+
+    fn open_frame_analyzer(&mut self) {
+        if !matches!(self.ui.panel, Some(Panel::FrameAnalyzer(_))) {
+            self.set_mouse_captured(false);
+            self.paused_before_analyzer = self.paused;
+            self.paused = true;
+            self.sync_live_audio_suspension();
+            self.emu.bus_mut().set_frame_analyzer_enabled(true);
+            self.ui.panel = Some(Panel::FrameAnalyzer(ui::FrameAnalyzerPanel::new()));
+            self.resize_for_active_panel();
+        }
+    }
+
+    fn frame_analyzer_toggle_run(&mut self) {
+        self.paused = !self.paused;
+        self.paused_before_analyzer = self.paused;
+        self.sync_live_audio_suspension();
+        if !self.paused {
+            self.emu.bus_mut().set_frame_analyzer_enabled(true);
+        }
+    }
+
+    fn frame_analyzer_step_frame(&mut self) {
+        self.emu.bus_mut().set_frame_analyzer_enabled(true);
+        self.debugger_step_frame();
+    }
+
+    fn frame_analyzer_select(&mut self, x: u16, y: u16, scanline: bool) {
+        let Some(trace) = self.emu.bus().frame_bus_trace() else {
+            return;
+        };
+        let hpos = (usize::from(x) * trace.cols / 1024).min(trace.cols.saturating_sub(1));
+        let vpos = if scanline {
+            self.ui
+                .panel
+                .as_ref()
+                .and_then(|panel| match panel {
+                    Panel::FrameAnalyzer(panel) => Some(panel.selected_vpos as usize),
+                    _ => None,
+                })
+                .unwrap_or(trace.visible_start_vpos as usize)
+        } else {
+            (usize::from(y) * trace.rows / 1024).min(trace.rows.saturating_sub(1))
+        };
+        if let Some(Panel::FrameAnalyzer(panel)) = self.ui.panel.as_mut() {
+            panel.selected_hpos = hpos.min(u16::MAX as usize) as u16;
+            panel.selected_vpos = vpos.min(u16::MAX as usize) as u16;
+        }
+    }
+
     /// Close the open panel. Closing the debugger restores the pause state
     /// from before it opened (as updated by Run/Pause used inside it).
     fn close_panel(&mut self) {
@@ -4407,7 +4731,14 @@ impl App {
             self.last_debug_stop = None;
             self.sync_live_audio_suspension();
         }
+        if matches!(self.ui.panel, Some(Panel::FrameAnalyzer(_))) {
+            self.paused = self.paused_before_analyzer;
+            self.emu.bus_mut().set_frame_analyzer_enabled(false);
+            self.sync_live_audio_suspension();
+        }
         self.ui.panel = None;
+        self.tool_window = None;
+        self.resize_for_active_panel();
         self.request_redraw();
     }
 
@@ -4891,6 +5222,84 @@ impl App {
             Panel::Debugger(panel) => {
                 Some(ui::PanelViewData::Debugger(self.build_debugger_view(panel)))
             }
+            Panel::FrameAnalyzer(panel) => Some(ui::PanelViewData::FrameAnalyzer(Box::new(
+                self.build_frame_analyzer_view(panel),
+            ))),
+        }
+    }
+
+    fn build_frame_analyzer_view(&self, panel: &ui::FrameAnalyzerPanel) -> ui::FrameAnalyzerView {
+        let bus = self.emu.bus();
+        let status = format!(
+            "{} frame {} {:.2}s",
+            if self.paused { "paused" } else { "running" },
+            bus.emulated_frames(),
+            bus.emulated_seconds()
+        );
+        let Some(trace) = bus.frame_bus_trace() else {
+            return ui::FrameAnalyzerView {
+                running: !self.paused,
+                status,
+                trace: None,
+            };
+        };
+        let selected_vpos = usize::from(panel.selected_vpos).min(trace.rows.saturating_sub(1));
+        let selected_hpos = usize::from(panel.selected_hpos).min(trace.cols.saturating_sub(1));
+        let selected_owner_code = trace.owner_code_at(selected_vpos, selected_hpos);
+        let selected_owner = owner_name_from_code(selected_owner_code);
+        let mut owners = Vec::with_capacity(trace.rows * trace.cols);
+        for vpos in 0..trace.rows {
+            if let Some(row) = trace.owner_row(vpos) {
+                owners.extend_from_slice(row);
+            }
+        }
+        let markers = bus
+            .frame_render_events()
+            .iter()
+            .take(240)
+            .map(|event| {
+                let off = event.offset & 0x01FE;
+                ui::AnalyzerMarker {
+                    vpos: event.vpos.min(u32::from(u16::MAX)) as u16,
+                    hpos: event.hpos.min(u32::from(u16::MAX)) as u16,
+                    label: format!(
+                        "{} v={:03} h={:03} ${off:03X}={:04X}",
+                        match event.source {
+                            BeamWriteSource::Cpu => "cpu",
+                            BeamWriteSource::CpuCopperIrq => "irq",
+                            BeamWriteSource::Copper => "copper",
+                        },
+                        event.vpos,
+                        event.hpos,
+                        event.value,
+                    ),
+                }
+            })
+            .collect();
+        ui::FrameAnalyzerView {
+            running: !self.paused,
+            status,
+            trace: Some(ui::AnalyzerTraceView {
+                frame: trace.frame,
+                seconds: trace.seconds,
+                rows: trace.rows,
+                cols: trace.cols,
+                line_cck: trace.line_cck,
+                visible_start_vpos: trace.visible_start_vpos,
+                visible_lines: trace.visible_lines,
+                display_hpos_start: trace.display_hpos_start,
+                display_hpos_end: trace.display_hpos_end,
+                owner_cck: trace.owner_cck,
+                blitter_busy_cck: trace.blitter_busy_cck,
+                blitter_starve_cck: trace.blitter_starve_cck,
+                partial: trace.partial,
+                selected_vpos,
+                selected_hpos,
+                selected_owner,
+                selected_owner_code,
+                owners,
+                markers,
+            }),
         }
     }
 
@@ -5311,9 +5720,20 @@ impl App {
         self.emu.set_live_audio_suspended(suspended);
     }
 
+    fn resize_for_active_panel(&self) {
+        let Some(window) = self.render.as_ref().map(|r| r.window.clone()) else {
+            return;
+        };
+        let size = LogicalSize::new(FB_WIDTH as f64, WINDOW_PRESENT_HEIGHT as f64);
+        let _ = window.request_inner_size(size);
+    }
+
     fn request_redraw(&self) {
         if let Some(render) = self.render.as_ref() {
             render.window.request_redraw();
+        }
+        if let Some(tool) = self.tool_window.as_ref() {
+            tool.window.request_redraw();
         }
     }
 

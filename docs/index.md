@@ -45,8 +45,8 @@ running in Copperline.
 - [](zorro) -- describing additional Zorro II/III expansion boards in
   TOML metadata files.
 - [](debugger/window), [](debugger/headless), and [](debugger/gdb) -- the
-  interactive debugger window, environment-driven headless debugger, and
-  remote GDB frontend.
+  interactive debugger window, chip-bus frame analyzer, environment-driven
+  headless debugger, and remote GDB frontend.
 - [](internals/architecture) -- how the emulator works inside, for
   contributors.
 
