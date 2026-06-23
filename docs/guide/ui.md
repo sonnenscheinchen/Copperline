@@ -20,7 +20,7 @@ The app shortcut modifier is `Cmd` on macOS and `Alt` on Linux/Windows.
 | `Cmd+G` | `Alt+G` | Capture / release the host mouse (clicking the display also captures) |
 | `Cmd+B` | `Alt+B` | Open the [debugger window](../debugger/window) |
 | `Cmd+J` | `Alt+J` | Cycle joystick input mode: auto, keyboard, gamepad |
-| `Esc` | `Esc` | Close an open menu or overlay window; otherwise passed through to the Amiga |
+| `Esc` | `Esc` | Close an open menu, tool window, or overlay panel; otherwise passed through to the Amiga |
 | `Ctrl+Amiga+Amiga` | `Ctrl+Amiga+Amiga` | Keyboard reset (warm reboot) |
 
 Host modifiers that are passed through to the emulated keyboard map onto
@@ -61,7 +61,7 @@ The status bar (44 pixels below the display) holds, left to right:
   powered; power cold-boots (clears RAM) or powers off back to the test
   screen; reboot is a warm reset.
 
-## Menu and overlay windows
+## Menu, tool windows, and overlay panels
 
 ```{figure} ../images/ui-preview-menu.png
 :alt: The pop-up menu
@@ -70,12 +70,18 @@ The status bar (44 pixels below the display) holds, left to right:
 The pop-up menu opened from the status bar.
 ```
 
-The menu opens overlay windows drawn over the display. While one is open,
-key presses and display clicks stay in the window instead of reaching the
-Amiga; `Esc` closes it.
+The menu opens debugger-style tool windows and smaller overlay panels. Tool
+windows are separate native windows so the emulated display remains visible;
+overlay panels are drawn over the display. While either kind is open, key
+presses and display clicks stay in the UI instead of reaching the Amiga;
+`Esc` closes it.
 
+- **Frame Analyzer...**: pauses the machine and opens a separate diagnostic
+  window showing which chip-bus owner had each Agnus colour clock across
+  the captured frame, including overscan and blanking; see
+  [](../debugger/window.md#frame-analyzer-pane).
 - **Debugger** (also `Cmd+B` on macOS or `Alt+B` on Linux/Windows):
-  pauses the machine and opens the five-tab debugger; see
+  pauses the machine and opens the five-tab debugger in a tool window; see
   [](../debugger/window).
 - **Calibrate Gamepad...**: the guided calibration flow, described below.
 - **Joystick Input** (also `Cmd+J` / `Alt+J`): cycles between automatic
@@ -194,8 +200,9 @@ file format and what exactly is (and is not) captured are specified in
 
 The mouse lives on port 1 and feeds the JOY0DAT counters. Click the display
 (or press `Cmd+G` on macOS or `Alt+G` on Linux/Windows) to capture the host
-mouse; the same shortcut releases it. While an overlay window is open, host
-cursor motion is not fed to the emulated mouse.
+mouse; the same shortcut releases it. While an overlay panel is open, host
+cursor motion is not fed to the emulated mouse. Tool windows likewise keep
+the debugger or analyzer interaction separate from Amiga mouse input.
 
 A USB gamepad drives the emulated port-2 digital joystick: directions
 through JOY1DAT, fire through /FIR1, and a second button through

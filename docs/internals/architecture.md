@@ -56,8 +56,8 @@ src/
     beam.rs         # beam-position event index for the renderer
     bitplane.rs     # event replay + planar->RGBA renderer
     deinterlace.rs  # motion-adaptive deinterlacer
-    window.rs       # winit ApplicationHandler + render worker + pixels surface + status bar
-    ui.rs           # pop-up menu + overlay windows (debugger etc.)
+    window.rs       # winit ApplicationHandler + render worker + main/tool pixels surfaces + status bar
+    ui.rs           # pop-up menu, overlay panels, and debugger/analyzer panel drawing
     font.rs         # 8x8 overlay font
 vendor/m68k/        # vendored m68k CPU core
 tests/              # ignored integration tests (need local ROM assets)

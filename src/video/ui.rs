@@ -51,6 +51,7 @@ const MENU_PAD: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuItem {
+    FrameAnalyzer,
     About,
     Shortcuts,
     Calibration,
@@ -64,7 +65,8 @@ pub enum MenuItem {
     LoadRom,
 }
 
-pub const MENU_ITEMS: [MenuItem; 11] = [
+pub const MENU_ITEMS: [MenuItem; 12] = [
+    MenuItem::FrameAnalyzer,
     MenuItem::Debugger,
     MenuItem::Calibration,
     MenuItem::JoystickInput,
@@ -86,6 +88,7 @@ fn menu_item_label(
     joystick_input_mode: JoystickInputMode,
 ) -> String {
     match item {
+        MenuItem::FrameAnalyzer => "Frame Analyzer...".to_string(),
         MenuItem::About => "About...".to_string(),
         MenuItem::Shortcuts => "Keyboard Shortcuts...".to_string(),
         MenuItem::Calibration => "Calibrate Gamepad...".to_string(),
@@ -201,12 +204,34 @@ impl Default for DebuggerPanel {
     }
 }
 
+/// Interactive state of the frame analyzer pane.
+pub struct FrameAnalyzerPanel {
+    pub selected_vpos: u16,
+    pub selected_hpos: u16,
+}
+
+impl FrameAnalyzerPanel {
+    pub fn new() -> Self {
+        Self {
+            selected_vpos: 0x2C,
+            selected_hpos: 0x28,
+        }
+    }
+}
+
+impl Default for FrameAnalyzerPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// An open overlay sub-window.
 pub enum Panel {
     About,
     Shortcuts,
     Calibration(crate::gamepad::CalibrationSession),
     Debugger(DebuggerPanel),
+    FrameAnalyzer(FrameAnalyzerPanel),
 }
 
 /// Menu/panel state owned by the window.
@@ -233,42 +258,57 @@ impl UiState {
             }
             return menu_rect().contains(pos).then_some(UiControl::PanelBody);
         }
-        let panel = self.panel.as_ref()?;
-        let rect = panel_rect(panel);
-        if close_button_rect(rect).contains(pos) {
-            return Some(UiControl::PanelClose);
-        }
-        match panel {
-            Panel::Calibration(session) => {
-                for (control, button_rect) in cal_button_rects(rect) {
-                    if button_rect.contains(pos) && cal_button_enabled(control, session) {
-                        return Some(control);
-                    }
+        self.panel
+            .as_ref()
+            .and_then(|panel| panel_control_at(panel, pos))
+    }
+}
+
+pub fn panel_control_at(panel: &Panel, pos: (i32, i32)) -> Option<UiControl> {
+    let rect = panel_rect(panel);
+    if close_button_rect(rect).contains(pos) {
+        return Some(UiControl::PanelClose);
+    }
+    match panel {
+        Panel::Calibration(session) => {
+            for (control, button_rect) in cal_button_rects(rect) {
+                if button_rect.contains(pos) && cal_button_enabled(control, session) {
+                    return Some(control);
                 }
             }
-            Panel::Debugger(panel) => {
-                for (index, tab) in DEBUG_TABS.iter().enumerate() {
-                    if debug_tab_rect(rect, index).contains(pos) {
-                        return Some(UiControl::DebugTab(*tab));
-                    }
+        }
+        Panel::Debugger(panel) => {
+            for (index, tab) in DEBUG_TABS.iter().enumerate() {
+                if debug_tab_rect(rect, index).contains(pos) {
+                    return Some(UiControl::DebugTab(*tab));
                 }
-                for (control, button_rect) in debug_button_rects(rect) {
+            }
+            for (control, button_rect) in debug_button_rects(rect) {
+                if button_rect.contains(pos) {
+                    return Some(control);
+                }
+            }
+            if panel.tab == DebugTab::Break {
+                for (control, button_rect) in break_tab_button_rects(rect) {
                     if button_rect.contains(pos) {
                         return Some(control);
                     }
                 }
-                if panel.tab == DebugTab::Break {
-                    for (control, button_rect) in break_tab_button_rects(rect) {
-                        if button_rect.contains(pos) {
-                            return Some(control);
-                        }
-                    }
+            }
+        }
+        Panel::FrameAnalyzer(_) => {
+            if let Some(control) = analyzer_pick_control(rect, pos) {
+                return Some(control);
+            }
+            for (control, button_rect) in analyzer_button_rects(rect) {
+                if button_rect.contains(pos) {
+                    return Some(control);
                 }
             }
-            Panel::About | Panel::Shortcuts => {}
         }
-        rect.contains(pos).then_some(UiControl::PanelBody)
+        Panel::About | Panel::Shortcuts => {}
     }
+    rect.contains(pos).then_some(UiControl::PanelBody)
 }
 
 /// A clickable UI control, used for hit-testing and hover highlights.
@@ -306,6 +346,17 @@ pub enum UiControl {
     DebugRegToggle,
     /// Break tab: remove all breakpoints and watchpoints.
     DebugBreaksClear,
+    /// Frame analyzer: run/pause the machine while keeping the pane open.
+    AnalyzerRun,
+    /// Frame analyzer: step/capture one complete Agnus frame.
+    AnalyzerFrame,
+    /// Frame analyzer: select a slot. Coordinates are normalized to 0..1023
+    /// so window.rs can map them through the current trace dimensions.
+    AnalyzerPick {
+        x: u16,
+        y: u16,
+        scanline: bool,
+    },
 }
 
 fn panel_dims(panel: &Panel) -> (usize, usize) {
@@ -314,6 +365,7 @@ fn panel_dims(panel: &Panel) -> (usize, usize) {
         Panel::Shortcuts => (600, 352),
         Panel::Calibration(_) => (620, 372),
         Panel::Debugger(_) => (684, 520),
+        Panel::FrameAnalyzer(_) => (700, 526),
     }
 }
 
@@ -323,6 +375,7 @@ fn panel_title(panel: &Panel) -> &'static str {
         Panel::Shortcuts => "Keyboard Shortcuts",
         Panel::Calibration(_) => "Gamepad Calibration",
         Panel::Debugger(_) => "Debugger",
+        Panel::FrameAnalyzer(_) => "Frame Analyzer",
     }
 }
 
@@ -438,6 +491,69 @@ fn break_tab_button_rects(rect: Rect) -> [(UiControl, Rect); 4] {
     ]
 }
 
+fn analyzer_raster_rect(rect: Rect) -> Rect {
+    Rect {
+        x: rect.x + 10,
+        y: rect.y + TITLE_H + 44,
+        w: 448,
+        h: 246,
+    }
+}
+
+fn analyzer_scanline_rect(rect: Rect) -> Rect {
+    Rect {
+        x: rect.x + 10,
+        y: rect.y + TITLE_H + 336,
+        w: 512,
+        h: 34,
+    }
+}
+
+fn analyzer_button_rects(rect: Rect) -> [(UiControl, Rect); 2] {
+    let y = rect.y + rect.h - DEBUG_BUTTON_H - 6;
+    [
+        (
+            UiControl::AnalyzerRun,
+            Rect {
+                x: rect.x + 8,
+                y,
+                w: 70,
+                h: DEBUG_BUTTON_H,
+            },
+        ),
+        (
+            UiControl::AnalyzerFrame,
+            Rect {
+                x: rect.x + 84,
+                y,
+                w: 76,
+                h: DEBUG_BUTTON_H,
+            },
+        ),
+    ]
+}
+
+fn analyzer_pick_control(rect: Rect, pos: (i32, i32)) -> Option<UiControl> {
+    for (pick_rect, scanline) in [
+        (analyzer_raster_rect(rect), false),
+        (analyzer_scanline_rect(rect), true),
+    ] {
+        if !pick_rect.contains(pos) {
+            continue;
+        }
+        let x = (pos.0 - pick_rect.x as i32).max(0) as usize;
+        let y = (pos.1 - pick_rect.y as i32).max(0) as usize;
+        let nx = ((x * 1023) / pick_rect.w.max(1)).min(1023) as u16;
+        let ny = ((y * 1023) / pick_rect.h.max(1)).min(1023) as u16;
+        return Some(UiControl::AnalyzerPick {
+            x: nx,
+            y: ny,
+            scanline,
+        });
+    }
+    None
+}
+
 /// Bytes shown per Memory-tab page (16 rows of 16).
 pub const MEM_PAGE_BYTES: u32 = 256;
 
@@ -495,11 +611,63 @@ pub struct DebuggerView {
     pub lines: Vec<DbgLine>,
 }
 
+pub struct AnalyzerMarker {
+    pub vpos: u16,
+    pub hpos: u16,
+    pub label: String,
+}
+
+pub struct AnalyzerTraceView {
+    pub frame: u64,
+    pub seconds: f64,
+    pub rows: usize,
+    pub cols: usize,
+    pub line_cck: u32,
+    pub visible_start_vpos: u32,
+    pub visible_lines: usize,
+    pub display_hpos_start: u32,
+    pub display_hpos_end: u32,
+    pub owner_cck: [u64; 9],
+    pub blitter_busy_cck: u64,
+    pub blitter_starve_cck: [u64; 9],
+    pub partial: bool,
+    pub selected_vpos: usize,
+    pub selected_hpos: usize,
+    pub selected_owner: &'static str,
+    pub selected_owner_code: u8,
+    pub owners: Vec<u8>,
+    pub markers: Vec<AnalyzerMarker>,
+}
+
+impl AnalyzerTraceView {
+    fn owner_code_at(&self, vpos: usize, hpos: usize) -> u8 {
+        if vpos >= self.rows || hpos >= self.cols {
+            return b'.';
+        }
+        self.owners[vpos * self.cols + hpos]
+    }
+
+    fn owner_row(&self, vpos: usize) -> Option<&[u8]> {
+        if vpos >= self.rows || self.cols == 0 {
+            return None;
+        }
+        let start = vpos * self.cols;
+        Some(&self.owners[start..start + self.cols])
+    }
+}
+
+pub struct FrameAnalyzerView {
+    pub running: bool,
+    pub status: String,
+    pub trace: Option<AnalyzerTraceView>,
+}
+
 pub enum PanelViewData {
     About(AboutView),
     Shortcuts,
     Calibration(CalibrationView),
     Debugger(DebuggerView),
+    FrameAnalyzer(Box<FrameAnalyzerView>),
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1164,552 @@ fn draw_debugger(
     }
 }
 
+fn owner_color(code: u8) -> u32 {
+    match code {
+        b'R' => rgba(68, 180, 190),
+        b'B' => rgba(64, 118, 230),
+        b'S' => rgba(212, 84, 220),
+        b'D' => rgba(190, 122, 54),
+        b'A' => rgba(72, 190, 96),
+        b'C' => rgba(238, 206, 72),
+        b'L' => rgba(222, 78, 76),
+        b'P' => rgba(230, 232, 224),
+        _ => rgba(20, 22, 26),
+    }
+}
+
+fn owner_name_for_code(code: u8) -> &'static str {
+    match code {
+        b'R' => "refresh",
+        b'B' => "bitplane",
+        b'S' => "sprite",
+        b'D' => "disk",
+        b'A' => "audio",
+        b'C' => "copper",
+        b'L' => "blitter",
+        b'P' => "cpu",
+        _ => "idle",
+    }
+}
+
+fn draw_outline(frame: &mut [u8], rect: Rect, color: u32, scale: usize) {
+    if rect.w == 0 || rect.h == 0 {
+        return;
+    }
+    fill_rect(
+        frame,
+        scale_rect(
+            Rect {
+                x: rect.x,
+                y: rect.y,
+                w: rect.w,
+                h: 1,
+            },
+            scale,
+        ),
+        color,
+        scale,
+    );
+    fill_rect(
+        frame,
+        scale_rect(
+            Rect {
+                x: rect.x,
+                y: rect.y + rect.h.saturating_sub(1),
+                w: rect.w,
+                h: 1,
+            },
+            scale,
+        ),
+        color,
+        scale,
+    );
+    fill_rect(
+        frame,
+        scale_rect(
+            Rect {
+                x: rect.x,
+                y: rect.y,
+                w: 1,
+                h: rect.h,
+            },
+            scale,
+        ),
+        color,
+        scale,
+    );
+    fill_rect(
+        frame,
+        scale_rect(
+            Rect {
+                x: rect.x + rect.w.saturating_sub(1),
+                y: rect.y,
+                w: 1,
+                h: rect.h,
+            },
+            scale,
+        ),
+        color,
+        scale,
+    );
+}
+
+fn trace_x(rect: Rect, hpos: usize, cols: usize) -> usize {
+    rect.x + (hpos.min(cols.saturating_sub(1)) * rect.w / cols.max(1))
+}
+
+fn trace_y(rect: Rect, vpos: usize, rows: usize) -> usize {
+    rect.y + (vpos.min(rows.saturating_sub(1)) * rect.h / rows.max(1))
+}
+
+fn draw_owner_heatmap(frame: &mut [u8], rect: Rect, trace: &AnalyzerTraceView, scale: usize) {
+    fill_rect(frame, scale_rect(rect, scale), rgba(10, 12, 14), scale);
+    for y in 0..rect.h {
+        let vpos = y * trace.rows / rect.h.max(1);
+        for x in 0..rect.w {
+            let hpos = x * trace.cols / rect.w.max(1);
+            let color = owner_color(trace.owner_code_at(vpos, hpos));
+            fill_rect(
+                frame,
+                scale_rect(
+                    Rect {
+                        x: rect.x + x,
+                        y: rect.y + y,
+                        w: 1,
+                        h: 1,
+                    },
+                    scale,
+                ),
+                color,
+                scale,
+            );
+        }
+    }
+
+    let visible_top = trace_y(rect, trace.visible_start_vpos as usize, trace.rows);
+    let visible_bottom = trace_y(
+        rect,
+        (trace.visible_start_vpos as usize)
+            .saturating_add(trace.visible_lines)
+            .min(trace.rows.saturating_sub(1)),
+        trace.rows,
+    )
+    .max(visible_top + 1);
+    let display_left = trace_x(rect, trace.display_hpos_start as usize, trace.cols);
+    let display_right =
+        trace_x(rect, trace.display_hpos_end as usize, trace.cols).max(display_left + 1);
+    draw_outline(
+        frame,
+        Rect {
+            x: display_left,
+            y: visible_top,
+            w: display_right.saturating_sub(display_left).max(1),
+            h: visible_bottom.saturating_sub(visible_top).max(1),
+        },
+        rgba(238, 238, 232),
+        scale,
+    );
+
+    for marker in trace.markers.iter().take(80) {
+        let x = trace_x(rect, marker.hpos as usize, trace.cols);
+        let y = trace_y(rect, marker.vpos as usize, trace.rows);
+        fill_rect(
+            frame,
+            scale_rect(
+                Rect {
+                    x: x.saturating_sub(1),
+                    y,
+                    w: 3,
+                    h: 1,
+                },
+                scale,
+            ),
+            PANEL_TEXT_ACCENT,
+            scale,
+        );
+        fill_rect(
+            frame,
+            scale_rect(
+                Rect {
+                    x,
+                    y: y.saturating_sub(1),
+                    w: 1,
+                    h: 3,
+                },
+                scale,
+            ),
+            PANEL_TEXT_ACCENT,
+            scale,
+        );
+    }
+
+    let sx = trace_x(rect, trace.selected_hpos, trace.cols);
+    let sy = trace_y(rect, trace.selected_vpos, trace.rows);
+    draw_outline(
+        frame,
+        Rect {
+            x: sx.saturating_sub(3),
+            y: sy.saturating_sub(3),
+            w: 7,
+            h: 7,
+        },
+        PANEL_TEXT_HILIGHT,
+        scale,
+    );
+    draw_outline(frame, rect, BUTTON_EDGE_LIGHT, scale);
+}
+
+fn draw_scanline_strip(frame: &mut [u8], rect: Rect, trace: &AnalyzerTraceView, scale: usize) {
+    fill_rect(frame, scale_rect(rect, scale), rgba(10, 12, 14), scale);
+    if let Some(row) = trace.owner_row(trace.selected_vpos) {
+        for x in 0..rect.w {
+            let hpos = x * trace.cols / rect.w.max(1);
+            let color = owner_color(row[hpos.min(row.len().saturating_sub(1))]);
+            fill_rect(
+                frame,
+                scale_rect(
+                    Rect {
+                        x: rect.x + x,
+                        y: rect.y + 8,
+                        w: 1,
+                        h: rect.h.saturating_sub(14),
+                    },
+                    scale,
+                ),
+                color,
+                scale,
+            );
+        }
+    }
+    let sx = trace_x(rect, trace.selected_hpos, trace.cols);
+    fill_rect(
+        frame,
+        scale_rect(
+            Rect {
+                x: sx,
+                y: rect.y,
+                w: 1,
+                h: rect.h,
+            },
+            scale,
+        ),
+        PANEL_TEXT_HILIGHT,
+        scale,
+    );
+    draw_outline(frame, rect, BUTTON_EDGE_LIGHT, scale);
+}
+
+fn draw_owner_counters(
+    frame: &mut [u8],
+    x: usize,
+    mut y: usize,
+    trace: &AnalyzerTraceView,
+    scale: usize,
+) {
+    let total: u64 = trace.owner_cck.iter().sum();
+    draw_panel_text(frame, x, y, "Owner cck", PANEL_TEXT_HILIGHT, 1, scale);
+    y += 12;
+    for (idx, name) in crate::bus::CHIP_BUS_OWNER_NAMES.iter().enumerate() {
+        let cck = trace.owner_cck[idx];
+        if cck == 0 {
+            continue;
+        }
+        let pct = if total == 0 {
+            0.0
+        } else {
+            cck as f64 * 100.0 / total as f64
+        };
+        let code = match idx {
+            0 => b'R',
+            1 => b'B',
+            2 => b'S',
+            3 => b'D',
+            4 => b'A',
+            5 => b'C',
+            6 => b'L',
+            7 => b'P',
+            _ => b'.',
+        };
+        fill_rect(
+            frame,
+            scale_rect(
+                Rect {
+                    x,
+                    y: y + 2,
+                    w: 8,
+                    h: 8,
+                },
+                scale,
+            ),
+            owner_color(code),
+            scale,
+        );
+        draw_panel_text(
+            frame,
+            x + 14,
+            y,
+            &format!("{name:<8} {cck:>5} {pct:>4.1}%"),
+            PANEL_TEXT,
+            1,
+            scale,
+        );
+        y += 12;
+    }
+    if trace.blitter_busy_cck != 0 {
+        y += 4;
+        let blit_grant = trace.owner_cck[6];
+        let pct = blit_grant as f64 * 100.0 / trace.blitter_busy_cck as f64;
+        draw_panel_text(
+            frame,
+            x,
+            y,
+            &format!("blitter grant {pct:>4.1}%"),
+            PANEL_TEXT_ACCENT,
+            1,
+            scale,
+        );
+        y += 12;
+        let total_starve: u64 = trace.blitter_starve_cck.iter().sum();
+        draw_panel_text(
+            frame,
+            x,
+            y,
+            &format!("blitter wait {total_starve:>5}"),
+            PANEL_TEXT_ACCENT,
+            1,
+            scale,
+        );
+        y += 12;
+        for (idx, name) in crate::bus::CHIP_BUS_OWNER_NAMES.iter().enumerate() {
+            let cck = trace.blitter_starve_cck[idx];
+            if cck == 0 {
+                continue;
+            }
+            draw_panel_text(
+                frame,
+                x,
+                y,
+                &format!("{name:<8} {cck:>5}"),
+                PANEL_TEXT_DIM,
+                1,
+                scale,
+            );
+            y += 12;
+        }
+    }
+}
+
+fn draw_frame_analyzer(
+    frame: &mut [u8],
+    rect: Rect,
+    _panel: &FrameAnalyzerPanel,
+    view: &FrameAnalyzerView,
+    hover: Option<UiControl>,
+    scale: usize,
+) {
+    let status_w = view.status.chars().count() * font::GLYPH_W;
+    draw_panel_text(
+        frame,
+        rect.x + rect.w - TITLE_H - 8 - status_w.min(rect.w.saturating_sub(TITLE_H + 16)),
+        rect.y + (TITLE_H - 8) / 2,
+        &view.status,
+        PANEL_TITLE_TEXT,
+        1,
+        scale,
+    );
+
+    let Some(trace) = &view.trace else {
+        let mut y = rect.y + TITLE_H + 36;
+        for line in [
+            "No chip-bus trace captured yet.",
+            "Press Frame to record one full Agnus frame, or Run to collect live frames.",
+            "The analyzer records hpos/vpos ownership, including overscan and blanking.",
+        ] {
+            draw_panel_text(frame, rect.x + 24, y, line, PANEL_TEXT, 1, scale);
+            y += 16;
+        }
+        for (control, button_rect) in analyzer_button_rects(rect) {
+            let label = match control {
+                UiControl::AnalyzerRun if view.running => "Pause",
+                UiControl::AnalyzerRun => "Run",
+                _ => "Frame",
+            };
+            draw_text_button(
+                frame,
+                button_rect,
+                label,
+                true,
+                hover == Some(control),
+                scale,
+            );
+        }
+        return;
+    };
+
+    let header = format!(
+        "frame {}  {:.3}s  {} lines x {} cck{}{}",
+        trace.frame,
+        trace.seconds,
+        trace.rows,
+        trace.line_cck,
+        if trace.cols as u32 != trace.line_cck {
+            " sampled"
+        } else {
+            ""
+        },
+        if trace.partial { "  partial" } else { "" }
+    );
+    draw_panel_text(
+        frame,
+        rect.x + 10,
+        rect.y + TITLE_H + 10,
+        &header,
+        PANEL_TEXT,
+        1,
+        scale,
+    );
+    draw_panel_text(
+        frame,
+        rect.x + 10,
+        rect.y + TITLE_H + 24,
+        "full raster: x=hpos colour clocks, y=vpos beam lines; white box is captured display",
+        PANEL_TEXT_DIM,
+        1,
+        scale,
+    );
+
+    let raster = analyzer_raster_rect(rect);
+    draw_owner_heatmap(frame, raster, trace, scale);
+    let counters_x = raster.x + raster.w + 16;
+    draw_owner_counters(frame, counters_x, raster.y, trace, scale);
+
+    let selected = format!(
+        "selected v={:03} h={:03}  owner={} ({})",
+        trace.selected_vpos,
+        trace.selected_hpos,
+        trace.selected_owner,
+        trace.selected_owner_code as char
+    );
+    draw_panel_text(
+        frame,
+        rect.x + 10,
+        raster.y + raster.h + 10,
+        &selected,
+        PANEL_TEXT_HILIGHT,
+        1,
+        scale,
+    );
+    if let Some(marker) = trace.markers.iter().find(|m| {
+        usize::from(m.vpos) == trace.selected_vpos && usize::from(m.hpos) == trace.selected_hpos
+    }) {
+        draw_panel_text(
+            frame,
+            rect.x + 10,
+            raster.y + raster.h + 22,
+            &marker.label,
+            PANEL_TEXT_ACCENT,
+            1,
+            scale,
+        );
+    }
+
+    let scanline = analyzer_scanline_rect(rect);
+    draw_panel_text(
+        frame,
+        scanline.x,
+        scanline.y - 14,
+        "selected scanline",
+        PANEL_TEXT_DIM,
+        1,
+        scale,
+    );
+    draw_scanline_strip(frame, scanline, trace, scale);
+
+    let mut y = scanline.y + scanline.h + 14;
+    draw_panel_text(frame, rect.x + 10, y, "Legend", PANEL_TEXT_DIM, 1, scale);
+    let mut x = rect.x + 66;
+    for code in [b'R', b'B', b'S', b'D', b'A', b'C', b'L', b'P', b'.'] {
+        fill_rect(
+            frame,
+            scale_rect(
+                Rect {
+                    x,
+                    y: y + 2,
+                    w: 8,
+                    h: 8,
+                },
+                scale,
+            ),
+            owner_color(code),
+            scale,
+        );
+        draw_panel_text(
+            frame,
+            x + 12,
+            y,
+            owner_name_for_code(code),
+            PANEL_TEXT,
+            1,
+            scale,
+        );
+        x += if code == b'.' { 54 } else { 82 };
+    }
+    y += 18;
+    let marker_text = format!("register markers shown: {}", trace.markers.len().min(80));
+    draw_panel_text(
+        frame,
+        rect.x + 10,
+        y,
+        &marker_text,
+        PANEL_TEXT_DIM,
+        1,
+        scale,
+    );
+
+    for (control, button_rect) in analyzer_button_rects(rect) {
+        let label = match control {
+            UiControl::AnalyzerRun if view.running => "Pause",
+            UiControl::AnalyzerRun => "Run",
+            _ => "Frame",
+        };
+        draw_text_button(
+            frame,
+            button_rect,
+            label,
+            true,
+            hover == Some(control),
+            scale,
+        );
+    }
+}
+
+pub fn draw_panel_layer(
+    frame: &mut [u8],
+    texture_scale: usize,
+    panel: &Panel,
+    hover: Option<UiControl>,
+    data: Option<&PanelViewData>,
+) {
+    draw_panel_chrome(frame, panel, hover, texture_scale);
+    let rect = panel_rect(panel);
+    match (panel, data) {
+        (Panel::About, Some(PanelViewData::About(view))) => {
+            draw_about(frame, rect, view, texture_scale)
+        }
+        (Panel::Shortcuts, _) => draw_shortcuts(frame, rect, texture_scale),
+        (Panel::Calibration(session), Some(PanelViewData::Calibration(view))) => {
+            draw_calibration(frame, rect, view, hover, session, texture_scale)
+        }
+        (Panel::Debugger(panel_state), Some(PanelViewData::Debugger(view))) => {
+            draw_debugger(frame, rect, panel_state, view, hover, texture_scale)
+        }
+        (Panel::FrameAnalyzer(panel_state), Some(PanelViewData::FrameAnalyzer(view))) => {
+            draw_frame_analyzer(frame, rect, panel_state, view, hover, texture_scale)
+        }
+        _ => {}
+    }
+}
+
 /// Draw the whole UI layer: pop-up menu and/or the open panel. Drawn after
 /// the status bar and OSD so it sits on top of everything.
 pub fn draw(
@@ -1010,21 +1724,7 @@ pub fn draw(
     joystick_input_mode: JoystickInputMode,
 ) {
     if let Some(panel) = &ui.panel {
-        draw_panel_chrome(frame, panel, hover, texture_scale);
-        let rect = panel_rect(panel);
-        match (panel, data) {
-            (Panel::About, Some(PanelViewData::About(view))) => {
-                draw_about(frame, rect, view, texture_scale)
-            }
-            (Panel::Shortcuts, _) => draw_shortcuts(frame, rect, texture_scale),
-            (Panel::Calibration(session), Some(PanelViewData::Calibration(view))) => {
-                draw_calibration(frame, rect, view, hover, session, texture_scale)
-            }
-            (Panel::Debugger(panel_state), Some(PanelViewData::Debugger(view))) => {
-                draw_debugger(frame, rect, panel_state, view, hover, texture_scale)
-            }
-            _ => {}
-        }
+        draw_panel_layer(frame, texture_scale, panel, hover, data);
     }
     if ui.menu_open {
         draw_menu(
@@ -1161,8 +1861,11 @@ mod tests {
         };
         let first = menu_item_rect(0);
         let pos = (first.x as i32 + 4, first.y as i32 + 4);
-        assert_eq!(ui.control_at(pos), Some(UiControl::MenuItem(MENU_ITEMS[0])));
-        let joystick = menu_item_rect(2);
+        assert_eq!(
+            ui.control_at(pos),
+            Some(UiControl::MenuItem(MenuItem::FrameAnalyzer))
+        );
+        let joystick = menu_item_rect(3);
         let pos = (joystick.x as i32 + 4, joystick.y as i32 + 4);
         assert_eq!(
             ui.control_at(pos),
@@ -1170,6 +1873,42 @@ mod tests {
         );
         // Outside the menu: nothing (the click closes the menu).
         assert_eq!(ui.control_at((0, 0)), None);
+    }
+
+    #[test]
+    fn frame_analyzer_controls_hit_test() {
+        let ui = UiState {
+            menu_open: false,
+            panel: Some(Panel::FrameAnalyzer(FrameAnalyzerPanel::new())),
+        };
+        let rect = panel_rect(ui.panel.as_ref().unwrap());
+        let raster = analyzer_raster_rect(rect);
+        assert_eq!(
+            ui.control_at((raster.x as i32 + raster.w as i32 / 2, raster.y as i32 + 2)),
+            Some(UiControl::AnalyzerPick {
+                x: 511,
+                y: 8,
+                scanline: false,
+            })
+        );
+        let scanline = analyzer_scanline_rect(rect);
+        assert_eq!(
+            ui.control_at((
+                scanline.x as i32 + scanline.w as i32 / 2,
+                scanline.y as i32 + 2
+            )),
+            Some(UiControl::AnalyzerPick {
+                x: 511,
+                y: 60,
+                scanline: true,
+            })
+        );
+        let (control, button) = analyzer_button_rects(rect)[1];
+        assert_eq!(control, UiControl::AnalyzerFrame);
+        assert_eq!(
+            ui.control_at((button.x as i32 + 2, button.y as i32 + 2)),
+            Some(UiControl::AnalyzerFrame)
+        );
     }
 
     #[test]

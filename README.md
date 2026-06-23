@@ -49,9 +49,10 @@ against real hardware.
 - **Peripherals**: a bit-timed keyboard (6500/1 MCU), mouse, USB gamepad
   (via the pure-Rust `gilrs`, no SDL2), 4-channel Paula audio, floppy
   (ADF / ADZ / DMS, read-only SCP), Gayle IDE, A2091 SCSI, and CDTV/CD32 CD.
-- **Tooling**: an in-window debugger, remote GDB support, deterministic save
-  states, input recording/replay, and headless screenshot/frame-dump capture
-  -- the deterministic core makes every replay byte-identical.
+- **Tooling**: an in-window debugger, an interactive chip-bus frame
+  analyzer, remote GDB support, deterministic save states, input
+  recording/replay, and headless screenshot/frame-dump capture -- the
+  deterministic core makes every replay byte-identical.
 
 ## Requirements
 
@@ -140,8 +141,8 @@ Essential shortcuts use `Cmd` on macOS and `Alt` on Linux/Windows:
 closes an open menu/window), `Cmd+S` / `Alt+S` saves a screenshot, and
 `Cmd+B` / `Alt+B` opens the debugger. `Cmd+J` / `Alt+J` cycles joystick
 input between automatic selection, keyboard emulation, and gamepad-only.
-The status bar, pop-up menu, overlay windows (debugger, gamepad
-calibration, save/load state, input recording), and the full shortcut list
+The status bar, pop-up menu, tool windows (debugger and frame analyzer),
+overlay panels, save/load state, input recording, and the full shortcut list
 are documented in the
 [user guide](docs/guide/ui.md).
 
