@@ -72,9 +72,10 @@ The pop-up menu opened from the status bar.
 
 The menu opens debugger-style tool windows and smaller overlay panels. Tool
 windows are separate native windows so the emulated display remains visible;
-overlay panels are drawn over the display. While either kind is open, key
-presses and display clicks stay in the UI instead of reaching the Amiga;
-`Esc` closes it.
+the debugger and frame analyzer can be open at the same time. Overlay panels
+are drawn over the display. While either kind is open, key presses and display
+clicks stay in the UI instead of reaching the Amiga; `Esc` closes the focused
+tool window or overlay.
 
 - **Frame Analyzer...**: pauses the machine and opens a separate diagnostic
   window showing which chip-bus owner had each Agnus colour clock across
