@@ -140,16 +140,21 @@ check is applied by `Copper::step_eligible_slot`, the single primitive
 shared by the live bus path and the blitter-deadline predictor's cloned
 simulation, so prediction and execution cannot drift apart.
 
-For the OCS low-res renderer, a same-line `COLORxx` write at beam `hpos`
-starts affecting pixels at `(hpos - $38) * 4` (`COLOR_WRITE_HPOS_FB0` in
+For the low-res renderer, a same-line `COLORxx` write at beam `hpos`
+starts affecting pixels at `(hpos - $34) * 4` (`COLOR_WRITE_HPOS_FB0` in
 `src/video/bitplane.rs`); beam-timed placement is anchored at
 `COPPER_WAIT_HPOS_FB0` ($28), and bitplane-control writes add the
-fetch-to-display pipeline offset (`BITPLANE_CONTROL_PIPELINE_FB`). AGA
-BPLCON4's sprite palette-base byte uses Lisa's earlier sprite colour-lookup
-path at `(hpos - $3A) * 4` (`SPRITE_PALETTE_CONTROL_HPOS_FB0`). Because
-colour MOVEs are spaced four colour clocks apart, a gradient changes
-colour every 8 lores pixels, matching hardware rather than the previous
-(too-fine) 4-pixel spacing. Tests:
+fetch-to-display pipeline offset (`BITPLANE_CONTROL_PIPELINE_FB`). This
+anchor keeps a copper colour change aligned with the bitplane pixels it
+recolours: Denise (and MiniMig, which adds a one-lores-pixel bitplane delay
+"for alignment of bitplane data and copper colour change") emits the new
+colour in the same beam slot as those pixels. OCS Denise (8362) and ECS
+Denise (8373) share this timing; the only OCS/ECS colour-path difference is
+the OCS 12-bit value mask. (AGA Lisa delays colour changes by one hires
+pixel relative to OCS/ECS per WinUAE; that sub-colour-clock offset is not
+yet modelled.) AGA BPLCON4's sprite palette-base byte uses Lisa's earlier
+sprite colour-lookup path at `(hpos - $36) * 4`
+(`SPRITE_PALETTE_CONTROL_HPOS_FB0`). Tests:
 `copper_move_writes_visible_registers_on_second_dma_slot`,
 `copper_move_spends_four_color_clocks_leaving_alternate_cycles_free`.
 

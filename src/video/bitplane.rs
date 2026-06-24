@@ -56,17 +56,25 @@ const DIW_HSTART_FETCH_REFERENCE_HIRES: i32 = 0x83;
 // clocks in lockstep with DIW_HSTART_FB0 (16 lo-res pixels) so register writes
 // and bitplane pixels still register against each other after widening.
 const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
-/// COLORxx writes feed Denise's final colour-selection/output path, not the
-/// upstream bitplane shifter. Treat the left output edge as the first visible
-/// colour-register position rather than the earlier bitplane-control domain;
-/// in low-res copper gradients, writes four colour clocks apart advance by one
-/// 16-pixel colour cell.
-const COLOR_WRITE_HPOS_FB0: i32 = 0x38;
+/// COLORxx writes feed Denise's final colour-selection/output path. Denise
+/// keeps copper/CPU colour-register changes phase-aligned with the bitplane
+/// serializer output: a colour write and the bitplane pixels it recolours reach
+/// the DAC together. (MiniMig models this explicitly with a one-lores-pixel
+/// bitplane delay added "for alignment of bitplane data and copper colour
+/// change"; WinUAE applies colour changes in the same beam slot as the
+/// bitplane pixels.) OCS Denise (8362) and ECS Denise (8373) share this timing
+/// exactly -- the only OCS/ECS colour-path difference is the OCS 12-bit value
+/// mask -- so this anchor is revision-independent across OCS/ECS.
+///
+/// TODO: AGA Lisa delays colour changes by one hires pixel relative to
+/// OCS/ECS (WinUAE: "AGA color changes are 1 hires pixel delayed"). That
+/// sub-colour-clock offset is not yet modelled here.
+const COLOR_WRITE_HPOS_FB0: i32 = 0x34;
 /// AGA BPLCON4's low sprite-palette byte follows Lisa's sprite colour lookup
 /// path, which reaches sprite output earlier than ordinary COLORxx palette
 /// writes. Keep it separate from COLOR replay so copper palette gradients stay
 /// in the Denise palette-output phase on OCS/ECS.
-const SPRITE_PALETTE_CONTROL_HPOS_FB0: i32 = 0x3A;
+const SPRITE_PALETTE_CONTROL_HPOS_FB0: i32 = 0x36;
 /// SPRxPOS writes update the Denise horizontal comparator seven CCK ahead of
 /// the normal register/output beam domain. Manual sprite replays use this
 /// earlier domain so adjacent position writes can abut at their programmed
@@ -7404,7 +7412,7 @@ mod tests {
         );
         assert_eq!(
             beam_to_framebuffer_x_unclamped(COLOR_WRITE_HPOS_FB0 as u32),
-            64
+            48
         );
         assert_eq!(
             sprite_palette_control_framebuffer_x(SPRITE_PALETTE_CONTROL_HPOS_FB0 as u32),
