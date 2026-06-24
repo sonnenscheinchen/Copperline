@@ -9351,16 +9351,12 @@ fn live_sprite_visible_x_range_for_control(
         return Some((x_start, x_stop));
     }
     let display_enable_x = display_enable_x?;
-    if beam_y < 0
-        || !display_window_contains_vpos(
-            control.diwstrt,
-            control.diwstop,
-            control.diwhigh,
-            beam_y as u32,
-        )
-    {
+    if beam_y < 0 {
         return None;
     }
+    // A manual BPL1DAT write records `display_enable_x` for this scanline;
+    // that is enough to make OCS/ECS sprites active vertically, while DIW
+    // still clips the horizontal span.
     let (window_x_start, window_x_stop) =
         live_display_window_x(control.diwstrt, control.diwstop, control.diwhigh);
     let x_start = x_start.max(display_enable_x).max(window_x_start);
@@ -9387,12 +9383,10 @@ fn live_sprite_pixel_inside_display_window(
     if display_enable_x.is_none_or(|enable_x| framebuffer_x < enable_x) {
         return false;
     }
-    display_window_contains_vpos(
-        control.diwstrt,
-        control.diwstop,
-        control.diwhigh,
-        beam_y as u32,
-    ) && live_display_window_contains_x(
+    // See `live_sprite_visible_x_range_for_control`: display_enable_x carries
+    // the per-line BPL1DAT/DMA latch, so do not apply a separate DIW vertical
+    // test here.
+    live_display_window_contains_x(
         control.diwstrt,
         control.diwstop,
         control.diwhigh,
@@ -16679,6 +16673,67 @@ mod tests {
                 0,
                 2,
                 None,
+                0,
+            ) & (1 << 9),
+            1 << 9
+        );
+    }
+
+    #[test]
+    fn manual_bpl1dat_display_enable_allows_live_sprite_clxdat_on_vertically_closed_diw_line() {
+        let control = LiveCollisionControl::from_current(
+            AgnusRevision::Ocs,
+            0x1000,
+            0,
+            0,
+            0,
+            ((RENDER_VISIBLE_START_VPOS as u16 + 10) << 8) | RENDER_DIW_HSTART_FB0 as u16,
+            ((RENDER_VISIBLE_START_VPOS as u16 + 20) << 8) | 0x00C1,
+            DiwHigh::ocs_implicit(),
+            0x0038,
+            [0; 8],
+        );
+        let replay = LiveCollisionLineReplay {
+            line_start: control,
+            segments: Vec::new(),
+        };
+        let sources = [
+            LiveSpriteCollisionSource {
+                group: 0,
+                hstart: RENDER_DIW_HSTART_FB0,
+                hsub_70ns: false,
+                words: [0x8000, 0, 0, 0],
+                requires_odd_enable: false,
+            },
+            LiveSpriteCollisionSource {
+                group: 1,
+                hstart: RENDER_DIW_HSTART_FB0,
+                hsub_70ns: false,
+                words: [0x8000, 0, 0, 0],
+                requires_odd_enable: false,
+            },
+        ];
+
+        assert_eq!(
+            live_sprite_sprite_collision_bits(
+                &sources,
+                &replay,
+                RENDER_VISIBLE_START_VPOS as i32,
+                0,
+                2,
+                None,
+                0,
+            ) & (1 << 9),
+            0
+        );
+        assert_eq!(
+            live_sprite_sprite_collision_bits(
+                &sources,
+                &replay,
+                RENDER_VISIBLE_START_VPOS as i32,
+                0,
+                2,
+                Some(0),
                 0,
             ) & (1 << 9),
             1 << 9

@@ -6118,20 +6118,25 @@ fn sprite_display_enable_x_for_y(
 
 fn sprite_pixel_inside_display_window(
     control: ControlState,
-    y: usize,
+    _y: usize,
     x: usize,
-    visible_line0: i32,
+    _visible_line0: i32,
     display_enable_x: Option<usize>,
 ) -> bool {
     if control.border_sprite_enabled() {
         return true;
     }
-    if display_enable_x.is_none_or(|enable_x| x < enable_x) {
+    let Some(enable_x) = display_enable_x else {
+        return false;
+    };
+    if x < enable_x {
         return false;
     }
-    if !control.display_window_contains_line(y, visible_line0) {
-        return false;
-    }
+    // OCS/ECS Denise starts sprite display for this scanline after the first
+    // BPL1DAT load, whether that load came from bitplane DMA or a manual
+    // copper/CPU write. DIW still clips horizontally, but a manual BPL1DAT
+    // write can make sprites visible on lines where the vertical bitplane
+    // window is closed.
     let (x_start, x_stop) = control.display_window_x();
     x >= x_start && x < x_stop
 }
@@ -9697,6 +9702,89 @@ mod tests {
         assert_eq!(fb[0], rgb12_to_rgba8(0));
         assert_eq!(fb[3], rgb12_to_rgba8(0));
         assert_eq!(fb[4], rgb12_to_rgba8(0x0F00));
+    }
+
+    #[test]
+    fn manual_bpl1dat_display_enable_allows_sprites_on_vertically_closed_diw_line() {
+        let mut state = RenderState {
+            dmacon: DMACON_DMAEN | DMACON_SPREN,
+            diwstrt: (((PAL_VISIBLE_LINE0 + 10) as u16) << 8) | DIW_HSTART_FB0 as u16,
+            diwstop: (((PAL_VISIBLE_LINE0 + 20) as u16) << 8) | 0x00C1,
+            ..blank_state()
+        };
+        state.palette.write_ocs(17, 0x0F00);
+        let ram = vec![0; 64];
+        let base_palettes = [state.palette; FB_HEIGHT];
+        let palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let base_controls = [ControlState::from_render_state(&state); FB_HEIGHT];
+        let control_segments = vec![Vec::new(); FB_HEIGHT];
+        let playfield_mask = vec![0u8; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let captured = [CapturedSpriteLine {
+            sprite: 0,
+            hstart: DIW_HSTART_FB0,
+            hsub_70ns: false,
+            beam_y: PAL_VISIBLE_LINE0,
+            data: 0x8000,
+            datb: 0,
+            attached: false,
+            data_ext: [0; 3],
+            datb_ext: [0; 3],
+            width_words: 1,
+        }];
+
+        let mut fb = vec![rgb12_to_rgba8(0); FB_PIXELS];
+        let display_disabled = [None; FB_HEIGHT];
+        render_sprites_with_manual_lines_and_writes(
+            &state,
+            &ram,
+            &mut fb,
+            SpriteClip {
+                x_start: 0,
+                x_stop: FB_WIDTH,
+                y_start: 0,
+                y_stop: FB_HEIGHT,
+            },
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+            &display_disabled,
+            &playfield_mask,
+            &mut collision_pixels,
+            &captured,
+            true,
+            None,
+            PAL_VISIBLE_LINE0,
+        );
+        assert_eq!(fb[0], rgb12_to_rgba8(0));
+
+        let mut fb = vec![rgb12_to_rgba8(0); FB_PIXELS];
+        let mut display_enabled = [None; FB_HEIGHT];
+        display_enabled[0] = Some(0);
+        render_sprites_with_manual_lines_and_writes(
+            &state,
+            &ram,
+            &mut fb,
+            SpriteClip {
+                x_start: 0,
+                x_stop: FB_WIDTH,
+                y_start: 0,
+                y_stop: FB_HEIGHT,
+            },
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+            &display_enabled,
+            &playfield_mask,
+            &mut collision_pixels,
+            &captured,
+            true,
+            None,
+            PAL_VISIBLE_LINE0,
+        );
+        assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
     }
 
     #[test]
