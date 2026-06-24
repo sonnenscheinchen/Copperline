@@ -2330,26 +2330,67 @@ fn line_display_window_bounds(
     visible_line0: i32,
 ) -> Option<(usize, usize)> {
     let mut bounds = None;
-    if base_control.display_window_contains_line(line, visible_line0) {
-        bounds = Some(base_control.display_window_x());
-    }
+    let mut control = base_control;
+    let mut run_start = 0usize;
     for segment in control_segments {
-        if !segment
-            .control
-            .display_window_contains_line(line, visible_line0)
-        {
-            continue;
-        }
-        let (segment_x_start, segment_x_stop) = segment.control.display_window_x();
-        match &mut bounds {
-            Some((x_start, x_stop)) => {
-                *x_start = (*x_start).min(segment_x_start);
-                *x_stop = (*x_stop).max(segment_x_stop);
+        let run_stop = segment.x.min(FB_WIDTH);
+        merge_display_window_run_bounds(
+            &mut bounds,
+            control,
+            line,
+            visible_line0,
+            run_start,
+            run_stop,
+        );
+        control = segment.control;
+        run_start = run_stop;
+    }
+    merge_display_window_run_bounds(
+        &mut bounds,
+        control,
+        line,
+        visible_line0,
+        run_start,
+        FB_WIDTH,
+    );
+    bounds.filter(|(x_start, x_stop)| x_start < x_stop)
+}
+
+fn merge_display_window_run_bounds(
+    bounds: &mut Option<(usize, usize)>,
+    control: ControlState,
+    line: usize,
+    visible_line0: i32,
+    run_start: usize,
+    run_stop: usize,
+) {
+    if run_start >= run_stop || !control.display_window_contains_line(line, visible_line0) {
+        return;
+    }
+    let (window_x_start, window_x_stop) = control.display_window_x();
+    if window_x_start >= run_start && window_x_start <= run_stop {
+        // The horizontal DIW start comparator has fired while this control was
+        // active, so it establishes the shifter origin even if a same-line
+        // write clips all visible pixels before the next control run.
+        match bounds {
+            Some((bounds_start, _)) => {
+                *bounds_start = (*bounds_start).min(window_x_start);
             }
-            None => bounds = Some((segment_x_start, segment_x_stop)),
+            None => *bounds = Some((window_x_start, window_x_start)),
         }
     }
-    bounds.filter(|(x_start, x_stop)| x_start < x_stop)
+    let x_start = window_x_start.max(run_start);
+    let x_stop = window_x_stop.min(run_stop);
+    if x_start >= x_stop {
+        return;
+    }
+    match bounds {
+        Some((bounds_start, bounds_stop)) => {
+            *bounds_start = (*bounds_start).min(x_start);
+            *bounds_stop = (*bounds_stop).max(x_stop);
+        }
+        None => *bounds = Some((x_start, x_stop)),
+    }
 }
 
 fn line_max_display_planes(
@@ -7304,6 +7345,28 @@ mod tests {
 
         assert_eq!(state.diw_v_start(), 0x02C);
         assert_eq!(state.diw_v_stop(), 0x12D);
+    }
+
+    #[test]
+    fn line_start_diw_write_replaces_previous_horizontal_display_bounds() {
+        let base = ControlState {
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16,
+            diwstop: (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | 0x00C1,
+            ..ControlState::default()
+        };
+        let narrowed = ControlState {
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | 0x00A0,
+            ..base
+        };
+        let segments = [ControlSegment {
+            x: 0,
+            control: narrowed,
+        }];
+
+        assert_eq!(
+            line_display_window_bounds(base, &segments, 0, PAL_VISIBLE_LINE0),
+            Some(narrowed.display_window_x())
+        );
     }
 
     #[test]
