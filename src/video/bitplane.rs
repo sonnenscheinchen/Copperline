@@ -2146,19 +2146,11 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
 }
 
 fn cpu_palette_writes_are_beam_timed(events: &[BeamRegisterWrite], visible_line0: i32) -> bool {
-    let mut visible_cpu_palette_writes = 0usize;
-    for event in events {
-        if matches!(event.source, BeamWriteSource::Cpu)
+    events.iter().any(|event| {
+        matches!(event.source, BeamWriteSource::Cpu)
             && matches!(event.offset & 0x01FE, 0x180..=0x1BE)
             && (event.vpos as i32) > visible_line0
-        {
-            visible_cpu_palette_writes += 1;
-            if visible_cpu_palette_writes >= 64 {
-                return true;
-            }
-        }
-    }
-    false
+    })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -7781,7 +7773,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_visible_cpu_palette_writes_seed_frame_base_without_beam_segments() {
+    fn visible_cpu_palette_write_replays_by_beam_position() {
         let mut state = blank_state();
         let mut base_palettes = [state.palette; FB_HEIGHT];
         let mut palette_segments = vec![Vec::new(); FB_HEIGHT];
@@ -7801,14 +7793,18 @@ mod tests {
         );
 
         let line = (0x45 - 0x2C) as usize;
-        assert_eq!(base_palettes[0][0], 0x0FFF);
-        assert_eq!(base_palettes[line][0], 0x0FFF);
-        assert!(palette_segments[line].is_empty());
+        assert_eq!(base_palettes[0][0], 0x0103);
+        assert_eq!(base_palettes[line][0], 0x0103);
+        assert_eq!(base_palettes[line + 1][0], 0x0FFF);
+        assert_eq!(palette_segments[line].len(), 1);
+        assert_eq!(palette_segments[line][0].x, 0);
+        assert_eq!(palette_segments[line][0].entry, 0);
+        assert_eq!(palette_segments[line][0].value, 0x0FFF);
         assert_eq!(state.palette[0], 0x0FFF);
     }
 
     #[test]
-    fn dense_visible_cpu_palette_writes_replay_by_beam_position() {
+    fn small_visible_cpu_palette_batch_replays_by_beam_position() {
         let mut state = blank_state();
         let mut base_palettes = [state.palette; FB_HEIGHT];
         let mut palette_segments = vec![Vec::new(); FB_HEIGHT];
@@ -7816,7 +7812,7 @@ mod tests {
         let mut control_segments = vec![Vec::new(); FB_HEIGHT];
         let mut manual_bpl_segments = Vec::new();
         let mut events = Vec::new();
-        for idx in 0..64 {
+        for idx in 0..30 {
             events.push(cpu_event(
                 0x45 + idx as u32,
                 COPPER_WAIT_HPOS_FB0 as u32,
