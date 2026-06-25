@@ -58,6 +58,17 @@ update the live comparators but keep the descriptor's post-control data
 origin. The frame-start replay path mirrors this by replaying off-screen
 DMACON and SPRxPT writes in beam order before rendering the visible field.
 
+SPRxPT advances through sprite DMA and is not snapped back to the last value
+the Copper/CPU wrote at the top of the next field. A channel that has read its
+terminating descriptor leaves SPRxPT parked at the DMA frontier past the
+consumed list, so the next field's replay is seeded from that frontier rather
+than the stale descriptor address. Programs must reload SPRxPT every field
+(normally from the Copper) to keep a sprite displayed; this is what prevents a
+reused sprite descriptor buffer that software overwrites between fields from
+being re-armed from its previous, now-overwritten address before the Copper's
+reload lands. A channel still mid-descriptor at field end keeps the written
+pointer so an active reused sprite is not skipped past its data.
+
 Sprite descriptors whose decoded VSTART equals VSTOP idle the current
 sprite stream until software rearms it or the next field fetches again;
 the following words are not scanned as another descriptor. This is distinct

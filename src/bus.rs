@@ -773,6 +773,19 @@ pub struct Bus {
     blitter_trace: Option<std::fs::File>,
     display_dma_bplpt: [u32; 8],
     display_dma_sprpt: [u32; 8],
+    /// Per-sprite SPRxPT value to seed the next frame's sprite-DMA replay with.
+    /// Real Agnus advances SPRxPT through sprite DMA and does not snap it back to
+    /// the last Copper/CPU write at the top of a field: once a channel has read
+    /// its terminating descriptor its pointer sits past the consumed list. We
+    /// model that by carrying the finished channel's DMA frontier across the
+    /// frame boundary instead of re-seeding from `denise.sprpt` (the stale last
+    /// write), so a sprite descriptor buffer that software rewrites every field
+    /// is not re-armed from its previous, now-overwritten address before the
+    /// Copper reloads SPRxPT. Transient render state, rebuilt each frame (and
+    /// re-derived after a state load), so it is excluded from the serialized
+    /// layout.
+    #[serde(skip)]
+    sprite_dma_frame_start_ptr: [u32; 8],
     // Derived from sprite DMA descriptor/control fetches. Kept in the bincode
     // layout for compatibility, then reset after a state load so stale decoded
     // latches are rebuilt from the restored pointer context.
@@ -1796,6 +1809,7 @@ impl Bus {
             blitter_trace,
             display_dma_bplpt: [0; 8],
             display_dma_sprpt: [0; 8],
+            sprite_dma_frame_start_ptr: [0; 8],
             display_dma_sprite_state: [DisplaySpriteDmaState::default(); 8],
             display_dma_clipped_rows_advanced: false,
             bitplane_dmacon_delay: None,
@@ -2085,6 +2099,7 @@ impl Bus {
         self.emulated_frames = 0;
         self.display_dma_bplpt = [0; 8];
         self.display_dma_sprpt = [0; 8];
+        self.sprite_dma_frame_start_ptr = [0; 8];
         self.display_dma_sprite_state = [DisplaySpriteDmaState::default(); 8];
         self.display_dma_clipped_rows_advanced = false;
         self.bitplane_dmacon_delay = None;
@@ -6812,6 +6827,22 @@ impl Bus {
         self.current_frame_display_snapshot_taken = false;
         self.current_frame_visible_start_vpos = RENDER_VISIBLE_START_VPOS;
         self.current_frame_render_base = self.capture_render_snapshot();
+        // Carry each sprite channel's DMA pointer across the frame boundary the
+        // way real Agnus does. A channel that finished the field (read its
+        // terminating descriptor, so `control` is cleared) leaves SPRxPT parked
+        // past the consumed list at its DMA frontier; it does NOT snap back to
+        // the last value the Copper/CPU wrote into `denise.sprpt`. Seed the next
+        // frame's replay from that frontier so a reused descriptor buffer that
+        // software rewrites every field is not re-armed from its previous,
+        // now-overwritten address before the Copper reloads SPRxPT. Channels
+        // still mid-descriptor at frame end keep the written pointer.
+        for sprite in 0..8 {
+            let state = &self.display_dma_sprite_state[sprite];
+            self.sprite_dma_frame_start_ptr[sprite] = match (state.control, state.next_ptr) {
+                (None, Some(frontier)) => frontier,
+                _ => self.denise.sprpt[sprite],
+            };
+        }
         self.current_frame_collision_may_have_dual_playfield =
             self.current_frame_render_base.bplcon0 & 0x0400 != 0;
         self.display_dma_bplpt = self.denise.bplpt;
@@ -7228,7 +7259,11 @@ impl Bus {
         // span and run the sprite fetch only on lines where SPREN was actually
         // enabled, rather than sampling registers at the visible start.
         let base = self.current_frame_render_base;
-        self.display_dma_sprpt = base.sprpt;
+        // Seed from the previous field's carried SPRxPT frontier rather than the
+        // last Copper/CPU write captured in `base.sprpt`. See
+        // `sprite_dma_frame_start_ptr` for why finished channels must not snap
+        // back to their stale descriptor address.
+        self.display_dma_sprpt = self.sprite_dma_frame_start_ptr;
         self.display_dma_sprite_state = [DisplaySpriteDmaState::default(); 8];
         let mut dmacon = base.dmacon;
         let writes: Vec<(u32, u32, u16, u16)> = self
@@ -15281,9 +15316,9 @@ mod tests {
         write_chip_word(&mut bus, sprite_ptr + 18, 0);
 
         bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
-        // The offscreen sprite-DMA replay seeds from the frame-start DMACON
-        // and SPRxPT snapshot (and replays $096/$120..$13F writes across the
-        // span); mirror what begin_new_beam_frame records so SPREN and the
+        // The offscreen sprite-DMA replay seeds from the frame-start DMACON and
+        // the carried SPRxPT frontier (and replays $096/$120..$13F writes across
+        // the span); mirror what begin_new_beam_frame records so SPREN and the
         // sprite pointer are live for the offscreen lines this sprite starts on.
         bus.current_frame_render_base.dmacon = DMACON_DMAEN | DMACON_SPREN;
         bus.current_frame_render_base.sprpt[0] = sprite_ptr as u32;
@@ -15291,6 +15326,7 @@ mod tests {
         bus.agnus.hpos = 0;
         bus.denise.sprpt[0] = sprite_ptr as u32;
         bus.display_dma_sprpt[0] = sprite_ptr as u32;
+        bus.sprite_dma_frame_start_ptr[0] = sprite_ptr as u32;
 
         bus.capture_current_frame_display_start();
         bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1;
@@ -15327,6 +15363,7 @@ mod tests {
         bus.agnus.hpos = 0;
         bus.denise.sprpt[0] = sprite_ptr as u32;
         bus.display_dma_sprpt[0] = sprite_ptr as u32;
+        bus.sprite_dma_frame_start_ptr[0] = sprite_ptr as u32;
 
         bus.capture_current_frame_display_start();
 
@@ -15346,6 +15383,71 @@ mod tests {
         assert_eq!(lines[0].hstart, 0x00A1);
         assert_eq!(lines[0].data, 0x1111);
         assert_eq!(lines[0].datb, 0x2222);
+    }
+
+    #[test]
+    fn finished_sprite_channel_carries_dma_frontier_across_frame_boundary() {
+        // Real Agnus advances SPRxPT through sprite DMA. A channel that has read
+        // its terminating descriptor leaves the pointer parked at the DMA
+        // frontier past the consumed list; it does NOT snap back to the last
+        // value the Copper/CPU wrote into SPRxPT. begin_new_beam_frame must seed
+        // the next frame's sprite-DMA replay from that frontier for a finished
+        // channel (so a reused descriptor buffer that software overwrites every
+        // field is not re-armed from its stale address before the Copper reloads
+        // SPRxPT), and from the written pointer for a channel still mid-field.
+        let mut bus = empty_bus();
+
+        // Channel 0 finished the field: its control comparator is cleared and the
+        // DMA frontier sits at the terminating descriptor. denise.sprpt still
+        // holds the now-overwritten descriptor address the Copper wrote earlier.
+        let frontier0 = 0x0005_F3E4u32;
+        bus.denise.sprpt[0] = 0x0005_F0BC;
+        bus.display_dma_sprite_state[0] = DisplaySpriteDmaState {
+            control: None,
+            next_ptr: Some(frontier0),
+            terminated: true,
+            data_dma_active: false,
+            last_line: None,
+        };
+
+        // Channel 1 is still mid-descriptor at frame end: keep the written
+        // pointer so an active reused sprite is not skipped past its data.
+        let written1 = 0x0006_0000u32;
+        bus.denise.sprpt[1] = written1;
+        bus.display_dma_sprite_state[1] = DisplaySpriteDmaState {
+            control: Some(DisplaySpriteControl {
+                vstart: 0x20,
+                vstop: 0x40,
+                hstart: 0x80,
+                hsub_70ns: false,
+                data_vstart: 0x20,
+                data_base: 0x0100,
+                next_ptr: 0x0200,
+                attached: false,
+            }),
+            next_ptr: Some(0x0200),
+            terminated: false,
+            data_dma_active: true,
+            last_line: None,
+        };
+
+        // Channel 2 was never set up this field: fall back to the written pointer.
+        bus.denise.sprpt[2] = 0x0007_0000;
+
+        bus.begin_new_beam_frame();
+
+        assert_eq!(
+            bus.sprite_dma_frame_start_ptr[0], frontier0,
+            "finished channel must carry the DMA frontier, not the stale written pointer"
+        );
+        assert_eq!(
+            bus.sprite_dma_frame_start_ptr[1], written1,
+            "channel still mid-descriptor keeps the written SPRxPT"
+        );
+        assert_eq!(
+            bus.sprite_dma_frame_start_ptr[2], 0x0007_0000,
+            "channel with no descriptor falls back to the written SPRxPT"
+        );
     }
 
     #[test]
