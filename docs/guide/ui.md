@@ -164,10 +164,11 @@ The layout is:
   and *A/V & Emu* (overscan, phosphor, floppy sounds and volume, power-on,
   pacing, realtime priority, warp speed).
 - **Settings rows** (right pane). `[<]`/`[>]` step through a value, On/Off
-  buttons flip a toggle, and **Browse**/**Clear** set or remove a file path
-  through a native file dialog. A setting that does not apply to the chosen
-  machine is greyed and shows why in place of its control -- "needs 32-bit CPU"
-  for Zorro III RAM, "needs 68020+" for the FPU, "needs A600/A1200" for IDE.
+  buttons flip a toggle, and the **Browse** and **Clear** buttons set or remove
+  a file path through a native file dialog. A setting that does not apply to the
+  chosen machine is greyed and shows why in place of its control -- "needs
+  32-bit CPU" for Zorro III RAM, "needs 68020+" for the FPU, "needs A600/A1200"
+  for IDE.
 - **Action bar** (bottom). **Load...** and **Save...** read and write a `.toml`
   config
   through a file dialog (Save writes a minimal file, only the settings that
