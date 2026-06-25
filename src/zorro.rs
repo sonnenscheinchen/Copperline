@@ -17,9 +17,12 @@
 //! boards are implemented today; other backings plug in via
 //! [`BoardBacking`].
 
+use crate::net::NetConfig;
+use crate::wasmboard::{WasmCaps, WasmManifest};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 pub const AUTOCONFIG_BASE: u64 = 0x00E8_0000;
 pub const AUTOCONFIG_SIZE: u64 = 0x0001_0000;
@@ -73,9 +76,11 @@ pub enum ZorroVersion {
 pub enum BoardBacking {
     /// RAM the CPU can read and write at external-bus speed.
     Ram,
-    /// The A2091/A590 SCSI controller (registers + boot ROM); accesses
-    /// route to the `A2091` device on the bus, not to board RAM.
-    A2091,
+    /// A functional device (registers + optional boot ROM): accesses route to
+    /// `Bus::devices[usize]`, a [`crate::zorro_device::BoardDevice`], not to
+    /// board RAM. The index is assigned when the board is added to the chain
+    /// and matches the device attached to the bus.
+    Device(usize),
 }
 
 /// The autoconfig identity and backing of one expansion board.
@@ -149,11 +154,29 @@ impl BoardSpec {
         }
     }
 
+    /// The A2065 Ethernet board: Commodore West Chester (manufacturer 514),
+    /// product 0x70, a 64K Zorro II window with no autoboot ROM. `slot` is the
+    /// index of the matching `A2065` device in `Bus::devices`.
+    pub fn a2065(slot: usize) -> Self {
+        Self {
+            name: "A2065 Ethernet".into(),
+            version: ZorroVersion::II,
+            manufacturer: 514,
+            product: 0x70,
+            serial: 0,
+            size_bytes: 0x1_0000,
+            backing: BoardBacking::Device(slot),
+            memlist: false,
+            diag_vec: None,
+        }
+    }
+
     /// The A2091 SCSI controller board: the DMAC supplies the autoconfig
     /// identity (Commodore West Chester, product 3) with a valid DiagArea
     /// vector pointing at the boot ROM, which appears at $2000 in the
-    /// board space.
-    pub fn a2091() -> Self {
+    /// board space. `slot` is the index of the matching `A2091` device in
+    /// `Bus::devices`.
+    pub fn a2091(slot: usize) -> Self {
         Self {
             name: "A2091 SCSI".into(),
             version: ZorroVersion::II,
@@ -161,7 +184,7 @@ impl BoardSpec {
             product: 3,
             serial: 0,
             size_bytes: 0x1_0000,
-            backing: BoardBacking::A2091,
+            backing: BoardBacking::Device(slot),
             memlist: false,
             diag_vec: Some(0x2000),
         }
@@ -226,7 +249,7 @@ impl ZorroChain {
         spec.validate()?;
         let ram = match spec.backing {
             BoardBacking::Ram => vec![0u8; spec.size_bytes],
-            BoardBacking::A2091 => Vec::new(),
+            BoardBacking::Device(_) => Vec::new(),
         };
         self.boards.push(Board {
             spec,
@@ -274,7 +297,7 @@ impl ZorroChain {
                             self.regions.push((base, board.ram.len() as u32, idx));
                         }
                     }
-                    BoardBacking::A2091 => {
+                    BoardBacking::Device(_) => {
                         self.device_regions
                             .push((base, board.spec.size_bytes as u32, idx));
                     }
@@ -497,12 +520,32 @@ fn floating_bus(size: usize) -> u64 {
 /// ```toml
 /// name = "MegaRAM"
 /// zorro = 3            # 2 or 3
-/// type = "ram"         # board backing; only "ram" so far
+/// type = "ram"         # "ram" or "wasm"
 /// size = "64M"
 /// manufacturer = 0x07DB
 /// product = 0x20
 /// serial = 0           # optional
-/// memlist = true       # optional; defaults true for type = "ram"
+/// memlist = true       # optional; defaults true for "ram", false for "wasm"
+///
+/// # For type = "wasm" (a plugin board), additionally:
+/// wasm = "board.wasm"  # module path, relative to this metadata file
+/// dma = true           # optional capabilities (default false)
+/// int2 = true
+/// int6 = false
+///
+/// # Plugin settings passed to the module (defaults; the user overrides them
+/// # per-board in the main config). A "file" option is loaded by the host and
+/// # exposed to the plugin as a named resource.
+/// [config]
+/// mac = "02:00:10:00:00:01"
+/// [[option]]
+/// key = "mac"
+/// label = "MAC address"
+/// type = "string"      # string | bool | int | file | enum
+/// [[option]]
+/// key = "rom"
+/// label = "Boot ROM"
+/// type = "file"
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -516,10 +559,89 @@ struct RawBoardMeta {
     product: u16,
     serial: Option<u32>,
     memlist: Option<bool>,
+    // WASM plugin boards (type = "wasm"):
+    wasm: Option<String>,
+    dma: Option<bool>,
+    int2: Option<bool>,
+    int6: Option<bool>,
+    /// Host network backend ("none"/"loopback"); presence grants the `net`
+    /// capability (the net_send/net_recv imports).
+    net: Option<String>,
+    /// Default plugin settings (free-form key/value).
+    config: Option<toml::Table>,
+    /// Config option schema, for the launcher's config panel.
+    #[serde(default)]
+    option: Vec<RawOption>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOption {
+    key: String,
+    label: Option<String>,
+    #[serde(rename = "type")]
+    kind: String,
+    default: Option<toml::Value>,
+    choices: Option<Vec<String>>,
+}
+
+/// One editable plugin setting, declared by a `[[option]]` in the manifest, used
+/// to render the launcher's config panel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigOption {
+    pub key: String,
+    pub label: String,
+    pub kind: ConfigOptionKind,
+    pub default: Option<String>,
+}
+
+/// The editing widget a [`ConfigOption`] wants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigOptionKind {
+    String,
+    Bool,
+    Int,
+    /// A host file path; loaded by the host and exposed to the plugin as a
+    /// resource keyed by the option's `key`.
+    File,
+    /// A choice from a fixed list.
+    Enum(Vec<String>),
+}
+
+/// Stringify a TOML scalar for the plugin's flat string-valued config map.
+pub(crate) fn toml_value_to_string(v: &toml::Value) -> String {
+    match v {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Integer(n) => n.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// A board parsed from a TOML metadata file: a RAM board (fully described by
+/// its autoconfig identity) or a WASM plugin board (identity plus the module
+/// path and capabilities, instantiated at machine-build time).
+#[derive(Debug)]
+pub enum LoadedZorroBoard {
+    Ram(BoardSpec),
+    Wasm {
+        /// Autoconfig identity; `backing` is a `Device` placeholder reassigned
+        /// to the real slot index when the board is attached to the bus.
+        spec: BoardSpec,
+        wasm_path: PathBuf,
+        manifest: WasmManifest,
+        /// The config-option schema for the launcher panel.
+        options: Vec<ConfigOption>,
+        /// Default settings from `[config]` (option defaults applied, file
+        /// values resolved relative to the metadata file); the user's per-board
+        /// overrides are layered on top at config-resolution time.
+        default_config: BTreeMap<String, String>,
+    },
 }
 
 /// Load a board description from a TOML metadata file.
-pub fn load_board_metadata(path: &Path) -> Result<BoardSpec> {
+pub fn load_board_metadata(path: &Path) -> Result<LoadedZorroBoard> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading zorro board metadata {}", path.display()))?;
     let raw: RawBoardMeta = toml::from_str(&text)
@@ -533,14 +655,6 @@ pub fn load_board_metadata(path: &Path) -> Result<BoardSpec> {
             other
         ),
     };
-    let backing = match raw.backing.trim().to_ascii_lowercase().as_str() {
-        "ram" => BoardBacking::Ram,
-        other => bail!(
-            "{}: type = {:?} is not supported (expected \"ram\")",
-            path.display(),
-            other
-        ),
-    };
     if raw.manufacturer > 0xFFFF {
         bail!("{}: manufacturer must be a 16-bit ID", path.display());
     }
@@ -549,20 +663,161 @@ pub fn load_board_metadata(path: &Path) -> Result<BoardSpec> {
     }
     let size_bytes = parse_board_size(&raw.size)
         .with_context(|| format!("{}: bad size {:?}", path.display(), raw.size))?;
-    let spec = BoardSpec {
-        name: raw.name,
-        version,
-        manufacturer: raw.manufacturer as u16,
-        product: raw.product as u8,
-        serial: raw.serial.unwrap_or(0),
-        size_bytes,
-        backing,
-        memlist: raw.memlist.unwrap_or(true),
-        diag_vec: None,
-    };
-    spec.validate()
-        .with_context(|| format!("{}: invalid board", path.display()))?;
-    Ok(spec)
+    let kind = raw.backing.trim().to_ascii_lowercase();
+    match kind.as_str() {
+        "ram" => {
+            let spec = BoardSpec {
+                name: raw.name,
+                version,
+                manufacturer: raw.manufacturer as u16,
+                product: raw.product as u8,
+                serial: raw.serial.unwrap_or(0),
+                size_bytes,
+                backing: BoardBacking::Ram,
+                memlist: raw.memlist.unwrap_or(true),
+                diag_vec: None,
+            };
+            spec.validate()
+                .with_context(|| format!("{}: invalid board", path.display()))?;
+            Ok(LoadedZorroBoard::Ram(spec))
+        }
+        "wasm" => {
+            let Some(wasm) = raw.wasm else {
+                bail!(
+                    "{}: type = \"wasm\" needs a `wasm = \"module.wasm\"` path",
+                    path.display()
+                );
+            };
+            // Module path resolves relative to the metadata file's directory.
+            let wasm_path = match path.parent() {
+                Some(dir) => dir.join(&wasm),
+                None => PathBuf::from(&wasm),
+            };
+            // The real slot index is assigned when the device is attached.
+            let spec = BoardSpec {
+                name: raw.name,
+                version,
+                manufacturer: raw.manufacturer as u16,
+                product: raw.product as u8,
+                serial: raw.serial.unwrap_or(0),
+                size_bytes,
+                backing: BoardBacking::Device(0),
+                memlist: raw.memlist.unwrap_or(false),
+                diag_vec: None,
+            };
+            spec.validate()
+                .with_context(|| format!("{}: invalid board", path.display()))?;
+            let net = match &raw.net {
+                Some(s) => crate::net::parse_net_config(s).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}: net = {:?} is not a known backend (expected \"none\" or \"loopback\")",
+                        path.display(),
+                        s
+                    )
+                })?,
+                None => NetConfig::None,
+            };
+            let options = parse_options(&raw.option, path)?;
+            let default_config = build_default_config(raw.config.as_ref(), &options, path);
+            let manifest = WasmManifest {
+                name: spec.name.clone(),
+                caps: WasmCaps {
+                    dma: raw.dma.unwrap_or(false),
+                    int2: raw.int2.unwrap_or(false),
+                    int6: raw.int6.unwrap_or(false),
+                    net: raw.net.is_some(),
+                },
+                net,
+                // The merge with the user's per-board overrides happens at
+                // config-resolution time; defaults travel separately for now.
+                config: BTreeMap::new(),
+                file_keys: options
+                    .iter()
+                    .filter(|o| o.kind == ConfigOptionKind::File)
+                    .map(|o| o.key.clone())
+                    .collect(),
+            };
+            Ok(LoadedZorroBoard::Wasm {
+                spec,
+                wasm_path,
+                manifest,
+                options,
+                default_config,
+            })
+        }
+        other => bail!(
+            "{}: type = {:?} is not supported (expected \"ram\" or \"wasm\")",
+            path.display(),
+            other
+        ),
+    }
+}
+
+/// Parse the `[[option]]` schema from a manifest.
+fn parse_options(raw: &[RawOption], path: &Path) -> Result<Vec<ConfigOption>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for o in raw {
+        let kind = match o.kind.trim().to_ascii_lowercase().as_str() {
+            "string" => ConfigOptionKind::String,
+            "bool" => ConfigOptionKind::Bool,
+            "int" => ConfigOptionKind::Int,
+            "file" => ConfigOptionKind::File,
+            "enum" => {
+                let choices = o.choices.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}: option {:?} type = \"enum\" needs choices = [...]",
+                        path.display(),
+                        o.key
+                    )
+                })?;
+                ConfigOptionKind::Enum(choices)
+            }
+            other => bail!(
+                "{}: option {:?} has unknown type {:?} (expected string/bool/int/file/enum)",
+                path.display(),
+                o.key,
+                other
+            ),
+        };
+        out.push(ConfigOption {
+            key: o.key.clone(),
+            label: o.label.clone().unwrap_or_else(|| o.key.clone()),
+            kind,
+            default: o.default.as_ref().map(toml_value_to_string),
+        });
+    }
+    Ok(out)
+}
+
+/// Build the default settings map: option defaults, overlaid by any `[config]`
+/// entries, with file-typed values resolved relative to the metadata file.
+fn build_default_config(
+    config: Option<&toml::Table>,
+    options: &[ConfigOption],
+    path: &Path,
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for o in options {
+        if let Some(d) = &o.default {
+            map.insert(o.key.clone(), d.clone());
+        }
+    }
+    if let Some(table) = config {
+        for (k, v) in table {
+            map.insert(k.clone(), toml_value_to_string(v));
+        }
+    }
+    if let Some(dir) = path.parent() {
+        for o in options {
+            if o.kind == ConfigOptionKind::File {
+                if let Some(val) = map.get(&o.key) {
+                    let resolved = dir.join(val).to_string_lossy().into_owned();
+                    map.insert(o.key.clone(), resolved);
+                }
+            }
+        }
+    }
+    map
 }
 
 fn parse_board_size(s: &str) -> Result<usize> {
@@ -756,9 +1011,12 @@ mod tests {
             "#,
         )
         .unwrap();
-        let spec = load_board_metadata(&path).unwrap();
+        let loaded = load_board_metadata(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
+        let LoadedZorroBoard::Ram(spec) = loaded else {
+            panic!("expected a RAM board");
+        };
         assert_eq!(spec.name, "MegaRAM");
         assert_eq!(spec.version, ZorroVersion::III);
         assert_eq!(spec.backing, BoardBacking::Ram);
@@ -766,6 +1024,56 @@ mod tests {
         assert_eq!(spec.manufacturer, 2011);
         assert_eq!(spec.product, 32);
         assert!(spec.memlist);
+    }
+
+    #[test]
+    fn wasm_board_metadata_parses_path_and_caps() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "copperline-zorro-wasm-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+            name = "Test NIC"
+            zorro = 2
+            type = "wasm"
+            size = "64K"
+            manufacturer = 5192
+            product = 16
+            wasm = "nic.wasm"
+            dma = true
+            int2 = true
+            "#,
+        )
+        .unwrap();
+        let loaded = load_board_metadata(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let LoadedZorroBoard::Wasm {
+            spec,
+            wasm_path,
+            manifest,
+            ..
+        } = loaded
+        else {
+            panic!("expected a WASM board");
+        };
+        assert_eq!(spec.name, "Test NIC");
+        assert_eq!(spec.version, ZorroVersion::II);
+        assert!(matches!(spec.backing, BoardBacking::Device(_)));
+        assert!(!spec.memlist);
+        // Module path is resolved next to the metadata file.
+        assert_eq!(wasm_path, dir.join("nic.wasm"));
+        assert_eq!(manifest.name, "Test NIC");
+        assert!(manifest.caps.dma);
+        assert!(manifest.caps.int2);
+        assert!(!manifest.caps.int6);
     }
 
     #[test]
@@ -812,7 +1120,7 @@ mod tests {
 
     #[test]
     fn diag_vector_sets_diagvalid_and_init_diag_vec() {
-        let chain = chain_with(vec![BoardSpec::a2091()]);
+        let chain = chain_with(vec![BoardSpec::a2091(0)]);
 
         // er_Type carries ERTF_DIAGVALID (autoboot ROM present)...
         let hi = (chain.config_read(AUTOCONFIG_BASE, 1) as u8) >> 4;
@@ -865,7 +1173,7 @@ mod tests {
     fn three_board_chain_configures_in_order() {
         let mut chain = chain_with(vec![
             BoardSpec::fast_ram(2 * 1024 * 1024),
-            BoardSpec::a2091(),
+            BoardSpec::a2091(0),
             BoardSpec::z3_ram(16 * 1024 * 1024),
         ]);
 
@@ -877,7 +1185,7 @@ mod tests {
         chain.config_write(AUTOCONFIG_BASE + EC_BASEADDRESS_PHYS, 1, 0xE9);
         assert_eq!(
             chain.device_region_at(0x00E9_0000, 2),
-            Some((BoardBacking::A2091, 0))
+            Some((BoardBacking::Device(0), 0))
         );
 
         // Board 3: Zorro III RAM via the 16-bit write to $44.
