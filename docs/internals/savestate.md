@@ -202,9 +202,13 @@ resources across, resets any queued live-audio presentation frames from the
 old timeline, and clears transient video capture buffers. The restored guest
 RAM, custom registers, and beam event journal stay intact, while Agnus
 rebuilds sprite control/data latches from the restored pointer context under
-the current descriptor rules. On success the window forces power on, clears
-any CPU halt latch, and invalidates `last_rendered_emulated_frame` so the
-next presentation re-renders from the restored Bus.
+the current descriptor rules. Register-armed sprite streams whose transient
+descriptor latch was not serialized are reconstructed from Denise's retained
+SPRxPOS/SPRxCTL/data-armed state and the next after-slot SPRxPT low-word
+write in the rendered field, so the first complete field after load follows
+the same data-stream rule as a live run. On success the window forces power
+on, clears any CPU halt latch, and invalidates `last_rendered_emulated_frame`
+so the next presentation re-renders from the restored Bus.
 
 ## Verification
 

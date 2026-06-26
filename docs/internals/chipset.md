@@ -29,13 +29,15 @@ to the 8-CCK fetch-unit count: $34/$D4 fetches 21 words, $28/$D4 fetches
 rather than moving DDFSTRT down to an absolute grid. In
 lo-res, the plane-order slots for a wide unit are packed into the unit's
 first eight CCKs; the remaining CCKs are free for other bus users. If a
-bitplane fetch block occupies sprite 7's late DMA slot at $30, sprite 7 DMA
-is blocked for that line; the condition is derived from the fetch-block
-sequence, not from a single DDFSTRT value. SANITY Roots II's AGA 256-colour
-effects are regression examples for both sides of this: the hi-res FMODE=3
-pictures need raw-DDFSTRT unit rounding to preserve their 40-word rows, and
-the lo-res FMODE=3 landscape needs packed first-eight CCK plane slots
-instead of spreading those slots across the 32-CCK unit.
+bitplane fetch block that started before sprite 7's late DMA slot is still
+active at $30, sprite 7 DMA is blocked for that line; a DDFSTRT value of
+$30 itself matches on the following odd cycle and does not steal the already
+decided sprite slot. The condition is derived from the fetch-block sequence,
+not from a single DDFSTRT value. SANITY Roots II's AGA 256-colour effects are
+regression examples for both sides of this: the hi-res FMODE=3 pictures need
+raw-DDFSTRT unit rounding to preserve their 40-word rows, and the lo-res
+FMODE=3 landscape needs packed first-eight CCK plane slots instead of
+spreading those slots across the 32-CCK unit.
 
 Agnus revisions are modelled independently of Denise (machines shipped
 mixed): OCS (8370/8371), ECS 8372A (1M chip RAM reach), ECS 8375 (2M), and
@@ -46,17 +48,38 @@ sprite fetch quanta (FMODE=0 stays byte-identical to the OCS/ECS slot
 timing).
 
 Sprite DMA retains its latched POS/CTL descriptor independently from the
-SPRxPT registers while a sprite data stream is active. If software rewrites
-SPRxPT while the retained descriptor is still waiting for VSTART, the current
-stream is discarded and the next sprite DMA slot fetches a descriptor from
-the new address; otherwise descriptor words can be mistaken for sprite data.
+SPRxPT registers while a sprite data stream is active or waiting for VSTART.
+If software rewrites SPRxPT on a later beam line while that descriptor is
+still pending, the retained POS/CTL stays latched and the new SPRxPT value
+retargets the descriptor's post-control data stream. A same-line rewrite
+after the descriptor fetch is treated as a descriptor restart for the next
+sprite DMA slot; otherwise freshly loaded descriptor words would be mistaken
+for sprite data.
 Software can also write SPRxPOS/SPRxCTL directly and let sprite DMA fetch
 data from the current SPRxPT stream; in that case SPRxPT names the first
-data word pair, not a memory descriptor. If a DMA descriptor has already
-been retained and is still waiting for VSTART, later SPRxPOS/SPRxCTL writes
+data word pair, not a memory descriptor. A save-state load clears
+Copperline's transient Agnus descriptor latch, so this register-stream case
+is reconstructed from Denise's retained armed state, SPRxPOS/SPRxCTL, and
+an after-slot SPRxPT low-word write in the rendered display area. If a DMA
+descriptor has already been retained and is still waiting for VSTART, later
+SPRxPOS/SPRxCTL writes
 update the live comparators but keep the descriptor's post-control data
 origin. The frame-start replay path mirrors this by replaying off-screen
 DMACON and SPRxPT writes in beam order before rendering the visible field.
+Enabled sprite slots that fetch no sprite data are not treated as observed
+sprite DMA; otherwise empty DMA slots would suppress valid register/manual
+sprite replay for that frame.
+
+SPRxPT advances through sprite DMA and is not snapped back to the last value
+the Copper/CPU wrote at the top of the next field. A channel that has read its
+terminating descriptor leaves SPRxPT parked at the DMA frontier past the
+consumed list, so the next field's replay is seeded from that frontier rather
+than the stale descriptor address. Programs must reload SPRxPT every field
+(normally from the Copper) to keep a sprite displayed; this is what prevents a
+reused sprite descriptor buffer that software overwrites between fields from
+being re-armed from its previous, now-overwritten address before the Copper's
+reload lands. A channel still mid-descriptor at field end keeps the written
+pointer so an active reused sprite is not skipped past its data.
 
 Sprite descriptors whose decoded VSTART equals VSTOP idle the current
 sprite stream until software rearms it or the next field fetches again;

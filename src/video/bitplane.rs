@@ -23,6 +23,7 @@ use crate::chipset::denise::{
     Palette, COLOR_RGB_MASK, COLOR_TRANSPARENCY_BIT,
 };
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -57,36 +58,35 @@ const DIW_HSTART_FETCH_REFERENCE_HIRES: i32 = 0x83;
 // and bitplane pixels still register against each other after widening.
 const COPPER_WAIT_HPOS_FB0: i32 = 0x28;
 /// COLORxx writes feed Denise's final colour-selection/output path. Denise
-/// keeps copper/CPU colour-register changes phase-aligned with the bitplane
-/// serializer output: a colour write and the bitplane pixels it recolours reach
-/// the DAC together. (MiniMig models this explicitly with a one-lores-pixel
-/// bitplane delay added "for alignment of bitplane data and copper colour
-/// change"; WinUAE applies colour changes in the same beam slot as the
-/// bitplane pixels.) OCS Denise (8362) and ECS Denise (8373) share this timing
-/// exactly -- the only OCS/ECS colour-path difference is the OCS 12-bit value
-/// mask -- so this anchor is revision-independent across OCS/ECS.
+/// applies copper/CPU colour-register changes in the palette/output phase,
+/// ahead of register writes that feed the bitplane shifter. This anchor keeps
+/// COLORxx changes one lores pixel ahead of the generic beam/write domain,
+/// matching vAmiga's model where COLORxx is recorded at the current output
+/// pixel while BPLCON/DDF/sprite data paths carry explicit pixel delays. OCS
+/// Denise (8362) and ECS Denise (8373) share this timing exactly -- the only
+/// OCS/ECS colour-path difference is the OCS 12-bit value mask -- so this
+/// anchor is revision-independent across OCS/ECS.
 ///
 /// TODO: AGA Lisa delays colour changes by one hires pixel relative to
 /// OCS/ECS (WinUAE: "AGA color changes are 1 hires pixel delayed"). That
 /// sub-colour-clock offset is not yet modelled here.
 ///
 /// STOP before retuning this. If a scene's colours or copper-driven picture
-/// look horizontally shifted, the cause is almost never this anchor -- it has
-/// been moved "to fix" demos several times and always had to be moved back
-/// (the real bug was bitplane fetch/DDF alignment, sprite arming, etc.). This
-/// value keeps copper colour writes aligned with the bitplane pixels they
-/// recolour and is the same on OCS and ECS; leave it at 0x34.
-const COLOR_WRITE_HPOS_FB0: i32 = 0x34;
+/// look horizontally shifted, the cause is usually bitplane fetch/DDF
+/// alignment, sprite arming, or a missed write-domain delay, not this final
+/// colour-output anchor.
+const COLOR_WRITE_HPOS_FB0: i32 = 0x35;
 /// AGA BPLCON4's low sprite-palette byte follows Lisa's sprite colour lookup
 /// path, which reaches sprite output earlier than ordinary COLORxx palette
 /// writes. Keep it separate from COLOR replay so copper palette gradients stay
 /// in the Denise palette-output phase on OCS/ECS.
 const SPRITE_PALETTE_CONTROL_HPOS_FB0: i32 = 0x36;
-/// SPRxPOS writes update the Denise horizontal comparator seven CCK ahead of
-/// the normal register/output beam domain. Manual sprite replays use this
-/// earlier domain so adjacent position writes can abut at their programmed
-/// HSTARTs.
-const SPRITE_POSITION_WRITE_PIPELINE_CCK: u32 = 7;
+/// SPRxPOS and SPRxDATx writes feed Denise's sprite comparator/latches seven
+/// CCK ahead of the normal register/output beam domain. Manual sprite replays
+/// use this earlier domain so adjacent position writes can abut at their
+/// programmed HSTARTs, and data writes that beat the comparator load the same
+/// scanline.
+const SPRITE_REGISTER_WRITE_PIPELINE_CCK: u32 = 7;
 /// Framebuffer-x offset between the copper/register coordinate
 /// ([`COPPER_WAIT_HPOS_FB0`], used to place beam-timed register writes) and the
 /// bitplane/DIW coordinate ([`DIW_HSTART_FB0`], used to place fetched bitplane
@@ -824,6 +824,18 @@ impl ControlState {
             .max(0) as usize
     }
 
+    fn ham_history_start_native_x(
+        &self,
+        diw_h_start: u16,
+        pixel_repeat: usize,
+        native_x_offset: usize,
+    ) -> usize {
+        let display_phase_native =
+            ((diw_h_start as i32 - self.fetch_reference()) * 2) / pixel_repeat as i32;
+        let visible_phase = display_phase_native.max(0) as usize;
+        native_x_offset.saturating_sub(visible_phase.min(native_x_offset))
+    }
+
     fn fetch_origin_native_shift(&self, diw_h_start: u16, pixel_repeat: usize) -> i32 {
         let display_native_shift =
             ((diw_h_start as i32 - self.fetch_reference()) * 2) / pixel_repeat as i32;
@@ -894,18 +906,6 @@ impl ControlState {
                 // lo-res phase bias must not push a standard-width DIW one sample
                 // past that completed early-DDF row at the right edge.
                 origin_shift -= 1;
-            } else if ddf > standard_ddf && origin_shift < 0 && display_native_shift == 1 {
-                // Mirror of the above for a standard-width DIW whose DDFSTRT is
-                // *late*: the picture is positioned in whole fetch gulps, but the
-                // standard one-sample lo-res phase bias (DIWSTRT $81 vs the $80
-                // fetch reference, i.e. display_native_shift == 1) lands the
-                // clipped-sample count one off the gulp grid -- clipping the
-                // first cell column and orphaning a partial column at the right
-                // edge (e.g. a copper-fed bitplane mosaic fetched with DDFSTRT
-                // $48 in a standard DIW). Non-standard windows carry their own
-                // phase and are positioned by display_native_shift directly, so
-                // gate this on the standard +1 bias only.
-                origin_shift -= 1;
             }
         }
         origin_shift
@@ -921,6 +921,7 @@ struct ControlSegment {
 #[derive(Clone, Copy)]
 struct ManualBplSegment {
     line: usize,
+    hpos: u32,
     x: i32,
     planes: [u16; 8],
     palette: Palette,
@@ -1080,6 +1081,7 @@ struct DenisePlannedPlayfieldLine<'a> {
     x_stop: usize,
     plane_words: &'a [Vec<u16>],
     fetched_pixels: usize,
+    carry_words: [Option<u16>; 8],
 }
 
 impl<'a> DenisePlannedPlayfieldLine<'a> {
@@ -1096,7 +1098,13 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
             x_stop,
             plane_words,
             fetched_pixels,
+            carry_words: [None; 8],
         }
+    }
+
+    fn with_carry_words(mut self, carry_words: [Option<u16>; 8]) -> Self {
+        self.carry_words = carry_words;
+        self
     }
 
     #[cfg(test)]
@@ -1134,6 +1142,15 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
             let delay = delays[plane];
             if native_x < delay {
                 active = true;
+                if delay <= 16 {
+                    let carry_offset = delay - native_x;
+                    if let Some(word) = self.carry_words.get(plane).copied().flatten() {
+                        let bit = carry_offset - 1;
+                        if word & (1 << bit) != 0 {
+                            idx |= 1 << plane;
+                        }
+                    }
+                }
                 continue;
             }
             let fetch_x = native_x - delay;
@@ -1627,6 +1644,7 @@ impl BeamSpriteState {
         let held = self.held[sprite];
         let hstart = sprite_hstart(pos, ctl);
         let hsub_70ns = sprite_hsub_70ns(ctl);
+        let base_x = sprite_nominal_base_framebuffer_x(pos, ctl);
         // A held sprite was already active when SPREN was cleared. With no
         // sprite DMA slot running, the DMA descriptor's stop comparator cannot
         // retire the latched data; later SPRxPOS writes simply reposition it.
@@ -1644,6 +1662,13 @@ impl BeamSpriteState {
                 x_start,
                 x_stop,
             });
+        }
+        // SPRxDATA/SPRxDATB writes update Denise's data latches, but the
+        // serializer only copies those latches when the horizontal sprite
+        // comparator fires. A write after that compare is for a later compare,
+        // not the remaining pixels of the current word.
+        if x_start as i32 > base_x {
+            return None;
         }
         if !self.direct_data_armed[sprite] {
             let vstart = sprite_vstart(pos, ctl);
@@ -2149,6 +2174,7 @@ fn apply_render_events_and_collect_display_plan_events_with_visible_line0(
         if off == 0x110 && (0..base_palettes.len() as i32).contains(&visible_line) {
             manual_bpl_segments.push(ManualBplSegment {
                 line,
+                hpos: event.hpos,
                 x: beam_to_framebuffer_x_unclamped(event.hpos),
                 planes: state.bpldat,
                 palette,
@@ -2679,6 +2705,62 @@ fn line_fetch_plans_for_line(
 }
 
 #[cfg(test)]
+fn bitplane_output_start_x(
+    base_control: ControlState,
+    control_segments: &[ControlSegment],
+    display_start_x: usize,
+    words_per_row: usize,
+    dma_planes: usize,
+) -> usize {
+    bitplane_dma_output_start_x(
+        base_control,
+        control_segments,
+        display_start_x,
+        words_per_row,
+        dma_planes,
+    )
+    .unwrap_or(0)
+}
+
+fn bitplane_dma_output_start_x(
+    base_control: ControlState,
+    control_segments: &[ControlSegment],
+    display_start_x: usize,
+    words_per_row: usize,
+    dma_planes: usize,
+) -> Option<usize> {
+    if dma_planes == 0 || words_per_row == 0 {
+        return None;
+    }
+    let mut display_control = base_control;
+    for segment in control_segments {
+        if segment.x <= display_start_x {
+            display_control = segment.control;
+        }
+    }
+    let pixel_repeat = display_control.framebuffer_pixel_repeat();
+    if display_control.fetch_start_native_x(display_control.diw_h_start(), pixel_repeat) == 0 {
+        return Some(display_start_x);
+    }
+    line_fetch_plan_for_word(base_control, control_segments, 0, dma_planes)
+        .iter()
+        .find_map(|(hpos, plane)| (plane == 0).then_some(bitplane_fetch_framebuffer_x(hpos)))
+}
+
+fn bitplane_carry_words_for_line(
+    block_start: bool,
+    display_start_x: usize,
+    dma_output_start_x: Option<usize>,
+    previous_playfield_tail_words: [Option<u16>; 8],
+) -> [Option<u16>; 8] {
+    if block_start || dma_output_start_x.is_some_and(|start| start > display_start_x) {
+        [None; 8]
+    } else {
+        previous_playfield_tail_words
+    }
+}
+
+#[cfg(test)]
 fn line_fetch_hpos_for_word(
     base_control: ControlState,
     control_segments: &[ControlSegment],
@@ -2758,6 +2840,10 @@ fn bitplane_fetch_hpos(control: ControlState, word_idx: usize) -> u32 {
     bitplane_fetch_hpos_for_plane(control, word_idx, 0)
 }
 
+fn bitplane_fetch_framebuffer_x(hpos: u32) -> usize {
+    ((hpos as i32 * 2 - DIW_HSTART_FB0) * 2).clamp(0, FB_WIDTH as i32) as usize
+}
+
 fn apply_bitplane_pointer_write(ptrs: &mut [u32; 8], off: u16, val: u16) {
     if !(0x0E0..=0x0FF).contains(&off) {
         return;
@@ -2782,6 +2868,121 @@ fn apply_bitplane_data_write(bpldat: &mut [u16; 8], off: u16, val: u16) {
     let idx = ((off - 0x110) / 2) as usize;
     if idx < bpldat.len() {
         bpldat[idx] = val;
+    }
+}
+
+fn seed_manual_bpl_segments_from_latches(
+    segments: &mut [ManualBplSegment],
+    frame_start_bpldat: [u16; 8],
+    render_events: &[BeamRegisterWrite],
+    base_controls: &[ControlState],
+    control_segments: &[Vec<ControlSegment>],
+    captured_bitplane_rows: &[Option<CapturedBitplaneRow>],
+    visible_line0: i32,
+) {
+    if segments.is_empty() {
+        return;
+    }
+
+    let mut segment_indices_by_beam: HashMap<(usize, u32), Vec<usize>> = HashMap::new();
+    for (idx, segment) in segments.iter().enumerate() {
+        segment_indices_by_beam
+            .entry((segment.line, segment.hpos))
+            .or_default()
+            .push(idx);
+    }
+    for indices in segment_indices_by_beam.values_mut() {
+        indices.reverse();
+    }
+
+    let rows = base_controls.len().min(control_segments.len());
+    let mut bpldat = frame_start_bpldat;
+    let mut event_idx = 0usize;
+
+    for line in 0..rows {
+        let beam_y_i = visible_line0 + line as i32;
+        if beam_y_i < 0 {
+            continue;
+        }
+        let beam_y = beam_y_i as u32;
+        while let Some(event) = render_events.get(event_idx) {
+            if event.vpos >= beam_y {
+                break;
+            }
+            apply_bitplane_data_write(&mut bpldat, event.offset & 0x01FE, event.value);
+            event_idx += 1;
+        }
+
+        let row_control_segments = &control_segments[line];
+        let words_per_row = line_words_per_row(base_controls[line], row_control_segments);
+        let dma_planes = line_max_dma_planes(base_controls[line], row_control_segments);
+        let mut fetches = Vec::new();
+        if dma_planes != 0 && line_has_valid_ddf_window(base_controls[line], row_control_segments) {
+            if let Some(captured) = captured_bitplane_rows.get(line).and_then(Option::as_ref) {
+                let fetch_plans = line_fetch_plans_for_line(
+                    base_controls[line],
+                    row_control_segments,
+                    words_per_row,
+                    dma_planes,
+                );
+                for (word_idx, plan) in fetch_plans
+                    .iter()
+                    .enumerate()
+                    .take(words_per_row.min(captured.words_per_row))
+                {
+                    for (hpos, plane) in plan.iter() {
+                        if plane < dma_planes.min(8)
+                            && plane < captured.nplanes
+                            && word_idx < captured.planes[plane].len()
+                        {
+                            fetches.push((hpos, plane, word_idx));
+                        }
+                    }
+                }
+                fetches.sort_unstable();
+            }
+        }
+
+        let mut fetch_idx = 0usize;
+        loop {
+            let next_event_hpos = render_events
+                .get(event_idx)
+                .and_then(|event| (event.vpos == beam_y).then_some(event.hpos));
+            let next_fetch = fetches.get(fetch_idx).copied();
+            match (next_event_hpos, next_fetch) {
+                (Some(event_hpos), Some((fetch_hpos, plane, word_idx)))
+                    if fetch_hpos < event_hpos =>
+                {
+                    bpldat[plane] = captured_bitplane_rows[line]
+                        .as_ref()
+                        .and_then(|row| row.planes[plane].get(word_idx).copied())
+                        .unwrap_or(0);
+                    fetch_idx += 1;
+                }
+                (Some(_), _) => {
+                    let event = render_events[event_idx];
+                    let off = event.offset & 0x01FE;
+                    apply_bitplane_data_write(&mut bpldat, off, event.value);
+                    if off == 0x110 {
+                        if let Some(indices) = segment_indices_by_beam.get_mut(&(line, event.hpos))
+                        {
+                            if let Some(segment_idx) = indices.pop() {
+                                segments[segment_idx].planes = bpldat;
+                            }
+                        }
+                    }
+                    event_idx += 1;
+                }
+                (None, Some((_fetch_hpos, plane, word_idx))) => {
+                    bpldat[plane] = captured_bitplane_rows[line]
+                        .as_ref()
+                        .and_then(|row| row.planes[plane].get(word_idx).copied())
+                        .unwrap_or(0);
+                    fetch_idx += 1;
+                }
+                (None, None) => break,
+            }
+        }
     }
 }
 
@@ -2959,6 +3160,13 @@ fn manual_sprite_lines_from_events_with_visible_line0(
     include_latched_sprite_state: bool,
 ) -> Vec<Vec<SpriteLine>> {
     let mut regs = BeamSpriteState::from_render_state(initial_state, held);
+    if !include_latched_sprite_state {
+        for sprite in 0..8 {
+            if held[sprite].is_none() {
+                regs.spr_armed[sprite] = false;
+            }
+        }
+    }
     let visible_end = visible_line0 + rows as i32;
     let mut next_beam: [(i32, usize); 8] = std::array::from_fn(|sprite| {
         if include_latched_sprite_state || held[sprite].is_some() {
@@ -3003,19 +3211,22 @@ fn manual_sprite_lines_from_events_with_visible_line0(
             visible_line0,
             rows,
         );
-        let flush_mode = if (off - 0x140) & 0x0006 == 0 {
-            ManualSpriteFlushMode::PreserveStartedOutput
-        } else {
-            ManualSpriteFlushMode::ClipAtEnd
-        };
         flush_manual_sprite_lines(
             sprite,
             &regs,
             next_beam[sprite],
             event_beam,
-            flush_mode,
+            ManualSpriteFlushMode::PreserveStartedOutput,
             &mut lines,
         );
+        if !include_latched_sprite_state
+            && held[sprite].is_none()
+            && (off - 0x140) & 0x0006 == 0
+            && event.hpos < SPRITE_DMA_PAIR_CAPTURE_HPOS[sprite / 2]
+        {
+            regs.spr_armed[sprite] = false;
+            regs.direct_data_armed[sprite] = false;
+        }
         regs.apply_write(off, event.value);
         next_beam[sprite] = event_beam;
     }
@@ -3146,11 +3357,8 @@ fn merge_dma_seeded_manual_sprite_lines(
         if seeded.is_empty() {
             continue;
         }
-        let mut seeded_beams: Vec<i32> = seeded.iter().map(|line| line.beam_y).collect();
-        seeded_beams.sort_unstable();
-        seeded_beams.dedup();
         let target = &mut manual_lines[sprite];
-        target.retain(|line| seeded_beams.binary_search(&line.beam_y).is_err());
+        clip_sprite_lines_around_register_lines(seeded, target);
         target.append(seeded);
         target.sort_by_key(|line| (line.beam_y, line.x_start, line.x_stop));
     }
@@ -3170,6 +3378,10 @@ fn manual_sprite_event_beam_for_sprite_write(
         // domain delays attached pairs whose even/odd position writes are
         // staggered by the Copper.
         0x0 => manual_sprite_position_event_beam(vpos, hpos, visible_line0, rows),
+        // SPRxDATA/SPRxDATB update the latches copied by Denise's horizontal
+        // sprite comparator. If the write reaches that path before the
+        // comparator fires, the new data belongs to the current scanline.
+        0x4 | 0x6 => manual_sprite_data_event_beam(vpos, hpos, visible_line0, rows),
         _ => manual_sprite_event_beam(vpos, hpos, visible_line0, rows),
     }
 }
@@ -3205,9 +3417,31 @@ fn manual_sprite_position_event_beam(
     (vpos, x)
 }
 
+fn manual_sprite_data_event_beam(
+    vpos: u32,
+    hpos: u32,
+    visible_line0: i32,
+    rows: usize,
+) -> (i32, usize) {
+    let visible_end = visible_line0 + rows as i32;
+    let vpos = vpos as i32;
+    if vpos < visible_line0 {
+        return (visible_line0, 0);
+    }
+    if vpos >= visible_end {
+        return (visible_end, 0);
+    }
+    let x = sprite_data_write_framebuffer_x(hpos);
+    (vpos, x)
+}
+
 fn sprite_position_write_framebuffer_x(hpos: u32) -> usize {
-    let hpos = hpos.saturating_sub(SPRITE_POSITION_WRITE_PIPELINE_CCK);
+    let hpos = hpos.saturating_sub(SPRITE_REGISTER_WRITE_PIPELINE_CCK);
     ((hpos as i32 * 2 - DIW_HSTART_FB0) * 2).clamp(0, FB_WIDTH as i32) as usize
+}
+
+fn sprite_data_write_framebuffer_x(hpos: u32) -> usize {
+    sprite_position_write_framebuffer_x(hpos)
 }
 
 fn flush_manual_sprite_lines(
@@ -3230,7 +3464,7 @@ fn flush_manual_sprite_lines(
         if mode == ManualSpriteFlushMode::PreserveStartedOutput && beam_y == end_line {
             let pos = regs.sprpos[sprite];
             let ctl = regs.sprctl[sprite];
-            let base_x = (sprite_hstart(pos, ctl) - DIW_HSTART_FB0) * 2;
+            let base_x = sprite_nominal_base_framebuffer_x(pos, ctl);
             if x_stop as i32 >= base_x {
                 x_stop = FB_WIDTH;
             }
@@ -3468,6 +3702,12 @@ fn maybe_log_frame_state(
         sprite_dma_observed,
         ymin,
         ymax,
+    );
+    log::info!(
+        "  sprpos={:04X?} sprctl={:04X?} sprarmed={:?}",
+        state.sprpos,
+        state.sprctl,
+        state.spr_armed,
     );
 }
 
@@ -4187,7 +4427,6 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         &mut manual_bpl_segments,
         visible_line0,
     );
-    backfill_left_overscan_background(&mut base_palettes, &mut palette_segments);
     render_timing.event_nanos = event_started.elapsed().as_nanos();
     render_timing.events = render_events.len() as u64;
     render_timing.control_segments = control_segments
@@ -4216,6 +4455,7 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
     let mut playfield_mask = vec![0u8; FB_WIDTH * rows];
     let mut collision_pixels = vec![CollisionPixel::default(); FB_WIDTH * rows];
     let mut clxdat = 0u16;
+    let mut dma_output_start_x_by_line = vec![None; rows];
 
     let background_started = Instant::now();
     fill_background_with_visible_line0(
@@ -4327,6 +4567,7 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         // predecessor was border (no carried-over shifter data) can suppress
         // the BPLCON1 scroll pulling its leading pre-fetch words into view.
         let mut last_playfield_line: Option<usize> = None;
+        let mut previous_playfield_tail_words: [Option<u16>; 8] = [None; 8];
         for y in 0..rows {
             let row_control_segments = &control_segments[y];
             let Some((x_start, x_stop)) = line_display_window_bounds(
@@ -4534,14 +4775,30 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                     }
                 }
             }
+            let block_start = last_playfield_line != Some(y.wrapping_sub(1));
+            let dma_output_start_x = bitplane_dma_output_start_x(
+                base_controls[y],
+                row_control_segments,
+                x_start,
+                words_per_row,
+                dma_planes.min(nplanes),
+            );
+            let carry_words = bitplane_carry_words_for_line(
+                block_start,
+                x_start,
+                dma_output_start_x,
+                previous_playfield_tail_words,
+            );
             let line_plan = DenisePlannedPlayfieldLine::new(
                 y,
                 x_start,
                 x_stop,
                 &row_words[..nplanes],
                 fetched_pixels,
-            );
-            let block_start = last_playfield_line != Some(y.wrapping_sub(1));
+            )
+            .with_carry_words(carry_words);
+            let bpl_output_start_x = dma_output_start_x.unwrap_or(0);
+            dma_output_start_x_by_line[y] = dma_output_start_x;
             last_playfield_line = Some(y);
             render_planned_playfield_line(
                 &line_plan,
@@ -4557,6 +4814,7 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 control_segment_idx,
                 base_controls[y].bplcon1,
                 block_start,
+                bpl_output_start_x,
                 visible_line0,
                 input.emulated_seconds,
                 input.emulated_frames,
@@ -4565,6 +4823,11 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 let m = control.modulo_for_plane(p, beam_y as i32);
                 ptrs[p] = ((ptrs[p] as i64).wrapping_add(m as i64) as u32) & ram_mask;
             }
+            previous_playfield_tail_words = std::array::from_fn(|plane| {
+                (plane < nplanes)
+                    .then(|| row_words[plane].last().copied())
+                    .flatten()
+            });
         }
         if let (Some(planes), Some(index)) = (export_planes.as_ref(), export_index.as_ref()) {
             let frame = input.emulated_frames;
@@ -4607,6 +4870,15 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
     );
 
     let manual_bpl_started = Instant::now();
+    seed_manual_bpl_segments_from_latches(
+        &mut manual_bpl_segments,
+        frame_start_bpldat,
+        render_events,
+        &base_controls,
+        &control_segments,
+        captured_bitplane_rows,
+        visible_line0,
+    );
     render_timing.manual_bpl_segments = manual_bpl_segments.len() as u64;
     render_manual_bpl_segments_with_visible_line0(
         &manual_bpl_segments,
@@ -4618,6 +4890,7 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         &palette_segments,
         &base_controls,
         &control_segments,
+        &dma_output_start_x_by_line,
         visible_line0,
         input.emulated_seconds,
         input.emulated_frames,
@@ -4798,6 +5071,7 @@ fn render_planned_playfield_line(
     mut control_segment_idx: usize,
     base_scroll_bplcon1: u16,
     suppress_prefetch_scroll_fill: bool,
+    bpl_output_start_x: usize,
     visible_line0: i32,
     emulated_seconds: f64,
     emulated_frames: u64,
@@ -4899,6 +5173,15 @@ fn render_planned_playfield_line(
         let nplanes = sample_control.nplanes().min(plan.plane_words.len());
         let delays = std::array::from_fn(|plane| sample_control.scroll_for_plane(plane));
         let ham_mode = sample_control.hold_and_modify();
+        let ham_history_start_native_x = if ham_mode {
+            pixel_control.ham_history_start_native_x(
+                pixel_diw_h_start,
+                pixel_repeat,
+                native_x_offset,
+            )
+        } else {
+            0
+        };
 
         let collision_dual = pixel_control.dual_playfield();
         let collision_key_now = (
@@ -4934,9 +5217,14 @@ fn render_planned_playfield_line(
             let visible_sample = line_visible
                 && (0..pixel_repeat).any(|dx| {
                     let pixel_x = x + dx;
-                    pixel_x < plan.x_stop && pixel_x >= win_x_start && pixel_x < win_x_stop
+                    pixel_x < plan.x_stop
+                        && pixel_x >= bpl_output_start_x
+                        && pixel_x >= win_x_start
+                        && pixel_x < win_x_stop
                 });
             if ham_mode {
+                next_ham_native_x =
+                    next_ham_native_x.max(ham_history_start_native_x.min(plan.fetched_pixels));
                 let preroll_stop = native_x.min(plan.fetched_pixels);
                 while next_ham_native_x < preroll_stop {
                     let skipped =
@@ -5156,6 +5444,7 @@ fn render_manual_bpl_segments(
     base_controls: &[ControlState],
     control_segments: &[Vec<ControlSegment>],
 ) {
+    let dma_output_start_x_by_line = vec![None; base_controls.len()];
     render_manual_bpl_segments_with_visible_line0(
         segments,
         fb,
@@ -5166,6 +5455,7 @@ fn render_manual_bpl_segments(
         palette_segments,
         base_controls,
         control_segments,
+        &dma_output_start_x_by_line,
         PAL_VISIBLE_LINE0,
         0.0,
         0,
@@ -5183,6 +5473,7 @@ fn render_manual_bpl_segments_with_visible_line0(
     palette_segments: &[Vec<PaletteSegment>],
     base_controls: &[ControlState],
     control_segments: &[Vec<ControlSegment>],
+    dma_output_start_x_by_line: &[Option<usize>],
     visible_line0: i32,
     emulated_seconds: f64,
     emulated_frames: u64,
@@ -5218,6 +5509,7 @@ fn render_manual_bpl_segments_with_visible_line0(
             palette_segments,
             base_controls,
             control_segments,
+            dma_output_start_x_by_line,
             &mut ham_color,
             &mut ham_select,
             &mut ham_select_pixels,
@@ -5276,6 +5568,7 @@ fn draw_manual_bpl_word(
     palette_segments: &[Vec<PaletteSegment>],
     base_controls: &[ControlState],
     control_segments: &[Vec<ControlSegment>],
+    dma_output_start_x_by_line: &[Option<usize>],
     ham_color: &mut u32,
     ham_select: &mut u8,
     ham_select_pixels: &mut [u8],
@@ -5289,6 +5582,11 @@ fn draw_manual_bpl_word(
     const MAX_MANUAL_BPL_NATIVE_SAMPLES: usize = MANUAL_BPL_WORD_BITS + MAX_BPLCON1_DELAY;
 
     let shifter = DeniseManualBitplaneShifter::new(seg.planes, MANUAL_BPL_WORD_BITS);
+    let dma_output_start_x = dma_output_start_x_by_line
+        .get(seg.line)
+        .copied()
+        .flatten()
+        .filter(|&x| seg.x < x as i32);
     let mut x_cursor = seg.x;
     let mut native_idx = 0usize;
     while native_idx < MAX_MANUAL_BPL_NATIVE_SAMPLES {
@@ -5324,6 +5622,9 @@ fn draw_manual_bpl_word(
                 return false;
             }
             let x = x as usize;
+            if dma_output_start_x.is_some_and(|dma_x| x >= dma_x) {
+                return false;
+            }
             let pixel_control =
                 control_at_x(base_controls[seg.line], &control_segments[seg.line], x);
             let (window_x_start, window_x_stop) = pixel_control.display_window_x();
@@ -5368,6 +5669,9 @@ fn draw_manual_bpl_word(
                 continue;
             }
             let x = x as usize;
+            if dma_output_start_x.is_some_and(|dma_x| x >= dma_x) {
+                continue;
+            }
             let pixel_control =
                 control_at_x(base_controls[seg.line], &control_segments[seg.line], x);
             let (window_x_start, window_x_stop) = pixel_control.display_window_x();
@@ -6122,6 +6426,10 @@ fn sprite_base_framebuffer_x(
     base_x + i32::from(hsub_70ns && control.shres())
 }
 
+fn sprite_nominal_base_framebuffer_x(pos: u16, ctl: u16) -> i32 {
+    (sprite_hstart(pos, ctl) - DIW_HSTART_FB0) * 2 + i32::from(sprite_hsub_70ns(ctl))
+}
+
 fn sprite_display_enable_x_for_y(
     sprite_display_enable_x_by_y: &[Option<usize>],
     y: usize,
@@ -6149,11 +6457,10 @@ fn sprite_pixel_inside_display_window(
     if x < enable_x {
         return false;
     }
-    // OCS/ECS Denise starts sprite display for this scanline after the first
-    // BPL1DAT load, whether that load came from bitplane DMA or a manual
-    // copper/CPU write. DIW still clips horizontally, but a manual BPL1DAT
-    // write can make sprites visible on lines where the vertical bitplane
-    // window is closed.
+    // OCS/ECS Denise clips normal sprites to the horizontal display window.
+    // Bitplane DMA opens that gate at DIW's left edge even when DDFSTRT delays
+    // the first playfield word; a manual BPL1DAT write can still open it on a
+    // scanline where the vertical bitplane window is closed.
     let (x_start, x_stop) = control.display_window_x();
     x >= x_start && x < x_stop
 }
@@ -6334,48 +6641,6 @@ fn effective_ddf_window(
     let start = start.max(hard_start);
     let stop = stop.min(hard_stop);
     (stop >= start).then_some((start, stop))
-}
-
-/// Backfill the left overscan border's background colour (COLOR00) on lines
-/// where the Copper establishes it *within* the overscan.
-///
-/// A Copper-driven horizontal gradient parks on a per-line WAIT and writes its
-/// first COLOR00 a few color clocks into the line, timed so the colour is ready
-/// at the playfield's left edge. The columns to the left of that first write sit
-/// in the overscan border (left of [`STANDARD_VISIBLE_X0`]) and would otherwise
-/// fall back to the previous line's final gradient colour -- a stale,
-/// brighter-or-darker vertical strip at the far left. A real PAL display crops
-/// this overscan; since the framebuffer keeps the full overscan field, adopt the
-/// colour the Copper sets within the overscan so the gradient reads continuously
-/// to the left edge instead of showing the cross-line carry. Lines whose first
-/// background change lands at or beyond the standard visible edge are untouched,
-/// so no in-picture pixel changes.
-fn backfill_left_overscan_background(
-    base_palettes: &mut [Palette],
-    palette_segments: &mut [Vec<PaletteSegment>],
-) {
-    for (base, segments) in base_palettes.iter_mut().zip(palette_segments.iter_mut()) {
-        // Only act when the background colour is established within the overscan
-        // (the gradient's first COLOR00 write lands left of the visible edge).
-        if segments
-            .first()
-            .is_none_or(|first| first.x >= STANDARD_VISIBLE_X0)
-        {
-            continue;
-        }
-        // The COLOR00 the Copper has set by the time the beam reaches the visible
-        // edge -- the gradient's entry colour for this line.
-        let entry_color = palette_at_x(*base, segments, STANDARD_VISIBLE_X0 - 1)[0];
-        base.write_entry(0, false, entry_color);
-        for seg in segments.iter_mut() {
-            if seg.x >= STANDARD_VISIBLE_X0 {
-                break;
-            }
-            if seg.entry == 0 && !seg.loct {
-                seg.value = entry_color;
-            }
-        }
-    }
 }
 
 fn palette_at_x(mut palette: Palette, segments: &[PaletteSegment], x: usize) -> Palette {
@@ -6990,6 +7255,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn present_h_shift_for_leaves_narrow_late_fetch_untouched() {
+        // A normal DIW can be used around a tiny one-word late-DDF object. The
+        // fetched object must stay in beam position; presentation centring must
+        // not copy its right edge into the deep-left overscan border.
+        assert_eq!(
+            present_h_shift_for(&ocs_snapshot(0x3481, 0x24D1, 0x0050, 0x0058)),
+            0
+        );
+    }
+
     fn put_word(ram: &mut [u8], pc: usize, word: u16) {
         ram[pc..pc + 2].copy_from_slice(&word.to_be_bytes());
     }
@@ -7429,7 +7705,7 @@ mod tests {
         );
         assert_eq!(
             beam_to_framebuffer_x_unclamped(COLOR_WRITE_HPOS_FB0 as u32),
-            48
+            52
         );
         assert_eq!(
             sprite_palette_control_framebuffer_x(SPRITE_PALETTE_CONTROL_HPOS_FB0 as u32),
@@ -7773,6 +8049,68 @@ mod tests {
         };
         assert_eq!(inset_fetch.fetch_start_native_x(false, 2), 14);
         assert_eq!(inset_fetch.native_x_offset(false, 2), 0);
+
+        let late_fetch_standard_window = RenderState {
+            bplcon0: 0,
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | 0x0081,
+            ddfstrt: 0x0048,
+            ..blank_state()
+        };
+        assert_eq!(
+            late_fetch_standard_window.fetch_start_native_x(false, 2),
+            31
+        );
+        assert_eq!(late_fetch_standard_window.native_x_offset(false, 2), 0);
+    }
+
+    #[test]
+    fn late_ddf_bitplane_output_waits_for_first_bpl1dat_fetch() {
+        let standard_ddf = ControlState {
+            dmacon: DMACON_DMAEN | DMACON_BPLEN,
+            bplcon0: 0x1000,
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16,
+            diwstop: (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | STANDARD_DIW_HSTOP as u16,
+            ddfstrt: 0x0038,
+            ddfstop: 0x00D0,
+            ..ControlState::default()
+        };
+        let standard_words =
+            standard_ddf.words_per_row(native_frame_width_for_control(standard_ddf));
+
+        assert_eq!(
+            bitplane_output_start_x(
+                standard_ddf,
+                &[],
+                standard_ddf.display_window_x().0,
+                standard_words,
+                standard_ddf.dma_planes(),
+            ),
+            standard_ddf.display_window_x().0
+        );
+
+        let inset_ddf = ControlState {
+            ddfstrt: 0x0050,
+            ddfstop: 0x00D0,
+            ..standard_ddf
+        };
+        let inset_words = inset_ddf.words_per_row(native_frame_width_for_control(inset_ddf));
+        let first_bpl1dat_x =
+            bitplane_fetch_framebuffer_x(bitplane_fetch_hpos_for_plane(inset_ddf, 0, 0));
+
+        assert_ne!(
+            inset_ddf.fetch_start_native_x(inset_ddf.diw_h_start(), 2),
+            0
+        );
+        assert_eq!(
+            bitplane_output_start_x(
+                inset_ddf,
+                &[],
+                inset_ddf.display_window_x().0,
+                inset_words,
+                inset_ddf.dma_planes(),
+            ),
+            first_bpl1dat_x
+        );
     }
 
     #[test]
@@ -7794,6 +8132,77 @@ mod tests {
                 ..ControlState::default()
             }),
             8
+        );
+    }
+
+    #[test]
+    fn bplcon1_delay_uses_previous_line_shifter_tail_when_contiguous() {
+        let control = ControlState {
+            bplcon0: 0x1000,
+            bplcon1: 3,
+            ..ControlState::default()
+        };
+        let plane_words = [vec![0x8000]];
+        let no_carry = DenisePlannedPlayfieldLine::new(0, 0, 32, &plane_words, 16);
+
+        assert_eq!(
+            no_carry.sample(control, 0),
+            DeniseBitplaneSample {
+                idx: 0,
+                nplanes: 1,
+                active: true,
+            }
+        );
+
+        let mut carry_words = [None; 8];
+        carry_words[0] = Some(0x0004);
+        let with_carry = DenisePlannedPlayfieldLine::new(0, 0, 32, &plane_words, 16)
+            .with_carry_words(carry_words);
+
+        assert_eq!(with_carry.sample(control, 0).idx, 1);
+        assert_eq!(with_carry.sample(control, 1).idx, 0);
+        assert_eq!(with_carry.sample(control, 3).idx, 1);
+    }
+
+    #[test]
+    fn aga_extended_bplcon1_delay_does_not_reuse_single_word_line_tail() {
+        let control = ControlState {
+            agnus_revision: AgnusRevision::AgaAlice,
+            bplcon0: BPLCON0_ECSENA | 0x1000,
+            bplcon1: 0x0800,
+            fmode: 0x0003,
+            ..ControlState::default()
+        };
+        assert_eq!(control.scroll_for_plane(0), 32);
+
+        let plane_words = [vec![0x8000, 0x0000, 0x0000]];
+        let mut carry_words = [None; 8];
+        carry_words[0] = Some(0xFFFF);
+        let line = DenisePlannedPlayfieldLine::new(0, 0, 64, &plane_words, 48)
+            .with_carry_words(carry_words);
+
+        assert_eq!(line.sample(control, 15).idx, 0);
+        assert_eq!(line.sample(control, 16).idx, 0);
+        assert_eq!(line.sample(control, 31).idx, 0);
+        assert_eq!(line.sample(control, 32).idx, 1);
+    }
+
+    #[test]
+    fn bplcon1_delay_drops_carry_when_first_bpl1dat_is_late() {
+        let mut previous_tail = [None; 8];
+        previous_tail[0] = Some(0x0001);
+
+        assert_eq!(
+            bitplane_carry_words_for_line(false, 64, Some(64), previous_tail),
+            previous_tail
+        );
+        assert_eq!(
+            bitplane_carry_words_for_line(false, 64, Some(158), previous_tail),
+            [None; 8]
+        );
+        assert_eq!(
+            bitplane_carry_words_for_line(true, 64, Some(64), previous_tail),
+            [None; 8]
         );
     }
 
@@ -8895,6 +9304,41 @@ mod tests {
     }
 
     #[test]
+    fn manual_sprite_position_write_does_not_seed_from_frame_start_data_latch() {
+        let mut initial_state = blank_state();
+        let (old_pos, ctl) = sprite_control_words(
+            PAL_VISIBLE_LINE0 as u16,
+            PAL_VISIBLE_LINE0 as u16 + 1,
+            DIW_HSTART_FB0 as u16,
+        );
+        let (new_pos, _) = sprite_control_words(
+            PAL_VISIBLE_LINE0 as u16,
+            PAL_VISIBLE_LINE0 as u16 + 1,
+            (DIW_HSTART_FB0 + 16) as u16,
+        );
+        initial_state.sprpos[0] = old_pos;
+        initial_state.sprctl[0] = ctl;
+        initial_state.sprdata[0] = 0xFFFF;
+        initial_state.spr_armed[0] = true;
+
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[cpu_event(
+                PAL_VISIBLE_LINE0 as u32,
+                COPPER_WAIT_HPOS_FB0 as u32,
+                0x140,
+                new_pos,
+            )],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[0].is_empty());
+    }
+
+    #[test]
     fn manual_sprite_replay_starts_from_beam_timed_data_write() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
@@ -8922,6 +9366,92 @@ mod tests {
         assert!(manual_sprite_lines[0]
             .iter()
             .any(|line| line.beam_y == PAL_VISIBLE_LINE0));
+    }
+
+    #[test]
+    fn early_line_position_write_does_not_reuse_previous_manual_sprite_data() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0;
+        let (pos, ctl) =
+            sprite_control_words(beam_y as u16, beam_y as u16 + 4, DIW_HSTART_FB0 as u16);
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+
+        let (next_pos, _) = sprite_control_words(
+            (beam_y + 1) as u16,
+            (beam_y + 2) as u16,
+            (DIW_HSTART_FB0 + 32) as u16,
+        );
+        let manual_sprite_lines = manual_sprite_lines_from_events_with_visible_line0(
+            &initial_state,
+            &[
+                cpu_event(beam_y as u32, COPPER_WAIT_HPOS_FB0 as u32, 0x144, 0xFFFF),
+                cpu_event((beam_y + 1) as u32, 4, 0x140, next_pos),
+            ],
+            &[None; 8],
+            PAL_VISIBLE_LINE0,
+            FB_HEIGHT,
+            false,
+        );
+
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .any(|line| line.beam_y == beam_y && line.data == 0xFFFF));
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .all(|line| line.beam_y != beam_y + 1));
+    }
+
+    #[test]
+    fn dma_seeded_sprite_reuse_keeps_later_register_data_on_same_line() {
+        let beam_y = PAL_VISIBLE_LINE0;
+        let mut manual_lines = vec![Vec::new(); 8];
+        manual_lines[0].push(SpriteLine {
+            hstart: DIW_HSTART_FB0 + 96,
+            hsub_70ns: false,
+            beam_y,
+            data: 0xFFFF,
+            datb: 0,
+            data_ext: [0; 3],
+            datb_ext: [0; 3],
+            width_words: 1,
+            attached: false,
+            x_start: 208,
+            x_stop: FB_WIDTH,
+        });
+
+        let mut dma_seeded = vec![Vec::new(); 8];
+        dma_seeded[0].push(SpriteLine {
+            hstart: DIW_HSTART_FB0 + 96,
+            hsub_70ns: false,
+            beam_y,
+            data: 0x8000,
+            datb: 0,
+            data_ext: [0; 3],
+            datb_ext: [0; 3],
+            width_words: 1,
+            attached: false,
+            x_start: 112,
+            x_stop: 240,
+        });
+
+        merge_dma_seeded_manual_sprite_lines(&mut manual_lines, dma_seeded);
+
+        assert!(manual_lines[0].iter().any(|line| {
+            line.beam_y == beam_y
+                && line.data == 0xFFFF
+                && line.x_start == 208
+                && line.x_stop == FB_WIDTH
+        }));
+        assert!(manual_lines[0].iter().any(|line| {
+            line.beam_y == beam_y
+                && line.data == 0x8000
+                && line.x_start == 112
+                && line.x_stop == 208
+        }));
+        assert!(manual_lines[0]
+            .iter()
+            .all(|line| line.data != 0x8000 || line.x_stop <= 208));
     }
 
     #[test]
@@ -9193,7 +9723,7 @@ mod tests {
         initial_state.sprdata[0] = 0xFFFF;
         initial_state.spr_armed[0] = true;
 
-        let boundary_hpos = u32::from(first_hstart / 2) + SPRITE_POSITION_WRITE_PIPELINE_CCK;
+        let boundary_hpos = u32::from(first_hstart / 2) + SPRITE_REGISTER_WRITE_PIPELINE_CCK;
         let manual_sprite_lines = manual_sprite_lines_from_events(
             &initial_state,
             &[
@@ -9221,7 +9751,108 @@ mod tests {
     }
 
     #[test]
-    fn manual_sprite_data_writes_affect_only_later_pixels_on_same_line() {
+    fn manual_sprite_data_write_before_compare_uses_sprite_compare_domain() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0;
+        let hstart = 240;
+        let (pos, ctl) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, hstart);
+        initial_state.sprpos[2] = pos;
+        initial_state.sprctl[2] = ctl;
+        initial_state.palette.write_ocs(25, 0x0F00);
+
+        let event_hpos = 116;
+        let data_x = sprite_data_write_framebuffer_x(event_hpos);
+        let colour_output_x = beam_to_framebuffer_x_unclamped(event_hpos) as usize;
+        let base_x = sprite_nominal_base_framebuffer_x(pos, ctl) as usize;
+        assert!(data_x < base_x);
+        assert!(colour_output_x > base_x);
+
+        let manual_sprite_lines = manual_sprite_lines_from_events(
+            &initial_state,
+            &[cpu_event(beam_y as u32, event_hpos, 0x154, 0x8000)],
+        );
+
+        let line = manual_sprite_lines[2]
+            .iter()
+            .find(|line| line.beam_y == beam_y)
+            .expect("data write before the comparator affects the current scanline");
+        assert_eq!(line.x_start, data_x);
+        assert_eq!(line.data, 0x8000);
+        assert_eq!(
+            sprite_line_pixel_bits_at(
+                line,
+                base_x as i32,
+                ControlState::from_render_state(&initial_state),
+                &[],
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn attached_manual_sprite_data_write_before_compare_uses_sprite_compare_domain() {
+        let mut initial_state = blank_state();
+        let beam_y = PAL_VISIBLE_LINE0;
+        let hstart = 240;
+        let (pos, ctl) = sprite_control_words(beam_y as u16, beam_y as u16 + 1, hstart);
+        initial_state.sprpos[0] = pos;
+        initial_state.sprctl[0] = ctl;
+        initial_state.sprpos[1] = pos;
+        initial_state.sprctl[1] = ctl | 0x0080;
+        initial_state.palette.write_ocs(20, 0x0F00);
+
+        let event_hpos = 116;
+        let data_x = sprite_data_write_framebuffer_x(event_hpos);
+        let colour_output_x = beam_to_framebuffer_x_unclamped(event_hpos) as usize;
+        let base_x = sprite_nominal_base_framebuffer_x(pos, ctl) as usize;
+        assert!(data_x < base_x);
+        assert!(colour_output_x > base_x);
+
+        let events = [
+            cpu_event(beam_y as u32, event_hpos, 0x144, 0),
+            cpu_event(beam_y as u32, event_hpos, 0x14C, 0x8000),
+        ];
+        let manual_sprite_lines = manual_sprite_lines_from_events(&initial_state, &events);
+
+        let base_controls = [ControlState::from_render_state(&initial_state); FB_HEIGHT];
+        let mut render_state = initial_state;
+        apply_move(&mut render_state, 0x144, 0);
+        apply_move(&mut render_state, 0x14C, 0x8000);
+        let ram = vec![0u8; 512 * 1024];
+        let base_palettes = [render_state.palette; FB_HEIGHT];
+        let palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let control_segments = vec![Vec::new(); FB_HEIGHT];
+        let playfield_mask = vec![0u8; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut fb = vec![rgb12_to_rgba8(0); FB_PIXELS];
+
+        render_sprites_with_manual_lines(
+            &render_state,
+            &ram,
+            &mut fb,
+            SpriteClip {
+                x_start: 0,
+                x_stop: FB_WIDTH,
+                y_start: 0,
+                y_stop: FB_HEIGHT,
+            },
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+            &playfield_mask,
+            &mut collision_pixels,
+            sprite_pointer_refreshes_from_mask([false; 8]),
+            &[],
+            false,
+            Some(&manual_sprite_lines),
+        );
+
+        assert_eq!(fb[base_x], rgb12_to_rgba8(0x0F00));
+    }
+
+    #[test]
+    fn manual_sprite_data_write_after_compare_waits_for_next_scanline() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
             PAL_VISIBLE_LINE0 as u16,
@@ -9232,14 +9863,22 @@ mod tests {
         initial_state.sprctl[0] = ctl;
         initial_state.palette.write_ocs(17, 0x0F00);
 
+        let after_compare_hpos =
+            (DIW_HSTART_FB0 as u32 / 2) + SPRITE_REGISTER_WRITE_PIPELINE_CCK + 2;
+        assert!(sprite_data_write_framebuffer_x(after_compare_hpos) > 0);
         let events = [cpu_event(
             PAL_VISIBLE_LINE0 as u32,
-            (COPPER_WAIT_HPOS_FB0 + 1) as u32,
+            after_compare_hpos,
             0x144,
             0xA000,
         )];
         let manual_sprite_lines = manual_sprite_lines_from_events(&initial_state, &events);
-        assert_eq!(manual_sprite_lines[0][0].x_start, 4);
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .all(|line| line.beam_y != PAL_VISIBLE_LINE0));
+        assert!(manual_sprite_lines[0]
+            .iter()
+            .any(|line| line.beam_y == PAL_VISIBLE_LINE0 + 1 && line.x_start == 0));
 
         let base_controls = [ControlState::from_render_state(&initial_state); FB_HEIGHT];
         let mut render_state = initial_state;
@@ -9275,11 +9914,12 @@ mod tests {
         );
 
         assert_eq!(fb[0], rgb12_to_rgba8(0));
-        assert_eq!(fb[4], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[4], rgb12_to_rgba8(0));
+        assert_eq!(fb[FB_WIDTH], rgb12_to_rgba8(0x0F00));
     }
 
     #[test]
-    fn manual_sprite_data_arms_before_datb_updates_later_pixels() {
+    fn manual_sprite_datb_write_after_compare_waits_for_next_scanline() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
             PAL_VISIBLE_LINE0 as u16,
@@ -9291,6 +9931,9 @@ mod tests {
         initial_state.palette.write_ocs(17, 0x0F00);
         initial_state.palette.write_ocs(19, 0x00F0);
 
+        let after_compare_hpos =
+            (DIW_HSTART_FB0 as u32 / 2) + SPRITE_REGISTER_WRITE_PIPELINE_CCK + 2;
+        assert!(sprite_data_write_framebuffer_x(after_compare_hpos) > 0);
         let events = [
             cpu_event(
                 PAL_VISIBLE_LINE0 as u32,
@@ -9298,12 +9941,7 @@ mod tests {
                 0x144,
                 0xFFFF,
             ),
-            cpu_event(
-                PAL_VISIBLE_LINE0 as u32,
-                (COPPER_WAIT_HPOS_FB0 + 1) as u32,
-                0x146,
-                0xFFFF,
-            ),
+            cpu_event(PAL_VISIBLE_LINE0 as u32, after_compare_hpos, 0x146, 0xFFFF),
         ];
         let manual_sprite_lines = manual_sprite_lines_from_events(&initial_state, &events);
 
@@ -9342,11 +9980,12 @@ mod tests {
         );
 
         assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
-        assert_eq!(fb[4], rgb12_to_rgba8(0x00F0));
+        assert_eq!(fb[4], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[FB_WIDTH], rgb12_to_rgba8(0x00F0));
     }
 
     #[test]
-    fn manual_sprite_control_write_disarms_output_until_data_write() {
+    fn manual_sprite_control_write_after_compare_preserves_loaded_word() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
             PAL_VISIBLE_LINE0 as u16,
@@ -9411,9 +10050,10 @@ mod tests {
 
         assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
         assert_eq!(fb[7], rgb12_to_rgba8(0x0F00));
-        assert_eq!(fb[8], rgb12_to_rgba8(0));
-        assert_eq!(fb[15], rgb12_to_rgba8(0));
+        assert_eq!(fb[8], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[15], rgb12_to_rgba8(0x0F00));
         assert_eq!(fb[16], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[32], rgb12_to_rgba8(0));
     }
 
     #[test]
@@ -9484,7 +10124,7 @@ mod tests {
     }
 
     #[test]
-    fn attached_manual_sprite_writes_replay_later_odd_data_bits() {
+    fn attached_manual_sprite_data_after_compare_waits_for_next_scanline() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
             PAL_VISIBLE_LINE0 as u16,
@@ -9497,6 +10137,9 @@ mod tests {
         initial_state.sprctl[1] = ctl | 0x0080;
         initial_state.palette.write_ocs(20, 0x0F00);
 
+        let after_compare_hpos =
+            (DIW_HSTART_FB0 as u32 / 2) + SPRITE_REGISTER_WRITE_PIPELINE_CCK + 2;
+        assert!(sprite_data_write_framebuffer_x(after_compare_hpos) > 0);
         let events = [
             cpu_event(
                 PAL_VISIBLE_LINE0 as u32,
@@ -9510,12 +10153,7 @@ mod tests {
                 0x14C,
                 0x8000,
             ),
-            cpu_event(
-                PAL_VISIBLE_LINE0 as u32,
-                (COPPER_WAIT_HPOS_FB0 + 1) as u32,
-                0x14C,
-                0x2000,
-            ),
+            cpu_event(PAL_VISIBLE_LINE0 as u32, after_compare_hpos, 0x14C, 0x2000),
         ];
         let manual_sprite_lines = manual_sprite_lines_from_events(&initial_state, &events);
 
@@ -9554,11 +10192,11 @@ mod tests {
         );
 
         assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
-        assert_eq!(fb[4], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[4], rgb12_to_rgba8(0));
     }
 
     #[test]
-    fn attached_manual_sprite_writes_preserve_even_pixels_before_odd_arms() {
+    fn attached_manual_sprite_data_after_compare_preserves_loaded_even_pixels() {
         let mut initial_state = blank_state();
         let (pos, ctl) = sprite_control_words(
             PAL_VISIBLE_LINE0 as u16,
@@ -9574,9 +10212,12 @@ mod tests {
         initial_state.palette.write_ocs(17, 0x0F00);
         initial_state.palette.write_ocs(21, 0x00F0);
 
+        let after_compare_hpos =
+            (DIW_HSTART_FB0 as u32 / 2) + SPRITE_REGISTER_WRITE_PIPELINE_CCK + 2;
+        assert!(sprite_data_write_framebuffer_x(after_compare_hpos) > 0);
         let events = [cpu_event(
             PAL_VISIBLE_LINE0 as u32,
-            (COPPER_WAIT_HPOS_FB0 + 1) as u32,
+            after_compare_hpos,
             0x14C,
             0x2000,
         )];
@@ -9616,7 +10257,7 @@ mod tests {
         );
 
         assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
-        assert_eq!(fb[4], rgb12_to_rgba8(0x00F0));
+        assert_eq!(fb[4], rgb12_to_rgba8(0x0F00));
     }
 
     #[test]
@@ -10260,7 +10901,7 @@ mod tests {
     }
 
     #[test]
-    fn sprite_register_data_write_replaces_dma_latch_on_same_beam_line() {
+    fn sprite_register_data_write_after_compare_preserves_dma_latch_on_same_beam_line() {
         let mut state = blank_state();
         let (pos, ctl) = sprite_control_words(
             PAL_VISIBLE_LINE0 as u16,
@@ -10291,11 +10932,14 @@ mod tests {
             datb_ext: [0; 3],
             width_words: 1,
         }];
+        let after_compare_hpos =
+            (DIW_HSTART_FB0 as u32 / 2) + SPRITE_REGISTER_WRITE_PIPELINE_CCK + 2;
+        assert!(sprite_data_write_framebuffer_x(after_compare_hpos) > 0);
         let manual_sprite_lines = manual_sprite_lines_from_events(
             &state,
             &[beam_event(
                 PAL_VISIBLE_LINE0 as u32,
-                (COPPER_WAIT_HPOS_FB0 + 2) as u32,
+                after_compare_hpos,
                 0x0144,
                 0x0000,
             )],
@@ -10325,8 +10969,9 @@ mod tests {
 
         assert_eq!(fb[0], rgb12_to_rgba8(0x0F00));
         assert_eq!(fb[7], rgb12_to_rgba8(0x0F00));
-        assert_eq!(fb[8], rgb12_to_rgba8(0));
-        assert_eq!(fb[31], rgb12_to_rgba8(0));
+        assert_eq!(fb[8], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[31], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[32], rgb12_to_rgba8(0));
     }
 
     #[test]
@@ -10919,6 +11564,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -10963,6 +11609,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -10972,6 +11619,52 @@ mod tests {
         assert_eq!(fb[64], rgb12_to_rgba8(0x0122));
         assert_eq!(fb[65], rgb12_to_rgba8(0x0122));
         assert_eq!(&playfield_mask[62..64], &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn planned_ham_dma_ignores_extra_early_ddf_history_before_diw() {
+        let mut row_words = vec![vec![0; 2]; 6];
+        row_words[0][0] |= 0x8000; // native x 0: direct palette entry 1
+        row_words[4][0] |= 0x0001; // native x 15: HAM blue := 0
+        row_words[4][1] |= 0x8000; // native x 16: HAM blue := 0
+        let line_plan = DenisePlannedPlayfieldLine::new(0, 64, 66, &row_words, 32);
+        let mut control = visible_lowres_control(0x6800);
+        control.diwstrt = ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16;
+        control.diwstop =
+            (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | (STANDARD_DIW_HSTART as u16 + 1);
+        control.ddfstrt = 0x0030;
+        control.ddfstop = 0x00D0;
+        let mut palette = Palette::new();
+        palette.write_ocs(1, 0x0123);
+        let mut fb = vec![0; FB_PIXELS];
+        let mut playfield_mask = vec![0; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut clxdat = 0;
+
+        render_planned_playfield_line(
+            &line_plan,
+            &mut fb,
+            &mut playfield_mask,
+            &mut collision_pixels,
+            &mut clxdat,
+            palette,
+            &[],
+            0,
+            control,
+            &[],
+            0,
+            control.bplcon1,
+            false,
+            0,
+            PAL_VISIBLE_LINE0,
+            0.0,
+            0,
+        );
+
+        assert_eq!(control.native_x_offset(control.diw_h_start(), 2), 16);
+        assert_eq!(fb[64], rgb12_to_rgba8(0x0000));
+        assert_eq!(fb[65], rgb12_to_rgba8(0x0000));
+        assert_eq!(&playfield_mask[64..66], &[0x02, 0x02]);
     }
 
     #[test]
@@ -11011,6 +11704,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -11048,6 +11742,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -11085,6 +11780,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -11122,6 +11818,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -11155,6 +11852,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -11484,6 +12182,7 @@ mod tests {
         planes[0] = 0x8000;
         let segments = [ManualBplSegment {
             line: 0,
+            hpos: 0,
             x: 0,
             planes,
             palette,
@@ -11527,6 +12226,7 @@ mod tests {
         planes[0] = 0x4000;
         let segments = [ManualBplSegment {
             line: 0,
+            hpos: 0,
             x: 0,
             planes,
             palette,
@@ -11573,6 +12273,7 @@ mod tests {
         planes[0] = 0x8000;
         let segments = [ManualBplSegment {
             line: 0,
+            hpos: 0,
             x: 0,
             planes,
             palette,
@@ -11624,6 +12325,55 @@ mod tests {
         assert_eq!(palette_segments[border_line][0].entry, 0);
         assert_eq!(palette_segments[border_line][0].value, 0x0103);
         assert_eq!(base_palettes[border_line + 1][0], 0x0103);
+    }
+
+    #[test]
+    fn color00_overscan_write_does_not_backfill_row_start() {
+        let mut state = blank_state();
+        state.palette.write_ocs(0, 0x0000);
+        state.diwstrt = ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16;
+        state.diwstop = (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | STANDARD_DIW_HSTOP as u16;
+        let mut base_palettes = [state.palette; FB_HEIGHT];
+        let mut palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let mut base_controls = [ControlState::from_render_state(&state); FB_HEIGHT];
+        let mut control_segments = vec![Vec::new(); FB_HEIGHT];
+        let mut manual_bpl_segments = Vec::new();
+        let beam_y = PAL_VISIBLE_LINE0 as u32;
+        let events = [
+            beam_event(beam_y, 68, 0x0180, 0x087A),
+            beam_event(beam_y, 76, 0x0180, 0x0000),
+        ];
+
+        apply_render_events(
+            &mut state,
+            &events,
+            &mut base_palettes,
+            &mut palette_segments,
+            &mut base_controls,
+            &mut control_segments,
+            &mut manual_bpl_segments,
+        );
+
+        assert_eq!(palette_segments[0][0].x, 60);
+        assert_eq!(palette_segments[0][0].value, 0x087A);
+        assert_eq!(palette_segments[0][1].x, 92);
+        assert_eq!(palette_segments[0][1].value, 0x0000);
+        assert_eq!(base_palettes[0][0], 0x0000);
+
+        let mut fb = vec![0; FB_PIXELS];
+        fill_background(
+            &mut fb,
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+        );
+
+        assert_eq!(fb[0], rgb12_to_rgba8(0x0000));
+        assert_eq!(fb[59], rgb12_to_rgba8(0x0000));
+        assert_eq!(fb[60], rgb12_to_rgba8(0x087A));
+        assert_eq!(fb[91], rgb12_to_rgba8(0x087A));
+        assert_eq!(fb[92], rgb12_to_rgba8(0x0000));
     }
 
     #[test]
@@ -11682,7 +12432,7 @@ mod tests {
 
         let line = (0x50 - 0x2C) as usize;
         let sprite_x = sprite_palette_control_framebuffer_x(hpos);
-        assert_eq!(sprite_x, color_write_framebuffer_x(hpos).saturating_sub(8));
+        assert_eq!(sprite_x, color_write_framebuffer_x(hpos).saturating_sub(4));
         let beam_x = beam_to_framebuffer_x_unclamped(hpos) as usize;
         assert!(sprite_x < beam_x);
         assert_eq!(control_segments[line].len(), 2);
@@ -11993,6 +12743,112 @@ mod tests {
                 "word {word_idx}"
             );
         }
+    }
+
+    #[test]
+    fn manual_bpl1dat_snapshots_dma_updated_bpldat_latches() {
+        let mut state = RenderState {
+            dmacon: DMACON_DMAEN | DMACON_BPLEN,
+            bplcon0: 0x3000,
+            ddfstrt: 0x0038,
+            ddfstop: 0x0038,
+            ..blank_state()
+        };
+        state.bpldat[1] = 0x4000;
+        let base_control = ControlState::from_render_state(&state);
+        let base_controls = [base_control; FB_HEIGHT];
+        let control_segments = vec![Vec::new(); FB_HEIGHT];
+        let hpos = 0x0040;
+        let mut segments = [ManualBplSegment {
+            line: 0,
+            hpos,
+            x: beam_to_framebuffer_x_unclamped(hpos),
+            planes: [0; 8],
+            palette: state.palette,
+        }];
+        let mut captured_rows = vec![None; FB_HEIGHT];
+        let mut planes: [Vec<u16>; 8] = std::array::from_fn(|_| vec![0]);
+        planes[1][0] = 0x8000;
+        captured_rows[0] = Some(CapturedBitplaneRow {
+            nplanes: 3,
+            words_per_row: 1,
+            planes,
+        });
+        let events = [beam_event(PAL_VISIBLE_LINE0 as u32, hpos, 0x0110, 0x0000)];
+
+        seed_manual_bpl_segments_from_latches(
+            &mut segments,
+            state.bpldat,
+            &events,
+            &base_controls,
+            &control_segments,
+            &captured_rows,
+            PAL_VISIBLE_LINE0,
+        );
+
+        assert_eq!(segments[0].planes[0], 0x0000);
+        assert_eq!(segments[0].planes[1], 0x8000);
+    }
+
+    #[test]
+    fn manual_bpl1dat_before_dma_output_stops_at_dma_shifter_load() {
+        let mut palette = Palette::new();
+        palette.write_ocs(1, 0x0F00);
+        let control = ControlState {
+            dmacon: DMACON_DMAEN | DMACON_BPLEN,
+            bplcon0: 0x1000,
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16,
+            diwstop: (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | STANDARD_DIW_HSTOP as u16,
+            ddfstrt: 0x0050,
+            ddfstop: 0x00D0,
+            ..ControlState::default()
+        };
+        let base_palettes = [palette; FB_HEIGHT];
+        let palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let base_controls = [control; FB_HEIGHT];
+        let control_segments = vec![Vec::new(); FB_HEIGHT];
+        let dma_output_x = bitplane_dma_output_start_x(
+            control,
+            &[],
+            control.display_window_x().0,
+            control.words_per_row(native_frame_width_for_control(control)),
+            control.dma_planes(),
+        )
+        .unwrap();
+        let mut fb = vec![rgb12_to_rgba8(0x000F); FB_PIXELS];
+        let mut playfield_mask = vec![0u8; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut clxdat = 0u16;
+        let mut planes = [0u16; 8];
+        planes[0] = 0xFFFF;
+        let segments = [ManualBplSegment {
+            line: 0,
+            hpos: 0,
+            x: dma_output_x as i32 - 8,
+            planes,
+            palette,
+        }];
+        let mut dma_output_start_x_by_line = vec![None; FB_HEIGHT];
+        dma_output_start_x_by_line[0] = Some(dma_output_x);
+
+        render_manual_bpl_segments_with_visible_line0(
+            &segments,
+            &mut fb,
+            &mut playfield_mask,
+            &mut collision_pixels,
+            &mut clxdat,
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+            &dma_output_start_x_by_line,
+            PAL_VISIBLE_LINE0,
+            0.0,
+            0,
+        );
+
+        assert_eq!(fb[dma_output_x - 2], rgb12_to_rgba8(0x0F00));
+        assert_eq!(fb[dma_output_x], rgb12_to_rgba8(0x000F));
     }
 
     #[test]
