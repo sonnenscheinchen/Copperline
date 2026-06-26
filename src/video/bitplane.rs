@@ -2688,6 +2688,33 @@ fn line_fetch_plans_for_line(
     plans
 }
 
+fn bitplane_output_start_x(
+    base_control: ControlState,
+    control_segments: &[ControlSegment],
+    display_start_x: usize,
+    words_per_row: usize,
+    dma_planes: usize,
+) -> usize {
+    if dma_planes == 0 || words_per_row == 0 {
+        return 0;
+    }
+    let mut display_control = base_control;
+    for segment in control_segments {
+        if segment.x <= display_start_x {
+            display_control = segment.control;
+        }
+    }
+    let pixel_repeat = display_control.framebuffer_pixel_repeat();
+    if display_control.fetch_start_native_x(display_control.diw_h_start(), pixel_repeat) == 0 {
+        return 0;
+    }
+    line_fetch_plan_for_word(base_control, control_segments, 0, dma_planes)
+        .iter()
+        .find_map(|(hpos, plane)| (plane == 0).then_some(beam_to_framebuffer_x_unclamped(hpos)))
+        .map(|x| x.clamp(0, FB_WIDTH as i32) as usize)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 fn line_fetch_hpos_for_word(
     base_control: ControlState,
@@ -4699,6 +4726,13 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 &row_words[..nplanes],
                 fetched_pixels,
             );
+            let bpl_output_start_x = bitplane_output_start_x(
+                base_controls[y],
+                row_control_segments,
+                x_start,
+                words_per_row,
+                dma_planes.min(nplanes),
+            );
             let block_start = last_playfield_line != Some(y.wrapping_sub(1));
             last_playfield_line = Some(y);
             render_planned_playfield_line(
@@ -4715,6 +4749,7 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
                 control_segment_idx,
                 base_controls[y].bplcon1,
                 block_start,
+                bpl_output_start_x,
                 visible_line0,
                 input.emulated_seconds,
                 input.emulated_frames,
@@ -4965,6 +5000,7 @@ fn render_planned_playfield_line(
     mut control_segment_idx: usize,
     base_scroll_bplcon1: u16,
     suppress_prefetch_scroll_fill: bool,
+    bpl_output_start_x: usize,
     visible_line0: i32,
     emulated_seconds: f64,
     emulated_frames: u64,
@@ -5101,7 +5137,10 @@ fn render_planned_playfield_line(
             let visible_sample = line_visible
                 && (0..pixel_repeat).any(|dx| {
                     let pixel_x = x + dx;
-                    pixel_x < plan.x_stop && pixel_x >= win_x_start && pixel_x < win_x_stop
+                    pixel_x < plan.x_stop
+                        && pixel_x >= bpl_output_start_x
+                        && pixel_x >= win_x_start
+                        && pixel_x < win_x_stop
                 });
             if ham_mode {
                 let preroll_stop = native_x.min(plan.fetched_pixels);
@@ -7943,6 +7982,57 @@ mod tests {
         };
         assert_eq!(inset_fetch.fetch_start_native_x(false, 2), 14);
         assert_eq!(inset_fetch.native_x_offset(false, 2), 0);
+    }
+
+    #[test]
+    fn late_ddf_bitplane_output_waits_for_first_bpl1dat_fetch() {
+        let standard_ddf = ControlState {
+            dmacon: DMACON_DMAEN | DMACON_BPLEN,
+            bplcon0: 0x1000,
+            diwstrt: ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16,
+            diwstop: (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | STANDARD_DIW_HSTOP as u16,
+            ddfstrt: 0x0038,
+            ddfstop: 0x00D0,
+            ..ControlState::default()
+        };
+        let standard_words =
+            standard_ddf.words_per_row(native_frame_width_for_control(standard_ddf));
+
+        assert_eq!(
+            bitplane_output_start_x(
+                standard_ddf,
+                &[],
+                standard_ddf.display_window_x().0,
+                standard_words,
+                standard_ddf.dma_planes(),
+            ),
+            0
+        );
+
+        let inset_ddf = ControlState {
+            ddfstrt: 0x0050,
+            ddfstop: 0x00D0,
+            ..standard_ddf
+        };
+        let inset_words = inset_ddf.words_per_row(native_frame_width_for_control(inset_ddf));
+        let first_bpl1dat_x =
+            beam_to_framebuffer_x_unclamped(bitplane_fetch_hpos_for_plane(inset_ddf, 0, 0))
+                .clamp(0, FB_WIDTH as i32) as usize;
+
+        assert_ne!(
+            inset_ddf.fetch_start_native_x(inset_ddf.diw_h_start(), 2),
+            0
+        );
+        assert_eq!(
+            bitplane_output_start_x(
+                inset_ddf,
+                &[],
+                inset_ddf.display_window_x().0,
+                inset_words,
+                inset_ddf.dma_planes(),
+            ),
+            first_bpl1dat_x
+        );
     }
 
     #[test]
@@ -11325,6 +11415,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -11369,6 +11460,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -11417,6 +11509,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -11454,6 +11547,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -11491,6 +11585,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -11528,6 +11623,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,
@@ -11561,6 +11657,7 @@ mod tests {
             0,
             control.bplcon1,
             false,
+            0,
             PAL_VISIBLE_LINE0,
             0.0,
             0,

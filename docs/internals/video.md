@@ -38,6 +38,9 @@ pre-advances that hidden sample before painting the DIW edge. Single-word
 lo-res fetches that start before the standard `$38` DDF slot expose complete
 16-pixel groups; the standard one-sample phase bias is trimmed when it would
 push a standard-width DIW past the completed early-DDF row at the right edge.
+When DDFSTRT is late enough that DIW opens before DMA has delivered the
+first BPL1DAT word for the row, playfield output remains border-colour until
+that plane-0 fetch reaches Denise instead of sampling stale shifter contents.
 A BPLCON1 write whose normal register position is already at or beyond DIW's
 right edge is not pulled left into the current line's bitplane-scroll domain;
 it updates following lines without retapping the visible HAM tail of the
