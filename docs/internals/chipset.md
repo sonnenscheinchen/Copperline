@@ -48,17 +48,21 @@ sprite fetch quanta (FMODE=0 stays byte-identical to the OCS/ECS slot
 timing).
 
 Sprite DMA retains its latched POS/CTL descriptor independently from the
-SPRxPT registers while a sprite data stream is active. If software rewrites
-SPRxPT while the retained descriptor is still waiting for VSTART, the current
-stream is discarded and the next sprite DMA slot fetches a descriptor from
-the new address; otherwise descriptor words can be mistaken for sprite data.
+SPRxPT registers while a sprite data stream is active or waiting for VSTART.
+If software rewrites SPRxPT on a later beam line while that descriptor is
+still pending, the retained POS/CTL stays latched and the new SPRxPT value
+retargets the descriptor's post-control data stream. A same-line rewrite
+after the descriptor fetch is treated as a descriptor restart for the next
+sprite DMA slot; otherwise freshly loaded descriptor words would be mistaken
+for sprite data.
 Software can also write SPRxPOS/SPRxCTL directly and let sprite DMA fetch
 data from the current SPRxPT stream; in that case SPRxPT names the first
 data word pair, not a memory descriptor. A save-state load clears
 Copperline's transient Agnus descriptor latch, so this register-stream case
 is reconstructed from Denise's retained armed state, SPRxPOS/SPRxCTL, and
-the next beam-ordered SPRxPT low-word write. If a DMA descriptor has already
-been retained and is still waiting for VSTART, later SPRxPOS/SPRxCTL writes
+an after-slot SPRxPT low-word write in the rendered display area. If a DMA
+descriptor has already been retained and is still waiting for VSTART, later
+SPRxPOS/SPRxCTL writes
 update the live comparators but keep the descriptor's post-control data
 origin. The frame-start replay path mirrors this by replaying off-screen
 DMACON and SPRxPT writes in beam order before rendering the visible field.
