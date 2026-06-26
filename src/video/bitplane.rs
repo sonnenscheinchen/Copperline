@@ -824,6 +824,18 @@ impl ControlState {
             .max(0) as usize
     }
 
+    fn ham_history_start_native_x(
+        &self,
+        diw_h_start: u16,
+        pixel_repeat: usize,
+        native_x_offset: usize,
+    ) -> usize {
+        let display_phase_native =
+            ((diw_h_start as i32 - self.fetch_reference()) * 2) / pixel_repeat as i32;
+        let visible_phase = display_phase_native.max(0) as usize;
+        native_x_offset.saturating_sub(visible_phase.min(native_x_offset))
+    }
+
     fn fetch_origin_native_shift(&self, diw_h_start: u16, pixel_repeat: usize) -> i32 {
         let display_native_shift =
             ((diw_h_start as i32 - self.fetch_reference()) * 2) / pixel_repeat as i32;
@@ -1130,8 +1142,8 @@ impl<'a> DenisePlannedPlayfieldLine<'a> {
             let delay = delays[plane];
             if native_x < delay {
                 active = true;
-                let carry_offset = delay - native_x;
-                if carry_offset <= 16 {
+                if delay <= 16 {
+                    let carry_offset = delay - native_x;
                     if let Some(word) = self.carry_words.get(plane).copied().flatten() {
                         let bit = carry_offset - 1;
                         if word & (1 << bit) != 0 {
@@ -3691,6 +3703,12 @@ fn maybe_log_frame_state(
         ymin,
         ymax,
     );
+    log::info!(
+        "  sprpos={:04X?} sprctl={:04X?} sprarmed={:?}",
+        state.sprpos,
+        state.sprctl,
+        state.spr_armed,
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -4409,7 +4427,6 @@ pub fn render_from_input(input: &RenderInput, fb: &mut [u32]) -> RenderResult {
         &mut manual_bpl_segments,
         visible_line0,
     );
-    backfill_left_overscan_background(&mut base_palettes, &mut palette_segments);
     render_timing.event_nanos = event_started.elapsed().as_nanos();
     render_timing.events = render_events.len() as u64;
     render_timing.control_segments = control_segments
@@ -5156,6 +5173,15 @@ fn render_planned_playfield_line(
         let nplanes = sample_control.nplanes().min(plan.plane_words.len());
         let delays = std::array::from_fn(|plane| sample_control.scroll_for_plane(plane));
         let ham_mode = sample_control.hold_and_modify();
+        let ham_history_start_native_x = if ham_mode {
+            pixel_control.ham_history_start_native_x(
+                pixel_diw_h_start,
+                pixel_repeat,
+                native_x_offset,
+            )
+        } else {
+            0
+        };
 
         let collision_dual = pixel_control.dual_playfield();
         let collision_key_now = (
@@ -5197,6 +5223,8 @@ fn render_planned_playfield_line(
                         && pixel_x < win_x_stop
                 });
             if ham_mode {
+                next_ham_native_x =
+                    next_ham_native_x.max(ham_history_start_native_x.min(plan.fetched_pixels));
                 let preroll_stop = native_x.min(plan.fetched_pixels);
                 while next_ham_native_x < preroll_stop {
                     let skipped =
@@ -6613,48 +6641,6 @@ fn effective_ddf_window(
     let start = start.max(hard_start);
     let stop = stop.min(hard_stop);
     (stop >= start).then_some((start, stop))
-}
-
-/// Backfill the left overscan border's background colour (COLOR00) on lines
-/// where the Copper establishes it *within* the overscan.
-///
-/// A Copper-driven horizontal gradient parks on a per-line WAIT and writes its
-/// first COLOR00 a few color clocks into the line, timed so the colour is ready
-/// at the playfield's left edge. The columns to the left of that first write sit
-/// in the overscan border (left of [`STANDARD_VISIBLE_X0`]) and would otherwise
-/// fall back to the previous line's final gradient colour -- a stale,
-/// brighter-or-darker vertical strip at the far left. A real PAL display crops
-/// this overscan; since the framebuffer keeps the full overscan field, adopt the
-/// colour the Copper sets within the overscan so the gradient reads continuously
-/// to the left edge instead of showing the cross-line carry. Lines whose first
-/// background change lands at or beyond the standard visible edge are untouched,
-/// so no in-picture pixel changes.
-fn backfill_left_overscan_background(
-    base_palettes: &mut [Palette],
-    palette_segments: &mut [Vec<PaletteSegment>],
-) {
-    for (base, segments) in base_palettes.iter_mut().zip(palette_segments.iter_mut()) {
-        // Only act when the background colour is established within the overscan
-        // (the gradient's first COLOR00 write lands left of the visible edge).
-        if segments
-            .first()
-            .is_none_or(|first| first.x >= STANDARD_VISIBLE_X0)
-        {
-            continue;
-        }
-        // The COLOR00 the Copper has set by the time the beam reaches the visible
-        // edge -- the gradient's entry colour for this line.
-        let entry_color = palette_at_x(*base, segments, STANDARD_VISIBLE_X0 - 1)[0];
-        base.write_entry(0, false, entry_color);
-        for seg in segments.iter_mut() {
-            if seg.x >= STANDARD_VISIBLE_X0 {
-                break;
-            }
-            if seg.entry == 0 && !seg.loct {
-                seg.value = entry_color;
-            }
-        }
-    }
 }
 
 fn palette_at_x(mut palette: Palette, segments: &[PaletteSegment], x: usize) -> Palette {
@@ -8176,6 +8162,29 @@ mod tests {
         assert_eq!(with_carry.sample(control, 0).idx, 1);
         assert_eq!(with_carry.sample(control, 1).idx, 0);
         assert_eq!(with_carry.sample(control, 3).idx, 1);
+    }
+
+    #[test]
+    fn aga_extended_bplcon1_delay_does_not_reuse_single_word_line_tail() {
+        let control = ControlState {
+            agnus_revision: AgnusRevision::AgaAlice,
+            bplcon0: BPLCON0_ECSENA | 0x1000,
+            bplcon1: 0x0800,
+            fmode: 0x0003,
+            ..ControlState::default()
+        };
+        assert_eq!(control.scroll_for_plane(0), 32);
+
+        let plane_words = [vec![0x8000, 0x0000, 0x0000]];
+        let mut carry_words = [None; 8];
+        carry_words[0] = Some(0xFFFF);
+        let line = DenisePlannedPlayfieldLine::new(0, 0, 64, &plane_words, 48)
+            .with_carry_words(carry_words);
+
+        assert_eq!(line.sample(control, 15).idx, 0);
+        assert_eq!(line.sample(control, 16).idx, 0);
+        assert_eq!(line.sample(control, 31).idx, 0);
+        assert_eq!(line.sample(control, 32).idx, 1);
     }
 
     #[test]
@@ -11613,6 +11622,52 @@ mod tests {
     }
 
     #[test]
+    fn planned_ham_dma_ignores_extra_early_ddf_history_before_diw() {
+        let mut row_words = vec![vec![0; 2]; 6];
+        row_words[0][0] |= 0x8000; // native x 0: direct palette entry 1
+        row_words[4][0] |= 0x0001; // native x 15: HAM blue := 0
+        row_words[4][1] |= 0x8000; // native x 16: HAM blue := 0
+        let line_plan = DenisePlannedPlayfieldLine::new(0, 64, 66, &row_words, 32);
+        let mut control = visible_lowres_control(0x6800);
+        control.diwstrt = ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16;
+        control.diwstop =
+            (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | (STANDARD_DIW_HSTART as u16 + 1);
+        control.ddfstrt = 0x0030;
+        control.ddfstop = 0x00D0;
+        let mut palette = Palette::new();
+        palette.write_ocs(1, 0x0123);
+        let mut fb = vec![0; FB_PIXELS];
+        let mut playfield_mask = vec![0; FB_PIXELS];
+        let mut collision_pixels = vec![CollisionPixel::default(); FB_PIXELS];
+        let mut clxdat = 0;
+
+        render_planned_playfield_line(
+            &line_plan,
+            &mut fb,
+            &mut playfield_mask,
+            &mut collision_pixels,
+            &mut clxdat,
+            palette,
+            &[],
+            0,
+            control,
+            &[],
+            0,
+            control.bplcon1,
+            false,
+            0,
+            PAL_VISIBLE_LINE0,
+            0.0,
+            0,
+        );
+
+        assert_eq!(control.native_x_offset(control.diw_h_start(), 2), 16);
+        assert_eq!(fb[64], rgb12_to_rgba8(0x0000));
+        assert_eq!(fb[65], rgb12_to_rgba8(0x0000));
+        assert_eq!(&playfield_mask[64..66], &[0x02, 0x02]);
+    }
+
+    #[test]
     fn bplcon1_write_at_diw_right_edge_does_not_retap_current_ham_line() {
         let mut row_words = vec![vec![0; 1]; 6];
         row_words[0][0] |= 0x4000; // native x 1: direct palette entry 1
@@ -12270,6 +12325,55 @@ mod tests {
         assert_eq!(palette_segments[border_line][0].entry, 0);
         assert_eq!(palette_segments[border_line][0].value, 0x0103);
         assert_eq!(base_palettes[border_line + 1][0], 0x0103);
+    }
+
+    #[test]
+    fn color00_overscan_write_does_not_backfill_row_start() {
+        let mut state = blank_state();
+        state.palette.write_ocs(0, 0x0000);
+        state.diwstrt = ((PAL_VISIBLE_LINE0 as u16) << 8) | STANDARD_DIW_HSTART as u16;
+        state.diwstop = (((PAL_VISIBLE_LINE0 + 1) as u16) << 8) | STANDARD_DIW_HSTOP as u16;
+        let mut base_palettes = [state.palette; FB_HEIGHT];
+        let mut palette_segments = vec![Vec::new(); FB_HEIGHT];
+        let mut base_controls = [ControlState::from_render_state(&state); FB_HEIGHT];
+        let mut control_segments = vec![Vec::new(); FB_HEIGHT];
+        let mut manual_bpl_segments = Vec::new();
+        let beam_y = PAL_VISIBLE_LINE0 as u32;
+        let events = [
+            beam_event(beam_y, 68, 0x0180, 0x087A),
+            beam_event(beam_y, 76, 0x0180, 0x0000),
+        ];
+
+        apply_render_events(
+            &mut state,
+            &events,
+            &mut base_palettes,
+            &mut palette_segments,
+            &mut base_controls,
+            &mut control_segments,
+            &mut manual_bpl_segments,
+        );
+
+        assert_eq!(palette_segments[0][0].x, 60);
+        assert_eq!(palette_segments[0][0].value, 0x087A);
+        assert_eq!(palette_segments[0][1].x, 92);
+        assert_eq!(palette_segments[0][1].value, 0x0000);
+        assert_eq!(base_palettes[0][0], 0x0000);
+
+        let mut fb = vec![0; FB_PIXELS];
+        fill_background(
+            &mut fb,
+            &base_palettes,
+            &palette_segments,
+            &base_controls,
+            &control_segments,
+        );
+
+        assert_eq!(fb[0], rgb12_to_rgba8(0x0000));
+        assert_eq!(fb[59], rgb12_to_rgba8(0x0000));
+        assert_eq!(fb[60], rgb12_to_rgba8(0x087A));
+        assert_eq!(fb[91], rgb12_to_rgba8(0x087A));
+        assert_eq!(fb[92], rgb12_to_rgba8(0x0000));
     }
 
     #[test]

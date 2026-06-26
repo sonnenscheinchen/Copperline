@@ -89,11 +89,16 @@ data pointer stays with the descriptor that armed the sprite, and active
 row offsets remain relative to that descriptor. Copperline therefore keeps
 a runtime-only data-origin VSTART alongside the live comparator VSTART,
 preserving it across active POS/CTL rewrites while still using the
-rewritten HSTART for the line. The runtime origin is skipped in save states
-to preserve the fixed bincode layout; future save-state versioning should
-serialize it if mid-line sprite-DMA resume accuracy is tightened. Tests:
+rewritten HSTART for the line. Directly armed register sprites use the same
+runtime origin marker when SPRxPT is refreshed as a data stream instead of a
+memory descriptor. The runtime origin is skipped in save states to preserve
+the fixed bincode layout; after load, retained Denise armed state and the
+next SPRxPT low-word write reconstruct this case for subsequent full frames.
+Future save-state versioning should serialize it if mid-line sprite-DMA
+resume accuracy is tightened. Tests:
 `pending_sprite_control_rewrite_preserves_descriptor_data_origin`,
-`active_sprite_control_rewrite_preserves_descriptor_data_origin`.
+`active_sprite_control_rewrite_preserves_descriptor_data_origin`,
+`armed_register_sprite_pointer_write_seeds_dma_data_stream`.
 
 Beam-timed SPRxPOS writes are replayed in Denise's horizontal-comparator
 domain, seven colour clocks ahead of the normal register-output position.

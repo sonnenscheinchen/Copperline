@@ -54,11 +54,17 @@ stream is discarded and the next sprite DMA slot fetches a descriptor from
 the new address; otherwise descriptor words can be mistaken for sprite data.
 Software can also write SPRxPOS/SPRxCTL directly and let sprite DMA fetch
 data from the current SPRxPT stream; in that case SPRxPT names the first
-data word pair, not a memory descriptor. If a DMA descriptor has already
+data word pair, not a memory descriptor. A save-state load clears
+Copperline's transient Agnus descriptor latch, so this register-stream case
+is reconstructed from Denise's retained armed state, SPRxPOS/SPRxCTL, and
+the next beam-ordered SPRxPT low-word write. If a DMA descriptor has already
 been retained and is still waiting for VSTART, later SPRxPOS/SPRxCTL writes
 update the live comparators but keep the descriptor's post-control data
 origin. The frame-start replay path mirrors this by replaying off-screen
 DMACON and SPRxPT writes in beam order before rendering the visible field.
+Enabled sprite slots that fetch no sprite data are not treated as observed
+sprite DMA; otherwise empty DMA slots would suppress valid register/manual
+sprite replay for that frame.
 
 SPRxPT advances through sprite DMA and is not snapped back to the last value
 the Copper/CPU wrote at the top of the next field. A channel that has read its

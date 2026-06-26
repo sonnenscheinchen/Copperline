@@ -30,14 +30,16 @@ pipeline carries 24-bit colour end to end; OCS/ECS paths keep their exact
 12-bit maths and expand by nibble), composited with the eight sprites
 under playfield priority, and CLXDAT collisions are accumulated.
 For DMA-fetched HAM playfields, the display window gates framebuffer output
-and collision recording, but it does not rewind the HAM component history:
-fetched native samples that sit just before DIW, or inside a closed portion
-of DIW, still advance the HAM hold colour. Standard lo-res DDF timing starts
-the first visible output one native sample into the fetched stream, so replay
-pre-advances that hidden sample before painting the DIW edge. Single-word
-lo-res fetches that start before the standard `$38` DDF slot expose complete
-16-pixel groups; the standard one-sample phase bias is trimmed when it would
-push a standard-width DIW past the completed early-DDF row at the right edge.
+and collision recording, but the low-res Denise phase can still seed the HAM
+component history just before DIW: standard `$38` DDF timing starts the first
+visible output one native sample into the fetched stream, so replay
+pre-advances that hidden sample before painting the DIW edge. Extra fetch
+groups from an earlier DDFSTRT are not decoded into the HAM hold colour before
+DIW opens; they are fetched by Agnus, but the first visible HAM history is
+bounded to the display-phase samples. Single-word lo-res fetches that start
+before the standard `$38` DDF slot expose complete 16-pixel groups; the
+standard one-sample phase bias is trimmed when it would push a standard-width
+DIW past the completed early-DDF row at the right edge.
 Late single-word lo-res DDF keeps the standard DIW `$81` one-sample phase;
 the renderer must not subtract an extra sample just to align the clipped
 start to a fetch-unit boundary.
@@ -53,7 +55,10 @@ BPLCON1-delayed samples at the left edge of a contiguous bitplane-DMA block
 come from the previous line's shifter tail when current-line DMA is already
 feeding Denise at the display edge. Block-start lines, and lines whose output
 is held until a delayed first BPL1DAT load, blank that scroll-in because no
-current-line shifter data has reached the visible gate yet.
+current-line shifter data has reached the visible gate yet. AGA's extended
+BPLCON1 delays can exceed one 16-bit shifter word; replay does not reuse the
+single cached line-tail word for those wider delays, so the extra leading gap
+stays background until current-line samples reach Lisa.
 A BPLCON1 write whose normal register position is already at or beyond DIW's
 right edge is not pulled left into the current line's bitplane-scroll domain;
 it updates following lines without retapping the visible HAM tail of the
@@ -103,7 +108,10 @@ write after the sprite DMA slot can re-arm the horizontal comparator and
 reuse the line data DMA already loaded, so the renderer seeds those POS-only
 reuse spans from the captured DMA line. Sprites whose data was established
 by DMA before SPREN was cleared are carried separately as held sprites and
-can still be repositioned by later SPRxPOS/CTL writes.
+can still be repositioned by later SPRxPOS/CTL writes. Merely enabling
+sprite DMA and crossing an empty sprite pair slot is not enough to make
+captured DMA authoritative; the frame must contain actual fetched or held
+sprite data.
 
 The mapping from beam coordinates to framebuffer x is anchored by
 constants that encode the hardware's fetch-to-display pipeline delays --
