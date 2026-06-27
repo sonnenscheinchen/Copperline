@@ -5584,6 +5584,14 @@ impl App {
                     path.display(),
                     outcome.summary
                 );
+                // The pre-boot configuration screen runs on a placeholder
+                // machine with a silent NullSink (see build_placeholder_machine);
+                // a state loaded over it would keep that null sink and play no
+                // audio. Detect that case before powering on and give the
+                // restored machine a live host output below, mirroring the
+                // launcher's Run path. A machine that already has a real sink
+                // (any normal running session) is left untouched.
+                let restoring_over_placeholder = self.restoring_over_placeholder();
                 self.powered_on = true;
                 self.cpu_halted = false;
                 // Force a fresh presentation: the restored frame counter
@@ -5592,6 +5600,9 @@ impl App {
                 if matches!(self.ui.panel, Some(Panel::Launcher(_))) {
                     self.ui.panel = None;
                     self.resize_for_active_panel();
+                }
+                if restoring_over_placeholder {
+                    self.install_live_audio_after_placeholder_load();
                 }
                 if outcome.reconfigured {
                     // The state was built on a different machine; the host
@@ -6605,6 +6616,37 @@ impl App {
 
     fn suspend_live_audio_for_host_io(&mut self) {
         self.emu.set_live_audio_suspended(true);
+    }
+
+    /// Whether a state is being loaded over the pre-boot placeholder machine
+    /// that hosts the configuration screen: powered off, the launcher panel
+    /// open, and the silent NullSink still installed. Only then does a load need
+    /// to install a real audio output; every normal running session already has
+    /// one. Evaluate this before powering on / dismissing the launcher.
+    fn restoring_over_placeholder(&self) -> bool {
+        !self.powered_on
+            && matches!(self.ui.panel, Some(Panel::Launcher(_)))
+            && self.emu.bus().paula.audio.is_null_sink()
+    }
+
+    /// Replace the placeholder machine's silent NullSink with a live host audio
+    /// output after a save state is loaded over the configuration screen. This
+    /// mirrors the launcher Run path (`launcher_run`): the configuration screen
+    /// itself stays silent, but a machine started from it -- by Run or by a state
+    /// load -- gets real sound. On audio-init failure the state stays loaded and
+    /// the machine simply runs without sound, exactly as a failed Run does.
+    fn install_live_audio_after_placeholder_load(&mut self) {
+        match CpalSink::new(crate::priority::requested(false)) {
+            Ok(sink) => {
+                self.emu.bus_mut().paula.audio = Box::new(sink);
+                // Apply the current suspension state to the freshly installed
+                // stream (it should be live now: powered on and not paused).
+                self.sync_live_audio_suspension();
+            }
+            Err(e) => {
+                warn!("audio init after state load failed; continuing without sound: {e:#}");
+            }
+        }
     }
 
     fn finish_host_io_pause(&mut self) {
@@ -8903,6 +8945,79 @@ mod tests {
         app.suspend_live_audio_for_host_io();
         app.finish_host_io_pause();
         assert_eq!(states.borrow().last(), Some(&true));
+    }
+
+    #[test]
+    fn restoring_over_placeholder_detected_only_for_the_silent_config_screen() {
+        // The exact configuration-screen placeholder: powered off, launcher
+        // open, NullSink installed (as build_placeholder_machine produces).
+        let mut app = test_app();
+        app.power_off();
+        app.open_launcher();
+        assert!(
+            app.restoring_over_placeholder(),
+            "powered-off launcher with a null sink is the placeholder"
+        );
+
+        // A live (non-null) sink behind the launcher is a real running session
+        // re-opening the config screen: its audio must not be torn out.
+        let states = Rc::new(RefCell::new(Vec::new()));
+        let mut live = test_app_with_audio(Box::new(SuspensionSink {
+            states: Rc::clone(&states),
+        }));
+        live.power_off();
+        live.open_launcher();
+        assert!(
+            !live.restoring_over_placeholder(),
+            "a real audio sink behind the launcher is not the placeholder"
+        );
+
+        // A null sink but powered on, or with no launcher open, is not the
+        // pre-boot placeholder either.
+        let mut powered = test_app();
+        powered.open_launcher();
+        assert!(powered.powered_on);
+        assert!(!powered.restoring_over_placeholder());
+
+        let mut no_launcher = test_app();
+        no_launcher.power_off();
+        assert!(no_launcher.ui.panel.is_none());
+        assert!(!no_launcher.restoring_over_placeholder());
+    }
+
+    #[test]
+    fn state_load_over_running_session_keeps_its_live_audio_sink() {
+        // Re-opening the config screen over a running machine and loading a
+        // state must not replace the live audio sink (the regression guard for
+        // the placeholder-upgrade path). Uses a probe sink so no real audio
+        // device is touched.
+        let path = std::env::temp_dir().join(format!(
+            "copperline-running-state-load-{}.clstate",
+            std::process::id()
+        ));
+        let states = Rc::new(RefCell::new(Vec::new()));
+        let mut app = test_app_with_audio(Box::new(SuspensionSink {
+            states: Rc::clone(&states),
+        }));
+        app.emu.save_state(&path).expect("save test state");
+        app.open_launcher();
+        assert!(app.powered_on);
+        assert!(!app.restoring_over_placeholder());
+
+        assert!(app.load_state_from_path(&path));
+
+        // The probe sink is still the installed one: a suspension toggle still
+        // reaches it. (A replacement CpalSink would have dropped the probe.)
+        states.borrow_mut().clear();
+        app.suspend_live_audio_for_host_io();
+        app.finish_host_io_pause();
+        assert_eq!(
+            states.borrow().as_slice(),
+            &[true, false],
+            "live audio sink should survive a state load over a running session"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// End-to-end recording through the app: start, run emulated frames
