@@ -3,13 +3,10 @@
 //! Each function reduces its argument, evaluates a Taylor/atanh series in the
 //! double-double layer (`dd.rs`) -- whose coefficients are exact rationals, so
 //! no minimax tooling is needed -- and rounds the ~128-bit result to 64-bit
-//! extended under the caller's FPCR mode, setting INEX/OPERR/DZ. This replaces
-//! the former f64 bridge. Accuracy is faithful to ~64 bits (validated by
-//! identities and exact anchors); it is not chip-bit-exact (the 6888x uses its
-//! own CORDIC/polynomial microcode).
-//!
-//! Functions not yet converted to extended precision fall back to `bridge`
-//! (f64) for now and are replaced in later milestones.
+//! extended under the caller's FPCR mode, setting INEX/OPERR/DZ. Accuracy is
+//! faithful to ~64 bits (validated by identities and exact anchors); it is not
+//! chip-bit-exact (the 6888x uses its own CORDIC/polynomial microcode, and a
+//! bare 68040 traps these to a software FPSP). FMOD/FREM are exact.
 
 use super::dd::{self, Df};
 use super::softfloat::{self, ExcFlags, FpCmp, RoundCtx, RoundMode};
@@ -30,7 +27,12 @@ fn fx(v: f64) -> FloatX80 {
 /// 2^k as an exact extended value (or +/-Inf / 0 on overflow/underflow).
 #[inline]
 fn two_pow(k: i32) -> FloatX80 {
-    softfloat::scale(one_x80(), k, RoundCtx::NEAREST_EXT, &mut ExcFlags::default())
+    softfloat::scale(
+        one_x80(),
+        k,
+        RoundCtx::NEAREST_EXT,
+        &mut ExcFlags::default(),
+    )
 }
 
 /// Result for a NaN operand: quiet it and signal SNAN/OPERR if it was signaling.
@@ -151,7 +153,11 @@ fn expm1(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
         return nan_result(x, f);
     }
     if x.is_inf() {
-        return if x.sign() { softfloat::neg(one_x80()) } else { x };
+        return if x.sign() {
+            softfloat::neg(one_x80())
+        } else {
+            x
+        };
     }
     if x.is_zero() {
         return x; // expm1(+-0) = +-0
@@ -250,7 +256,12 @@ fn log1p(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
         let s = dd::div(xd, dd::add_x80(xd, fx(2.0)));
         dd::mul_x80(dd::atanh_small(s), fx(2.0))
     } else {
-        ln_dd(softfloat::add(x, one, RoundCtx::NEAREST_EXT, &mut noflags()))
+        ln_dd(softfloat::add(
+            x,
+            one,
+            RoundCtx::NEAREST_EXT,
+            &mut noflags(),
+        ))
     };
     d.to_x80(ctx, f)
 }
@@ -518,7 +529,11 @@ fn tanh(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     }
     if x.is_inf() || x.to_f64().abs() > 32.0 {
         // |x| large: tanh -> +-1 (inexact for finite x).
-        let one = if x.sign() { softfloat::neg(one_x80()) } else { one_x80() };
+        let one = if x.sign() {
+            softfloat::neg(one_x80())
+        } else {
+            one_x80()
+        };
         if !x.is_inf() {
             f.raise(ExcFlags::INEX2);
         }
@@ -742,7 +757,10 @@ mod tests {
         let e = exp(fx(1.0), rn(), &mut noflags());
         let rom = softfloat::const_rom(0x0C);
         assert_eq!(e.sign_exp, rom.sign_exp);
-        assert!((e.mantissa as i128 - rom.mantissa as i128).abs() <= 1, "exp(1) {e:?} vs {rom:?}");
+        assert!(
+            (e.mantissa as i128 - rom.mantissa as i128).abs() <= 1,
+            "exp(1) {e:?} vs {rom:?}"
+        );
     }
 
     #[test]
@@ -750,11 +768,17 @@ mod tests {
         // exp(ln x) == x and ln(exp x) == x to ~2^-62.
         for &x in &[0.5_f64, 1.5, 2.0, 7.3, 100.0, 1e8] {
             let lx = ln(fx(x), rn(), &mut noflags());
-            assert!(close(exp(lx, rn(), &mut noflags()).to_f64(), x, 1e-18), "exp(ln {x})");
+            assert!(
+                close(exp(lx, rn(), &mut noflags()).to_f64(), x, 1e-18),
+                "exp(ln {x})"
+            );
         }
         for &x in &[-3.0_f64, -0.5, 0.0, 0.7, 5.0] {
             let ex = exp(fx(x), rn(), &mut noflags());
-            assert!(close(ln(ex, rn(), &mut noflags()).to_f64(), x, 1e-15), "ln(exp {x})");
+            assert!(
+                close(ln(ex, rn(), &mut noflags()).to_f64(), x, 1e-15),
+                "ln(exp {x})"
+            );
         }
         // 2^x == exp(x*ln2).
         for &x in &[-4.0_f64, 0.3, 1.0, 13.5] {
@@ -821,8 +845,14 @@ mod tests {
     #[test]
     fn hyperbolic() {
         for &x in &[-3.0_f64, -0.3, 0.0, 0.2, 1.0, 5.0] {
-            assert!((ev(0x02, x) - x.sinh()).abs() < 1e-12 * (1.0 + x.sinh().abs()), "sinh {x}");
-            assert!((ev(0x19, x) - x.cosh()).abs() < 1e-12 * (1.0 + x.cosh().abs()), "cosh {x}");
+            assert!(
+                (ev(0x02, x) - x.sinh()).abs() < 1e-12 * (1.0 + x.sinh().abs()),
+                "sinh {x}"
+            );
+            assert!(
+                (ev(0x19, x) - x.cosh()).abs() < 1e-12 * (1.0 + x.cosh().abs()),
+                "cosh {x}"
+            );
             assert!((ev(0x09, x) - x.tanh()).abs() < 1e-14, "tanh {x}");
             // cosh^2 - sinh^2 == 1.
             let s = ev(0x02, x);
@@ -840,9 +870,7 @@ mod tests {
 
     #[test]
     fn fmod_frem_exact() {
-        let r = |a: f64, b: f64, ieee: bool| {
-            remainder(fx(a), fx(b), ieee, &mut noflags())
-        };
+        let r = |a: f64, b: f64, ieee: bool| remainder(fx(a), fx(b), ieee, &mut noflags());
         // FMOD basics.
         let m = r(7.5, 2.0, false);
         assert_eq!(m.value.to_f64(), 1.5);
@@ -869,8 +897,14 @@ mod tests {
     #[test]
     fn fpcr_mode_and_inex_threaded() {
         use super::super::softfloat::{Precision, RoundMode};
-        let rz = RoundCtx { mode: RoundMode::Zero, prec: Precision::Extended };
-        let rp = RoundCtx { mode: RoundMode::PosInf, prec: Precision::Extended };
+        let rz = RoundCtx {
+            mode: RoundMode::Zero,
+            prec: Precision::Extended,
+        };
+        let rp = RoundCtx {
+            mode: RoundMode::PosInf,
+            prec: Precision::Extended,
+        };
         let mut fz = ExcFlags::default();
         let mut fp = ExcFlags::default();
         let lo = eval_unary(0x14, fx(3.0), rz, &mut fz).unwrap(); // ln(3) toward zero

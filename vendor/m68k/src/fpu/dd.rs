@@ -1,6 +1,3 @@
-// Some helpers are consumed incrementally as the kernels land; the final
-// milestone removes this and drops anything genuinely unused.
-#![allow(dead_code)]
 //! Double-`FloatX80` ("double-double") arithmetic for the extended-precision
 //! transcendental kernels.
 //!
@@ -94,11 +91,6 @@ pub struct Df {
 }
 
 impl Df {
-    #[inline]
-    pub fn new(hi: FloatX80, lo: FloatX80) -> Df {
-        Df { hi, lo }
-    }
-
     #[inline]
     pub fn from_x80(a: FloatX80) -> Df {
         Df {
@@ -242,7 +234,6 @@ pub fn atanh_small(x: Df) -> Df {
 pub struct Consts {
     pub pi: Df,
     pub pi_2: Df,
-    pub pi_4: Df,
     pub ln2: Df,
     pub ln10: Df,
     pub log2e: Df,
@@ -262,14 +253,10 @@ pub fn consts() -> &'static Consts {
         );
         // ln2 = 2*atanh(1/3); ln10 = 3*ln2 + 2*atanh(1/9)
         let ln2 = mul_x80(atanh_small(inv(3)), fx(2.0));
-        let ln10 = add(
-            mul_x80(ln2, fx(3.0)),
-            mul_x80(atanh_small(inv(9)), fx(2.0)),
-        );
+        let ln10 = add(mul_x80(ln2, fx(3.0)), mul_x80(atanh_small(inv(9)), fx(2.0)));
         Consts {
             pi,
             pi_2: mul_x80(pi, fx(0.5)),
-            pi_4: mul_x80(pi, fx(0.25)),
             ln2,
             ln10,
             log2e: recip(ln2),
