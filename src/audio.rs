@@ -69,6 +69,13 @@ pub trait AudioSink {
     fn runtime_status(&self) -> AudioRuntimeStatus {
         AudioRuntimeStatus::default()
     }
+    /// True only for the no-op sink that discards every sample (`NullSink`).
+    /// The configuration screen runs on a silent placeholder machine using this
+    /// sink; loading a state over that machine detects it here so the restored
+    /// machine can be given a real host output instead of staying silent.
+    fn is_null_sink(&self) -> bool {
+        false
+    }
 }
 
 pub fn audio_profile_enabled() -> bool {
@@ -85,6 +92,9 @@ pub struct NullSink;
 impl AudioSink for NullSink {
     fn push(&mut self, _left: f32, _right: f32) {}
     fn flush(&mut self) {}
+    fn is_null_sink(&self) -> bool {
+        true
+    }
 }
 
 // -----------------------------------------------------------------
