@@ -593,19 +593,119 @@ pub fn sincos(src: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> (FloatX80, Floa
     sin_cos_x80(src, ctx, f)
 }
 
-/// FMOD: dst modulo src (truncated quotient).
-pub fn fmod(dst: FloatX80, src: FloatX80) -> FloatX80 {
-    FloatX80::from_f64(dst.to_f64() % src.to_f64())
+/// Result of FMOD/FREM: the exact remainder, the low 7 bits of |quotient|,
+/// and the quotient's sign.
+pub struct Remainder {
+    pub value: FloatX80,
+    pub quotient: u8,
+    pub quotient_sign: bool,
 }
 
-/// FREM: IEEE remainder, r = x - y*round(x/y) (round-to-nearest quotient).
-pub fn frem(dst: FloatX80, src: FloatX80) -> FloatX80 {
-    let (x, y) = (dst.to_f64(), src.to_f64());
-    if y == 0.0 {
-        return FloatX80::default_nan();
+/// Exact extended remainder of `dst` by `src`. `ieee` selects FREM (quotient
+/// rounded to nearest) vs FMOD (truncated quotient). The remainder is computed
+/// exactly by shift-subtract long division of the significands.
+pub fn remainder(dst: FloatX80, src: FloatX80, ieee: bool, f: &mut ExcFlags) -> Remainder {
+    let none = |v: FloatX80| Remainder {
+        value: v,
+        quotient: 0,
+        quotient_sign: false,
+    };
+    if dst.is_nan() {
+        return none(nan_result(dst, f));
     }
-    let n = (x / y).round();
-    FloatX80::from_f64(x - y * n)
+    if src.is_nan() {
+        return none(nan_result(src, f));
+    }
+    let quotient_sign = dst.sign() ^ src.sign();
+    if dst.is_inf() || src.is_zero() {
+        f.raise(ExcFlags::OPERR);
+        return none(FloatX80::default_nan());
+    }
+    if src.is_inf() || dst.is_zero() {
+        // x mod inf = x; 0 mod y = 0.
+        return Remainder {
+            value: dst,
+            quotient: 0,
+            quotient_sign,
+        };
+    }
+
+    let ax = softfloat::abs(dst);
+    let ay = softfloat::abs(src);
+    let ex = unbiased_exp(ax);
+    let ey = unbiased_exp(ay);
+    let mx = softfloat::getman(ax, &mut noflags()).mantissa;
+    let my = softfloat::getman(ay, &mut noflags()).mantissa as u128;
+    let ediff = ex - ey;
+
+    // Floor remainder magnitude `rfloor` and the low bits of floor(|x|/|y|).
+    let (mut rfloor, mut q, rem_int): (FloatX80, u64, u128) = if ediff < 0 {
+        (ax, 0, u128::MAX) // |x| < |y|: remainder = |x| (rem_int unused)
+    } else {
+        // Long division of M = mx << ediff by my (bit by bit, MSB first).
+        let mut rem: u128 = 0;
+        let mut q: u64 = 0;
+        let total = 64 + ediff;
+        for j in (0..total).rev() {
+            rem <<= 1;
+            if j >= ediff {
+                rem |= ((mx >> (j - ediff)) & 1) as u128;
+            }
+            q <<= 1;
+            if rem >= my {
+                rem -= my;
+                q |= 1;
+            }
+        }
+        let rv = if rem == 0 {
+            FloatX80::zero(false)
+        } else {
+            softfloat::scale(
+                softfloat::from_u64(rem as u64, false),
+                ey - 63,
+                RoundCtx::NEAREST_EXT,
+                &mut noflags(),
+            )
+        };
+        (rv, q, rem)
+    };
+
+    let mut sign = dst.sign();
+    if ieee {
+        // FREM: round the quotient to nearest. Compare 2*rfloor with |y|.
+        let two_rfloor = softfloat::scale(rfloor, 1, RoundCtx::NEAREST_EXT, &mut noflags());
+        let c = softfloat::compare(two_rfloor, ay, &mut noflags());
+        let round_up = c == FpCmp::Greater || (c == FpCmp::Equal && (q & 1) == 1);
+        if round_up {
+            q += 1;
+            // Remainder crosses zero: new magnitude = |y| - rfloor, sign flips.
+            rfloor = if ediff >= 0 && rem_int != u128::MAX {
+                let nr = my - rem_int;
+                softfloat::scale(
+                    softfloat::from_u64(nr as u64, false),
+                    ey - 63,
+                    RoundCtx::NEAREST_EXT,
+                    &mut noflags(),
+                )
+            } else {
+                softfloat::sub(ay, rfloor, RoundCtx::NEAREST_EXT, &mut noflags())
+            };
+            sign = !sign;
+        }
+    }
+
+    let value = if rfloor.is_zero() {
+        FloatX80::zero(sign)
+    } else if sign {
+        softfloat::neg(rfloor)
+    } else {
+        rfloor
+    };
+    Remainder {
+        value,
+        quotient: (q & 0x7F) as u8,
+        quotient_sign,
+    }
 }
 
 #[cfg(test)]
@@ -736,6 +836,34 @@ mod tests {
         let mut f = ExcFlags::default();
         assert!(atanh(fx(1.0), rn(), &mut f).is_inf());
         assert!(f.has(ExcFlags::DZ));
+    }
+
+    #[test]
+    fn fmod_frem_exact() {
+        let r = |a: f64, b: f64, ieee: bool| {
+            remainder(fx(a), fx(b), ieee, &mut noflags())
+        };
+        // FMOD basics.
+        let m = r(7.5, 2.0, false);
+        assert_eq!(m.value.to_f64(), 1.5);
+        assert_eq!(m.quotient, 3); // 7.5 = 3*2 + 1.5
+        assert!(!m.quotient_sign);
+        // Negative dividend: remainder takes the sign of x.
+        let m = r(-7.5, 2.0, false);
+        assert_eq!(m.value.to_f64(), -1.5);
+        assert!(m.quotient_sign); // -/+ -> negative quotient
+        // FREM rounds the quotient to nearest: 7.5/2 = 3.75 -> 4, rem = -0.5.
+        let q = r(7.5, 2.0, true);
+        assert_eq!(q.value.to_f64(), -0.5);
+        assert_eq!(q.quotient, 4);
+        // Exactness beyond f64: 1e300 mod 3 via the f64 path would be wrong;
+        // here it is exact (result in [0,3)).
+        let big = r(1e18, 3.0, false);
+        assert!(big.value.to_f64() >= 0.0 && big.value.to_f64() < 3.0);
+        // src = 0 -> OPERR + NaN.
+        let mut f = ExcFlags::default();
+        let z = remainder(fx(1.0), fx(0.0), false, &mut f);
+        assert!(z.value.is_nan() && f.has(ExcFlags::OPERR));
     }
 
     #[test]

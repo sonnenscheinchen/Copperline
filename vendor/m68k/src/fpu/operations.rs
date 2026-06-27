@@ -570,6 +570,16 @@ impl CpuCore {
         }
     }
 
+    /// Write the FPSR quotient byte: bits 22:16 = low 7 bits of |quotient|,
+    /// bit 23 = quotient sign. Set by FMOD/FREM.
+    fn fpu_set_quotient(&mut self, quotient: u8, sign: bool) {
+        self.fpsr &= !0x00FF_0000;
+        self.fpsr |= ((quotient & 0x7F) as u32) << 16;
+        if sign {
+            self.fpsr |= 1 << 23;
+        }
+    }
+
     /// Build the rounding context (mode from FPCR, precision from `opmode`).
     fn fpu_ctx(&self, opmode: u16) -> RoundCtx {
         RoundCtx {
@@ -765,15 +775,23 @@ impl CpuCore {
                 4
             }
             0x21 => {
-                // FMOD (f64-bridged, see transcendental.rs)
-                self.fpr[dst] = transcendental::fmod(self.fpr[dst], src);
+                // FMOD - exact remainder, truncated quotient.
+                let mut f = ExcFlags::default();
+                let rem = transcendental::remainder(self.fpr[dst], src, false, &mut f);
+                self.fpr[dst] = rem.value;
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_set_quotient(rem.quotient, rem.quotient_sign);
+                self.fpu_commit(f);
                 4
             }
             0x25 => {
-                // FREM - IEEE remainder (f64-bridged, see transcendental.rs)
-                self.fpr[dst] = transcendental::frem(self.fpr[dst], src);
+                // FREM - exact IEEE remainder, round-to-nearest quotient.
+                let mut f = ExcFlags::default();
+                let rem = transcendental::remainder(self.fpr[dst], src, true, &mut f);
+                self.fpr[dst] = rem.value;
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_set_quotient(rem.quotient, rem.quotient_sign);
+                self.fpu_commit(f);
                 4
             }
             0x26 => {
