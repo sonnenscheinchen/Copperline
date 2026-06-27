@@ -559,11 +559,10 @@ fn atanh(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
 
 // ============================== dispatch =================================
 
-/// Evaluate a single-operand transcendental by opmode. Returns `None` if the
-/// opmode is not a transcendental.
-pub fn eval_unary(opmode: u16, src: FloatX80) -> Option<FloatX80> {
-    let ctx = RoundCtx::NEAREST_EXT;
-    let f = &mut noflags();
+/// Evaluate a single-operand transcendental by opmode, rounding to `ctx` and
+/// accumulating exceptions into `f`. Returns `None` if the opmode is not a
+/// transcendental.
+pub fn eval_unary(opmode: u16, src: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> Option<FloatX80> {
     let r = match opmode {
         // Extended-precision kernels.
         0x10 => exp(src, ctx, f),
@@ -590,8 +589,8 @@ pub fn eval_unary(opmode: u16, src: FloatX80) -> Option<FloatX80> {
 }
 
 /// FSINCOS: sine and cosine of the same operand.
-pub fn sincos(src: FloatX80) -> (FloatX80, FloatX80) {
-    sin_cos_x80(src, RoundCtx::NEAREST_EXT, &mut noflags())
+pub fn sincos(src: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> (FloatX80, FloatX80) {
+    sin_cos_x80(src, ctx, f)
 }
 
 /// FMOD: dst modulo src (truncated quotient).
@@ -617,7 +616,9 @@ mod tests {
         RoundCtx::NEAREST_EXT
     }
     fn ev(opmode: u16, x: f64) -> f64 {
-        eval_unary(opmode, FloatX80::from_f64(x)).unwrap().to_f64()
+        eval_unary(opmode, FloatX80::from_f64(x), rn(), &mut noflags())
+            .unwrap()
+            .to_f64()
     }
     fn close(a: f64, b: f64, rel: f64) -> bool {
         if b == 0.0 {
@@ -690,7 +691,7 @@ mod tests {
 
     #[test]
     fn sincos_pair() {
-        let (s, c) = sincos(fx(1.0));
+        let (s, c) = sincos(fx(1.0), rn(), &mut noflags());
         assert!((s.to_f64() - 1.0_f64.sin()).abs() < 1e-15);
         assert!((c.to_f64() - 1.0_f64.cos()).abs() < 1e-15);
     }
@@ -735,6 +736,21 @@ mod tests {
         let mut f = ExcFlags::default();
         assert!(atanh(fx(1.0), rn(), &mut f).is_inf());
         assert!(f.has(ExcFlags::DZ));
+    }
+
+    #[test]
+    fn fpcr_mode_and_inex_threaded() {
+        use super::super::softfloat::{Precision, RoundMode};
+        let rz = RoundCtx { mode: RoundMode::Zero, prec: Precision::Extended };
+        let rp = RoundCtx { mode: RoundMode::PosInf, prec: Precision::Extended };
+        let mut fz = ExcFlags::default();
+        let mut fp = ExcFlags::default();
+        let lo = eval_unary(0x14, fx(3.0), rz, &mut fz).unwrap(); // ln(3) toward zero
+        let hi = eval_unary(0x14, fx(3.0), rp, &mut fp).unwrap(); // ln(3) toward +inf
+        // ln(3) is irrational: rounding up gives a mantissa one ULP above
+        // rounding toward zero, and both are inexact.
+        assert_eq!(hi.mantissa, lo.mantissa + 1);
+        assert!(fz.has(ExcFlags::INEX2) && fp.has(ExcFlags::INEX2));
     }
 
     #[test]

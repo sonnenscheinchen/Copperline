@@ -794,18 +794,24 @@ impl CpuCore {
             }
             0x30..=0x37 => {
                 // FSINCOS - sin to FPn, cos to the FPc named by opmode bits 2-0.
+                let ctx = self.fpu_ctx(opmode);
+                let mut f = ExcFlags::default();
                 let cos_dst = (opmode & 7) as usize;
-                let (sin, cos) = transcendental::sincos(src);
+                let (sin, cos) = transcendental::sincos(src, ctx, &mut f);
                 self.fpr[dst] = sin;
                 self.fpr[cos_dst] = cos;
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             _ => {
-                // The remaining f64-bridged transcendentals (FSIN/FCOS/...).
-                if let Some(r) = transcendental::eval_unary(opmode, src) {
+                // The transcendentals (FSIN/FCOS/FETOX/FLOGN/...).
+                let ctx = self.fpu_ctx(opmode);
+                let mut f = ExcFlags::default();
+                if let Some(r) = transcendental::eval_unary(opmode, src, ctx, &mut f) {
                     self.fpr[dst] = r;
                     self.fpu_set_cc(self.fpr[dst]);
+                    self.fpu_commit(f);
                     4
                 } else {
                     0 // Unimplemented opmode -> Line-F
