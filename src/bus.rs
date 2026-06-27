@@ -225,6 +225,8 @@ const COPPER_BUS_LOCKOUT_HPOS: u32 = 0x00E1;
 const COPER_CPU_IRQ_DELAY_CCK: u32 = 2;
 const RENDER_VISIBLE_START_VPOS: u32 = 0x2C;
 const RENDER_MIN_OVERSCAN_START_VPOS: u32 = 0x1C;
+const PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS: u32 = 0x19;
+const NTSC_SPRITE_DMA_FIRST_ACTIVE_VPOS: u32 = 0x14;
 const RENDER_VISIBLE_LINES: usize = FB_HEIGHT;
 const RENDER_FRAMEBUFFER_WIDTH: i32 = FB_WIDTH as i32;
 // Capture-side twin of `bitplane::DIW_HSTART_FB0`; held 8 colour clocks (16
@@ -7045,15 +7047,13 @@ impl Bus {
         let state = self.display_dma_sprite_state[sprite];
         if let Some(control) = state.control {
             let pending_descriptor_not_loaded = state.control_loaded_vpos >= vpos as i32
-                || vpos < self.current_frame_visible_start_vpos
                 || (state.control_loaded_vpos == unset_sprite_control_loaded_vpos()
                     && (vpos as i32) < control.vstart);
             if !state.data_dma_active
                 && !control.data_origin_is_register_stream()
                 // The descriptor must have loaded earlier in this field before
-                // SPRxPT can retarget its data stream. Equal/later, pre-visible
-                // replay reloads, or an unknown save-state value before VSTART
-                // restart POS/CTL.
+                // SPRxPT can retarget its data stream. Equal/later loads or an
+                // unknown save-state value before VSTART restart POS/CTL.
                 && pending_descriptor_not_loaded
             {
                 self.display_dma_sprite_state[sprite] = DisplaySpriteDmaState::default();
@@ -7543,6 +7543,9 @@ impl Bus {
                 if dmacon & (DMACON_DMAEN | DMACON_SPREN) != (DMACON_DMAEN | DMACON_SPREN) {
                     continue;
                 }
+                if self.sprite_dma_inhibited_by_vertical_blank_at(vpos) {
+                    continue;
+                }
                 for sprite in pair * 2..pair * 2 + 2 {
                     if sprite_dma_disabled_by_bitplane_ddf(
                         sprite,
@@ -7604,12 +7607,19 @@ impl Bus {
         }
     }
 
+    fn sprite_dma_inhibited_by_vertical_blank_at(&self, vpos: u32) -> bool {
+        vpos < sprite_dma_first_active_vpos(self.agnus.video_standard())
+    }
+
     fn capture_sprite_dma_words_if_due(&mut self, vpos: u32, old_hpos: u32, new_hpos: u32) {
         // No sprite DMA pair slot lies in [old_hpos, new_hpos): nothing below
         // can run (the per-pair loop checks the same window), so skip the
         // sprite-state scan on the vast majority of beam advances.
         if old_hpos > SPRITE_DMA_PAIR_CAPTURE_HPOS[3] || new_hpos <= SPRITE_DMA_PAIR_CAPTURE_HPOS[0]
         {
+            return;
+        }
+        if self.sprite_dma_inhibited_by_vertical_blank_at(vpos) {
             return;
         }
         let sprite_dma_enabled =
@@ -8741,6 +8751,16 @@ fn copper_frame_start_vpos(_video_standard: VideoStandard) -> u32 {
     // lines, collapsing the CPU's pre-display work margin. Restarting at line 0
     // restores the margin real hardware gives before early display DMA fetches.
     0
+}
+
+fn sprite_dma_first_active_vpos(video_standard: VideoStandard) -> u32 {
+    // Hard vertical blank inhibits sprite DMA near the top of a standard
+    // field. The first line after that blank is one line earlier than bitplane
+    // DMA: PAL line $19 and NTSC line $14.
+    match video_standard {
+        VideoStandard::Pal => PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS,
+        VideoStandard::Ntsc => NTSC_SPRITE_DMA_FIRST_ACTIVE_VPOS,
+    }
 }
 
 fn next_chip_bus_quantum_at(hpos: u32, line_cck: u32) -> u32 {
@@ -10655,8 +10675,9 @@ mod tests {
         RenderRegisterSnapshot, BLITTER_SLOWDOWN_CPU_MISS_LIMIT, BLTCON1_DOFF, BPLCON0_ECSENA,
         BPLCON3_BRDSPRT, BPLCON3_SPRES_HIRES, COPPER_BUS_LOCKOUT_HPOS, DENISE_HPOS_LAG_CCK,
         DMACON_AUD_MASK, DMACON_BLTEN, DMACON_BLTPRI, DMACON_BPLEN, DMACON_SPREN,
-        RENDER_COPPER_WAIT_HPOS_FB0, RENDER_DIW_HSTART_FB0, RENDER_MIN_OVERSCAN_START_VPOS,
-        RENDER_VISIBLE_LINES, RENDER_VISIBLE_START_VPOS, SPRITE_DMA_PAIR_CAPTURE_HPOS,
+        PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS, RENDER_COPPER_WAIT_HPOS_FB0, RENDER_DIW_HSTART_FB0,
+        RENDER_MIN_OVERSCAN_START_VPOS, RENDER_VISIBLE_LINES, RENDER_VISIBLE_START_VPOS,
+        SPRITE_DMA_PAIR_CAPTURE_HPOS,
     };
     use crate::audio::AudioSink;
     use crate::chipset::agnus::{
@@ -15279,6 +15300,95 @@ mod tests {
         assert_eq!(lines[0].sprite, 0);
         assert_eq!(lines[0].beam_y, 0x2C);
         assert_eq!(lines[0].hstart, 0x00A1);
+        assert_eq!(lines[0].data, 0xAAAA);
+        assert_eq!(lines[0].datb, 0xBBBB);
+    }
+
+    #[test]
+    fn vertical_blank_sprite_pointer_write_reloads_descriptor_in_offscreen_replay() {
+        let mut bus = empty_bus();
+        let old_ptr = 0x0100usize;
+        let new_ptr = 0x0200usize;
+        let (old_pos, old_ctl) = sprite_control_words(0x2C, 0x30, 0x0083);
+        let (new_pos, new_ctl) = sprite_control_words(0x2C, 0x30, 0x00A1);
+        write_chip_word(&mut bus, old_ptr, old_pos);
+        write_chip_word(&mut bus, old_ptr + 2, old_ctl);
+        write_chip_word(&mut bus, old_ptr + 4, 0x1111);
+        write_chip_word(&mut bus, old_ptr + 6, 0x2222);
+        write_chip_word(&mut bus, new_ptr, new_pos);
+        write_chip_word(&mut bus, new_ptr + 2, new_ctl);
+        write_chip_word(&mut bus, new_ptr + 4, 0xAAAA);
+        write_chip_word(&mut bus, new_ptr + 6, 0xBBBB);
+
+        bus.current_frame_render_base.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.sprite_dma_frame_start_ptr[0] = old_ptr as u32;
+        bus.current_frame_render_events.push(BeamRegisterWrite {
+            vpos: PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS - 1,
+            hpos: 0,
+            offset: 0x120,
+            value: (new_ptr >> 16) as u16,
+            source: BeamWriteSource::Copper,
+        });
+        bus.current_frame_render_events.push(BeamRegisterWrite {
+            vpos: PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS - 1,
+            hpos: 0x0A,
+            offset: 0x122,
+            value: new_ptr as u16,
+            source: BeamWriteSource::Copper,
+        });
+
+        bus.agnus.vpos = RENDER_VISIBLE_START_VPOS;
+        bus.capture_current_frame_display_start();
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1;
+        bus.advance_chipset(2);
+
+        let lines = bus.frame_captured_sprite_lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].hstart, 0x00A1);
+        assert_eq!(lines[0].data, 0xAAAA);
+        assert_eq!(lines[0].datb, 0xBBBB);
+    }
+
+    #[test]
+    fn post_vertical_blank_sprite_pointer_write_retargets_pending_descriptor() {
+        let mut bus = empty_bus();
+        let descriptor_ptr = 0x0100usize;
+        let data_ptr = 0x0200usize;
+        let (pos, ctl) = sprite_control_words(0x2C, 0x30, 0x0083);
+        write_chip_word(&mut bus, descriptor_ptr, pos);
+        write_chip_word(&mut bus, descriptor_ptr + 2, ctl);
+        write_chip_word(&mut bus, descriptor_ptr + 4, 0x1111);
+        write_chip_word(&mut bus, descriptor_ptr + 6, 0x2222);
+        write_chip_word(&mut bus, data_ptr, 0xAAAA);
+        write_chip_word(&mut bus, data_ptr + 2, 0xBBBB);
+
+        bus.current_frame_render_base.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.agnus.dmacon = DMACON_DMAEN | DMACON_SPREN;
+        bus.sprite_dma_frame_start_ptr[0] = descriptor_ptr as u32;
+        bus.current_frame_render_events.push(BeamRegisterWrite {
+            vpos: PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS + 11,
+            hpos: SPRITE_DMA_PAIR_CAPTURE_HPOS[0],
+            offset: 0x120,
+            value: (data_ptr >> 16) as u16,
+            source: BeamWriteSource::Copper,
+        });
+        bus.current_frame_render_events.push(BeamRegisterWrite {
+            vpos: PAL_SPRITE_DMA_FIRST_ACTIVE_VPOS + 11,
+            hpos: SPRITE_DMA_PAIR_CAPTURE_HPOS[0] + 2,
+            offset: 0x122,
+            value: data_ptr as u16,
+            source: BeamWriteSource::Copper,
+        });
+
+        bus.agnus.vpos = RENDER_VISIBLE_START_VPOS;
+        bus.capture_current_frame_display_start();
+        bus.agnus.hpos = SPRITE_DMA_PAIR_CAPTURE_HPOS[0] - 1;
+        bus.advance_chipset(2);
+
+        let lines = bus.frame_captured_sprite_lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].hstart, 0x0083);
         assert_eq!(lines[0].data, 0xAAAA);
         assert_eq!(lines[0].datb, 0xBBBB);
     }

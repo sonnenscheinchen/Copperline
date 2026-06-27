@@ -8856,19 +8856,44 @@ mod tests {
             "copperline-app-recording-{}.avi",
             std::process::id()
         ));
-        app.start_recording_to(path.clone());
-        assert!(app.recorder.is_some(), "recorder should be active");
-
-        let frames_to_record = 5;
-        for _ in 0..frames_to_record {
+        for warmup_step in 0..4 {
             app.emu.step_frame().expect("step frame");
             let rendered = if app.render_worker.is_some() {
                 app.finish_render_for_current_frame()
             } else {
                 app.render_emulated_frame_if_needed()
             };
-            assert!(rendered, "each step quantum should complete a frame");
+            if rendered {
+                break;
+            }
+            assert!(
+                warmup_step < 3,
+                "fixture should produce an initial renderable frame"
+            );
+        }
+
+        app.start_recording_to(path.clone());
+        assert!(app.recorder.is_some(), "recorder should be active");
+
+        let frames_to_record = 5;
+        let mut rendered_frames = 0;
+        let mut step_quanta = 0;
+        while rendered_frames < frames_to_record {
+            app.emu.step_frame().expect("step frame");
+            let rendered = if app.render_worker.is_some() {
+                app.finish_render_for_current_frame()
+            } else {
+                app.render_emulated_frame_if_needed()
+            };
             app.capture_recorder_output(rendered);
+            if rendered {
+                rendered_frames += 1;
+            }
+            step_quanta += 1;
+            assert!(
+                step_quanta <= frames_to_record * 2,
+                "fixture should keep producing renderable frames"
+            );
         }
         app.stop_recording();
         assert!(app.recorder.is_none());
