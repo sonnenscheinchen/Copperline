@@ -44,8 +44,7 @@ pub enum Precision {
 }
 
 impl Precision {
-    /// Decode FPCR bits 7:6 (rounding precision). Wired in Phase 2.
-    #[allow(dead_code)]
+    /// Decode FPCR bits 7:6 (rounding precision).
     pub fn from_fpcr(fpcr: u32) -> Self {
         match (fpcr >> 6) & 3 {
             1 => Precision::Single,
@@ -85,9 +84,8 @@ impl RoundCtx {
 pub struct ExcFlags(pub u8);
 
 impl ExcFlags {
-    // BSUN and INEX1 are produced by the glue (FBcc / packed decimal) in
-    // Phase 2, not by the value engine itself.
-    #[allow(dead_code)]
+    // BSUN and INEX1 are produced by the glue (FBcc / packed decimal), not by
+    // the value engine itself.
     pub const BSUN: u8 = 0x80;
     pub const SNAN: u8 = 0x40;
     pub const OPERR: u8 = 0x20;
@@ -95,7 +93,6 @@ impl ExcFlags {
     pub const UNFL: u8 = 0x08;
     pub const DZ: u8 = 0x04;
     pub const INEX2: u8 = 0x02;
-    #[allow(dead_code)]
     pub const INEX1: u8 = 0x01;
 
     #[inline]

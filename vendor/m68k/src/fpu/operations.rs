@@ -560,23 +560,54 @@ impl CpuCore {
         }
     }
 
-    /// Build the rounding context from FPCR for a base-precision operation.
-    fn fpu_ctx(&self) -> RoundCtx {
-        RoundCtx {
-            mode: RoundMode::from_fpcr(self.fpcr),
-            prec: Precision::Extended,
+    /// Rounding precision for `opmode`: the FSxxx/FDxxx variants (bit 6 set)
+    /// force single (bit 2 clear) or double (bit 2 set); the base ops take the
+    /// FPCR rounding-precision bits 7:6.
+    fn opmode_precision(&self, opmode: u16) -> Precision {
+        if opmode & 0x40 == 0 {
+            Precision::from_fpcr(self.fpcr)
+        } else if opmode & 0x04 == 0 {
+            Precision::Single
+        } else {
+            Precision::Double
         }
     }
 
-    /// Phase 1 exception commit: map the engine's OPERR/DZ onto the existing
-    /// crude FPSR bits. Phase 2 replaces this with full EXC/AEXC modeling.
+    /// Build the rounding context (mode from FPCR, precision from `opmode`).
+    fn fpu_ctx(&self, opmode: u16) -> RoundCtx {
+        RoundCtx {
+            mode: RoundMode::from_fpcr(self.fpcr),
+            prec: self.opmode_precision(opmode),
+        }
+    }
+
+    /// Fold an operation's exception flags into FPSR. The exception-status
+    /// (EXC) byte (bits 15:8) reflects only this instruction and is rebuilt
+    /// each time; the accrued-exception (AEXC) byte (bits 7:0) is sticky.
+    /// AEXC mapping (MC68881/68040): IOP = BSUN|SNAN|OPERR, OVFL, UNFL =
+    /// UNFL&INEX2, DZ, INEX = OVFL|INEX2|INEX1.
     fn fpu_commit(&mut self, f: ExcFlags) {
-        if f.has(ExcFlags::OPERR) {
-            self.fpsr |= 0x20;
+        // ExcFlags bit k maps to FPSR EXC bit (8 + k): BSUN..INEX1.
+        self.fpsr &= !0x0000_FF00;
+        self.fpsr |= (f.0 as u32) << 8;
+
+        let mut aexc = 0u32;
+        if f.has(ExcFlags::BSUN | ExcFlags::SNAN | ExcFlags::OPERR) {
+            aexc |= 1 << 7; // IOP
+        }
+        if f.has(ExcFlags::OVFL) {
+            aexc |= 1 << 6;
+        }
+        if f.has(ExcFlags::UNFL) && f.has(ExcFlags::INEX2) {
+            aexc |= 1 << 5;
         }
         if f.has(ExcFlags::DZ) {
-            self.fpsr |= 0x10;
+            aexc |= 1 << 4;
         }
+        if f.has(ExcFlags::OVFL | ExcFlags::INEX2 | ExcFlags::INEX1) {
+            aexc |= 1 << 3; // INEX
+        }
+        self.fpsr |= aexc;
     }
 
     /// Evaluate a 6888x conditional predicate against FPSR. The upper
@@ -653,7 +684,7 @@ impl CpuCore {
             }
             0x04 | 0x41 | 0x45 => {
                 // FSQRT / FSSQRT / FDSQRT
-                let ctx = self.fpu_ctx();
+                let ctx = self.fpu_ctx(opmode);
                 let mut f = ExcFlags::default();
                 self.fpr[dst] = softfloat::sqrt(src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
@@ -674,7 +705,7 @@ impl CpuCore {
             }
             0x20 | 0x60 | 0x64 => {
                 // FDIV / FSDIV / FDDIV - dst = dst / src
-                let ctx = self.fpu_ctx();
+                let ctx = self.fpu_ctx(opmode);
                 let mut f = ExcFlags::default();
                 self.fpr[dst] = softfloat::div(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
@@ -683,7 +714,7 @@ impl CpuCore {
             }
             0x22 | 0x62 | 0x66 => {
                 // FADD / FSADD / FDADD
-                let ctx = self.fpu_ctx();
+                let ctx = self.fpu_ctx(opmode);
                 let mut f = ExcFlags::default();
                 self.fpr[dst] = softfloat::add(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
@@ -692,7 +723,7 @@ impl CpuCore {
             }
             0x23 | 0x63 | 0x67 => {
                 // FMUL / FSMUL / FDMUL
-                let ctx = self.fpu_ctx();
+                let ctx = self.fpu_ctx(opmode);
                 let mut f = ExcFlags::default();
                 self.fpr[dst] = softfloat::mul(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
@@ -701,7 +732,7 @@ impl CpuCore {
             }
             0x28 | 0x68 | 0x6C => {
                 // FSUB / FSSUB / FDSUB
-                let ctx = self.fpu_ctx();
+                let ctx = self.fpu_ctx(opmode);
                 let mut f = ExcFlags::default();
                 self.fpr[dst] = softfloat::sub(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
@@ -865,7 +896,7 @@ impl CpuCore {
             }
             0x26 => {
                 // FSCALE - dst = dst * 2^trunc(src)
-                let ctx = self.fpu_ctx();
+                let ctx = self.fpu_ctx(opmode);
                 let mut f = ExcFlags::default();
                 let n = s as i32;
                 self.fpr[dst] = softfloat::scale(self.fpr[dst], n, ctx, &mut f);
