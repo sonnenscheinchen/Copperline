@@ -126,6 +126,34 @@ fn f64_to_int_saturating(value: f64, fpcr: u32, min: i64, max: i64) -> i64 {
     }
 }
 
+/// Load a constant from the 6888x on-chip ROM by `offset` (the ROM-index
+/// field of an FMOVECR instruction). Shared by both FMOVECR encodings.
+fn fpu_const_rom(offset: usize) -> f64 {
+    match offset {
+        0x00 => std::f64::consts::PI,      // Pi
+        0x0B => std::f64::consts::LOG10_2, // log10(2)
+        0x0C => std::f64::consts::E,       // e
+        0x0D => std::f64::consts::LN_2,    // log_e(2) = ln(2)
+        0x0E => std::f64::consts::LN_10,   // log_e(10) = ln(10)
+        0x0F => 0.0,                       // Zero
+        0x30 => std::f64::consts::LN_2,    // ln(2)
+        0x31 => std::f64::consts::LN_10,   // ln(10)
+        0x32 => 1.0,                       // 1.0
+        0x33 => 10.0,                      // 10.0
+        0x34 => 100.0,                     // 10^2
+        0x35 => 1.0e4,                     // 10^4
+        0x36 => 1.0e8,                     // 10^8
+        0x37 => 1.0e16,                    // 10^16
+        0x38 => 1.0e32,                    // 10^32
+        0x39 => 1.0e64,                    // 10^64
+        0x3A => 1.0e128,                   // 10^128
+        0x3B => 1.0e256,                   // 10^256
+        // Higher powers would overflow, return infinity
+        0x3C..=0x3F => f64::INFINITY,
+        _ => 0.0, // Unknown constant, return 0
+    }
+}
+
 impl CpuCore {
     /// 68040 FPU "op0" entrypoint (opcode pattern 0xF2xx in Musashi: `040fpu0`).
     ///
@@ -152,116 +180,30 @@ impl CpuCore {
 
         match subop {
             0x2 => {
-                // FPU ALU <ea>, FPn - includes FMOVE, FADD, FSUB, FMUL, FDIV, FCMP from memory
+                // FPU ALU <ea>, FPn -- the memory/immediate-source form of
+                // the full opmode set (FMOVE, the monadic ops, the
+                // transcendentals, and the dyadic arithmetic). Shares the
+                // fpu_apply_op dispatch table with the register-source path
+                // below so the two cannot drift apart.
                 let src_fmt = (w2 >> 10) & 0x7;
                 let dst = ((w2 >> 7) & 7) as usize;
-                let mut opmode = w2 & 0x7f;
-                // Handle Musashi-style rounding modifiers embedded in opmode.
-                if (opmode & 0x44) == 0x44 {
-                    opmode &= !0x44;
-                } else if (opmode & 0x40) != 0 {
-                    opmode &= !0x40;
-                }
+                let opmode = w2 & 0x7f;
 
                 // Consume w2 now that we're committed.
                 let _w2 = self.read_imm_16(bus);
 
-                // FMOVECR (format 7) loads from the constant ROM; every
-                // other format reads the source operand at its width.
-                let src_value: Option<f64> = match src_fmt {
-                    7 => {
-                        // FMOVECR - load constant from ROM
-                        // The opmode field contains the ROM offset
-                        let rom_offset = opmode as usize;
-                        let constant = match rom_offset {
-                            0x00 => std::f64::consts::PI,      // Pi
-                            0x0B => std::f64::consts::LOG10_2, // log10(2)
-                            0x0C => std::f64::consts::E,       // e
-                            0x0D => std::f64::consts::LN_2,    // log_e(2) = ln(2)
-                            0x0E => std::f64::consts::LN_10,   // log_e(10) = ln(10)
-                            0x0F => 0.0,                       // Zero
-                            0x30 => std::f64::consts::LN_2,    // ln(2)
-                            0x31 => std::f64::consts::LN_10,   // ln(10)
-                            0x32 => 1.0,                       // 1.0
-                            0x33 => 10.0,                      // 10.0
-                            0x34 => 100.0,                     // 10^2
-                            0x35 => 1.0e4,                     // 10^4
-                            0x36 => 1.0e8,                     // 10^8
-                            0x37 => 1.0e16,                    // 10^16
-                            0x38 => 1.0e32,                    // 10^32
-                            0x39 => 1.0e64,                    // 10^64
-                            0x3A => 1.0e128,                   // 10^128
-                            0x3B => 1.0e256,                   // 10^256
-                            // Higher powers would overflow, return infinity
-                            0x3C..=0x3F => f64::INFINITY,
-                            _ => 0.0, // Unknown constant, return 0
-                        };
-                        self.fpr[dst] = constant;
-                        self.fpu_set_cc(self.fpr[dst]);
-                        return 4;
-                    }
-                    _ => self.fpu_read_source(bus, opcode, src_fmt),
-                };
+                if src_fmt == 7 {
+                    // FMOVECR - load constant from ROM. The opmode field is
+                    // the ROM index; there is no <ea> source operand.
+                    self.fpr[dst] = fpu_const_rom(opmode as usize);
+                    self.fpu_set_cc(self.fpr[dst]);
+                    return 4;
+                }
 
-                let Some(src) = src_value else {
+                let Some(src) = self.fpu_read_source(bus, opcode, src_fmt) else {
                     return 0;
                 };
-
-                match opmode {
-                    0x00 => {
-                        // FMOVE <ea>, FPn
-                        self.fpr[dst] = src;
-                        self.fpu_set_cc(src);
-                        4
-                    }
-                    0x20 => {
-                        // FDIV <ea>, FPn
-                        if src == 0.0 {
-                            if self.fpr[dst] == 0.0 {
-                                // 0/0 = NaN, set OPERR
-                                self.fpr[dst] = f64::NAN;
-                                self.fpsr |= 0x20; // OPERR
-                            } else {
-                                // x/0 = Inf, set DZ
-                                self.fpr[dst] = if self.fpr[dst] < 0.0 {
-                                    f64::NEG_INFINITY
-                                } else {
-                                    f64::INFINITY
-                                };
-                                self.fpsr |= 0x10; // DZ
-                            }
-                        } else {
-                            self.fpr[dst] /= src;
-                        }
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x22 => {
-                        // FADD <ea>, FPn
-                        self.fpr[dst] += src;
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x23 => {
-                        // FMUL <ea>, FPn
-                        self.fpr[dst] *= src;
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x28 => {
-                        // FSUB <ea>, FPn
-                        self.fpr[dst] -= src;
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x38 => {
-                        // FCMP <ea>, FPn
-                        let diff = self.fpr[dst] - src;
-                        self.fpu_set_cc(diff);
-                        4
-                    }
-                    _ => 0, // Unimplemented opmode
-                }
+                self.fpu_apply_op(opmode, dst, src)
             }
             0x3 => {
                 // FMOVE FP, <ea> - move FP register to memory/integer register
@@ -290,318 +232,14 @@ impl CpuCore {
                 // Consume w2
                 let _ = self.read_imm_16(bus);
 
-                match opmode {
-                    0x00 => {
-                        // FMOVE FPm, FPn
-                        self.fpr[dst] = self.fpr[src];
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x01 => {
-                        // FINT FPm, FPn - round to integer using FPCR rounding mode
-                        let rounding_mode = (self.fpcr >> 4) & 0x3;
-                        let val = self.fpr[src];
-                        self.fpr[dst] = match rounding_mode {
-                            0 => val.round(), // RN - Round to Nearest
-                            1 => val.trunc(), // RZ - Round toward Zero
-                            2 => val.floor(), // RM - Round toward Minus Infinity
-                            3 => val.ceil(),  // RP - Round toward Plus Infinity
-                            _ => val.round(),
-                        };
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x03 => {
-                        // FINTRZ FPm, FPn - round to integer toward zero
-                        self.fpr[dst] = self.fpr[src].trunc();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x04 | 0x44 | 0x45 => {
-                        // FSQRT FPm, FPn
-                        self.fpr[dst] = self.fpr[src].sqrt();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x18 | 0x58 | 0x5C => {
-                        // FABS FPm, FPn
-                        self.fpr[dst] = self.fpr[src].abs();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x1A | 0x5A | 0x5E => {
-                        // FNEG FPm, FPn
-                        self.fpr[dst] = -self.fpr[src];
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x20 | 0x60 | 0x64 => {
-                        // FDIV FPm, FPn (0x20), with rounding variants
-                        if self.fpr[src] == 0.0 {
-                            if self.fpr[dst] == 0.0 {
-                                // 0/0 = NaN, set OPERR
-                                self.fpr[dst] = f64::NAN;
-                                self.fpsr |= 0x20; // OPERR
-                            } else {
-                                // x/0 = Inf, set DZ
-                                self.fpr[dst] = if self.fpr[dst] < 0.0 {
-                                    f64::NEG_INFINITY
-                                } else {
-                                    f64::INFINITY
-                                };
-                                self.fpsr |= 0x10; // DZ
-                            }
-                        } else {
-                            self.fpr[dst] /= self.fpr[src];
-                        }
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x22 | 0x62 | 0x66 => {
-                        // FADD FPm, FPn with rounding variants
-                        self.fpr[dst] += self.fpr[src];
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x23 | 0x63 | 0x67 => {
-                        // FMUL FPm, FPn with rounding variants
-                        self.fpr[dst] *= self.fpr[src];
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x28 | 0x68 | 0x6C => {
-                        // FSUB FPm, FPn with rounding variants
-                        self.fpr[dst] -= self.fpr[src];
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x38 => {
-                        // FCMP FPm, FPn
-                        let diff = self.fpr[dst] - self.fpr[src];
-                        self.fpu_set_cc(diff);
-                        4
-                    }
-                    0x3A => {
-                        // FTST FPm - test and set condition codes (doesn't write dst)
-                        self.fpu_set_cc(self.fpr[src]);
-                        4
-                    }
-                    0x17 => {
-                        // FMOVECR - load constant from ROM
-                        // The src field contains the ROM offset
-                        let rom_offset = src;
-                        let constant = match rom_offset {
-                            0x00 => std::f64::consts::PI,      // Pi
-                            0x0B => std::f64::consts::LOG10_2, // log10(2)
-                            0x0C => std::f64::consts::E,       // e
-                            0x0D => std::f64::consts::LN_2,    // log_e(2) = ln(2)
-                            0x0E => std::f64::consts::LN_10,   // log_e(10) = ln(10)
-                            0x0F => 0.0,                       // Zero
-                            0x30 => std::f64::consts::LN_2,    // ln(2)
-                            0x31 => std::f64::consts::LN_10,   // ln(10)
-                            0x32 => 1.0,                       // 1.0
-                            0x33 => 10.0,                      // 10.0
-                            0x34 => 100.0,                     // 10^2
-                            0x35 => 1.0e4,                     // 10^4
-                            0x36 => 1.0e8,                     // 10^8
-                            0x37 => 1.0e16,                    // 10^16
-                            0x38 => 1.0e32,                    // 10^32
-                            0x39 => 1.0e64,                    // 10^64
-                            0x3A => 1.0e128,                   // 10^128
-                            0x3B => 1.0e256,                   // 10^256
-                            // Higher powers would overflow, return infinity
-                            0x3C..=0x3F => f64::INFINITY,
-                            _ => 0.0, // Unknown constant, return 0
-                        };
-                        self.fpr[dst] = constant;
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    // ========== Transcendental Functions ==========
-                    0x0E => {
-                        // FSIN FPm, FPn
-                        self.fpr[dst] = self.fpr[src].sin();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x1D => {
-                        // FCOS FPm, FPn
-                        self.fpr[dst] = self.fpr[src].cos();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x0F => {
-                        // FTAN FPm, FPn
-                        self.fpr[dst] = self.fpr[src].tan();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x0C => {
-                        // FASIN FPm, FPn
-                        self.fpr[dst] = self.fpr[src].asin();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x1C => {
-                        // FACOS FPm, FPn
-                        self.fpr[dst] = self.fpr[src].acos();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x0A => {
-                        // FATAN FPm, FPn
-                        self.fpr[dst] = self.fpr[src].atan();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x02 => {
-                        // FSINH FPm, FPn
-                        self.fpr[dst] = self.fpr[src].sinh();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x19 => {
-                        // FCOSH FPm, FPn
-                        self.fpr[dst] = self.fpr[src].cosh();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x09 => {
-                        // FTANH FPm, FPn
-                        self.fpr[dst] = self.fpr[src].tanh();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x0D => {
-                        // FATANH FPm, FPn
-                        self.fpr[dst] = self.fpr[src].atanh();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x10 => {
-                        // FETOX FPm, FPn (e^x)
-                        self.fpr[dst] = self.fpr[src].exp();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x08 => {
-                        // FETOXM1 FPm, FPn (e^x - 1)
-                        self.fpr[dst] = self.fpr[src].exp_m1();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x11 => {
-                        // FTWOTOX FPm, FPn (2^x)
-                        self.fpr[dst] = (2.0_f64).powf(self.fpr[src]);
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x12 => {
-                        // FTENTOX FPm, FPn (10^x)
-                        self.fpr[dst] = (10.0_f64).powf(self.fpr[src]);
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x14 => {
-                        // FLOGN FPm, FPn (ln(x))
-                        self.fpr[dst] = self.fpr[src].ln();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x06 => {
-                        // FLOGNP1 FPm, FPn (ln(1+x))
-                        self.fpr[dst] = self.fpr[src].ln_1p();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x15 => {
-                        // FLOG10 FPm, FPn (log10(x))
-                        self.fpr[dst] = self.fpr[src].log10();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x16 => {
-                        // FLOG2 FPm, FPn (log2(x))
-                        self.fpr[dst] = self.fpr[src].log2();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x1E => {
-                        // FGETEXP FPm, FPn - extract exponent
-                        let val = self.fpr[src];
-                        if val == 0.0 || val.is_nan() || val.is_infinite() {
-                            self.fpr[dst] = if val.is_nan() || val.is_infinite() {
-                                f64::NAN
-                            } else {
-                                0.0
-                            };
-                        } else {
-                            // IEEE 754 double: sign (1 bit) | exponent (11 bits) | mantissa (52 bits)
-                            let bits = val.to_bits();
-                            let biased_exp = ((bits >> 52) & 0x7FF) as i32;
-                            let exp = biased_exp - 1023; // Remove bias
-                            self.fpr[dst] = exp as f64;
-                        }
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x1F => {
-                        // FGETMAN FPm, FPn - extract mantissa as 1.xxx
-                        let val = self.fpr[src];
-                        if val == 0.0 {
-                            self.fpr[dst] = 0.0;
-                        } else if val.is_nan() || val.is_infinite() {
-                            self.fpr[dst] = val; // Keep special values
-                        } else {
-                            // Extract mantissa and set exponent to 0 (bias 1023)
-                            let bits = val.to_bits();
-                            let sign = bits & (1 << 63);
-                            let mantissa_bits = bits & 0x000F_FFFF_FFFF_FFFF;
-                            // Construct 1.mantissa with exponent 0 (biased 1023)
-                            let result_bits = sign | (1023_u64 << 52) | mantissa_bits;
-                            self.fpr[dst] = f64::from_bits(result_bits);
-                        }
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x21 => {
-                        // FMOD FPm, FPn
-                        self.fpr[dst] %= self.fpr[src];
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x25 => {
-                        // FREM FPm, FPn (IEEE remainder)
-                        let src_val = self.fpr[src];
-                        let dst_val = self.fpr[dst];
-                        // IEEE remainder: r = x - y*round(x/y)
-                        if src_val != 0.0 {
-                            let n = (dst_val / src_val).round();
-                            self.fpr[dst] = dst_val - src_val * n;
-                        }
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x26 => {
-                        // FSCALE FPm, FPn - multiply by power of 2
-                        // dst = dst * 2^src
-                        let scale = self.fpr[src] as i32;
-                        self.fpr[dst] *= (2.0_f64).powi(scale);
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    0x30..=0x37 => {
-                        // FSINCOS FPm, FPc:FPs - compute sin and cos simultaneously
-                        // Bottom 3 bits (opmode & 7) = cos destination register
-                        let cos_dst = (opmode & 7) as usize;
-                        let val = self.fpr[src];
-                        self.fpr[dst] = val.sin();
-                        self.fpr[cos_dst] = val.cos();
-                        self.fpu_set_cc(self.fpr[dst]);
-                        4
-                    }
-                    _ => 0, // Unimplemented opmode
+                if opmode == 0x17 {
+                    // FMOVECR - load constant from ROM. In this register-form
+                    // encoding the source-register field carries the ROM index.
+                    self.fpr[dst] = fpu_const_rom(src);
+                    self.fpu_set_cc(self.fpr[dst]);
+                    return 4;
                 }
+                self.fpu_apply_op(opmode, dst, self.fpr[src])
             }
             0x6 | 0x7 => {
                 // FMOVEM - move multiple FP registers to/from memory
@@ -1015,6 +653,293 @@ impl CpuCore {
             0xD => nan || n || z,     // ULE
             0xE => !z,                // NE
             _ => true,                // T
+        }
+    }
+
+    /// Apply a general FPU ALU operation `opmode` to destination register
+    /// `dst` using the source operand `src` (already widened to f64 from an
+    /// FPm register or an <ea>/immediate operand). This is the single
+    /// dispatch table shared by the register-source (`subop 0x0`) and
+    /// memory/immediate-source (`subop 0x2`) paths so the two cannot drift
+    /// apart. FMOVECR has no f64 source operand and is handled by the callers.
+    ///
+    /// The 6888x/68040 single- and double-precision rounding-precision
+    /// variants (FSxxx / FDxxx, opmode bit 6 set) force the result width but
+    /// compute the same value; the emulated FPU works in f64 and folds each
+    /// variant onto its base operation. Returns the cycle count, or 0 for an
+    /// unimplemented opmode so the caller raises the Line-F exception.
+    fn fpu_apply_op(&mut self, opmode: u16, dst: usize, src: f64) -> i32 {
+        match opmode {
+            0x00 | 0x40 | 0x44 => {
+                // FMOVE / FSMOVE / FDMOVE
+                self.fpr[dst] = src;
+                self.fpu_set_cc(src);
+                4
+            }
+            0x01 => {
+                // FINT - round to integer using FPCR rounding mode
+                let rounding_mode = (self.fpcr >> 4) & 0x3;
+                self.fpr[dst] = match rounding_mode {
+                    0 => src.round(), // RN - Round to Nearest
+                    1 => src.trunc(), // RZ - Round toward Zero
+                    2 => src.floor(), // RM - Round toward Minus Infinity
+                    3 => src.ceil(),  // RP - Round toward Plus Infinity
+                    _ => src.round(),
+                };
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x03 => {
+                // FINTRZ - round to integer toward zero
+                self.fpr[dst] = src.trunc();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x04 | 0x41 | 0x45 => {
+                // FSQRT / FSSQRT / FDSQRT
+                self.fpr[dst] = src.sqrt();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x18 | 0x58 | 0x5C => {
+                // FABS / FSABS / FDABS
+                self.fpr[dst] = src.abs();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x1A | 0x5A | 0x5E => {
+                // FNEG / FSNEG / FDNEG
+                self.fpr[dst] = -src;
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x20 | 0x60 | 0x64 => {
+                // FDIV / FSDIV / FDDIV - dst = dst / src
+                if src == 0.0 {
+                    if self.fpr[dst] == 0.0 {
+                        // 0/0 = NaN, set OPERR
+                        self.fpr[dst] = f64::NAN;
+                        self.fpsr |= 0x20; // OPERR
+                    } else {
+                        // x/0 = Inf, set DZ
+                        self.fpr[dst] = if self.fpr[dst] < 0.0 {
+                            f64::NEG_INFINITY
+                        } else {
+                            f64::INFINITY
+                        };
+                        self.fpsr |= 0x10; // DZ
+                    }
+                } else {
+                    self.fpr[dst] /= src;
+                }
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x22 | 0x62 | 0x66 => {
+                // FADD / FSADD / FDADD
+                self.fpr[dst] += src;
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x23 | 0x63 | 0x67 => {
+                // FMUL / FSMUL / FDMUL
+                self.fpr[dst] *= src;
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x28 | 0x68 | 0x6C => {
+                // FSUB / FSSUB / FDSUB
+                self.fpr[dst] -= src;
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x38 => {
+                // FCMP - compare dst with src, set condition codes only
+                let diff = self.fpr[dst] - src;
+                self.fpu_set_cc(diff);
+                4
+            }
+            0x3A => {
+                // FTST - test src, set condition codes only (no dst write)
+                self.fpu_set_cc(src);
+                4
+            }
+            // ========== Transcendental Functions ==========
+            0x0E => {
+                // FSIN
+                self.fpr[dst] = src.sin();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x1D => {
+                // FCOS
+                self.fpr[dst] = src.cos();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x0F => {
+                // FTAN
+                self.fpr[dst] = src.tan();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x0C => {
+                // FASIN
+                self.fpr[dst] = src.asin();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x1C => {
+                // FACOS
+                self.fpr[dst] = src.acos();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x0A => {
+                // FATAN
+                self.fpr[dst] = src.atan();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x02 => {
+                // FSINH
+                self.fpr[dst] = src.sinh();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x19 => {
+                // FCOSH
+                self.fpr[dst] = src.cosh();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x09 => {
+                // FTANH
+                self.fpr[dst] = src.tanh();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x0D => {
+                // FATANH
+                self.fpr[dst] = src.atanh();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x10 => {
+                // FETOX (e^x)
+                self.fpr[dst] = src.exp();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x08 => {
+                // FETOXM1 (e^x - 1)
+                self.fpr[dst] = src.exp_m1();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x11 => {
+                // FTWOTOX (2^x)
+                self.fpr[dst] = (2.0_f64).powf(src);
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x12 => {
+                // FTENTOX (10^x)
+                self.fpr[dst] = (10.0_f64).powf(src);
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x14 => {
+                // FLOGN (ln(x))
+                self.fpr[dst] = src.ln();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x06 => {
+                // FLOGNP1 (ln(1+x))
+                self.fpr[dst] = src.ln_1p();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x15 => {
+                // FLOG10 (log10(x))
+                self.fpr[dst] = src.log10();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x16 => {
+                // FLOG2 (log2(x))
+                self.fpr[dst] = src.log2();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x1E => {
+                // FGETEXP - extract exponent
+                if src == 0.0 || src.is_nan() || src.is_infinite() {
+                    self.fpr[dst] = if src.is_nan() || src.is_infinite() {
+                        f64::NAN
+                    } else {
+                        0.0
+                    };
+                } else {
+                    // IEEE 754 double: sign (1) | exponent (11) | mantissa (52)
+                    let bits = src.to_bits();
+                    let biased_exp = ((bits >> 52) & 0x7FF) as i32;
+                    let exp = biased_exp - 1023; // Remove bias
+                    self.fpr[dst] = exp as f64;
+                }
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x1F => {
+                // FGETMAN - extract mantissa as 1.xxx
+                if src == 0.0 {
+                    self.fpr[dst] = 0.0;
+                } else if src.is_nan() || src.is_infinite() {
+                    self.fpr[dst] = src; // Keep special values
+                } else {
+                    // Construct 1.mantissa with exponent 0 (biased 1023)
+                    let bits = src.to_bits();
+                    let sign = bits & (1 << 63);
+                    let mantissa_bits = bits & 0x000F_FFFF_FFFF_FFFF;
+                    let result_bits = sign | (1023_u64 << 52) | mantissa_bits;
+                    self.fpr[dst] = f64::from_bits(result_bits);
+                }
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x21 => {
+                // FMOD
+                self.fpr[dst] %= src;
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x25 => {
+                // FREM (IEEE remainder): r = x - y*round(x/y)
+                if src != 0.0 {
+                    let n = (self.fpr[dst] / src).round();
+                    self.fpr[dst] -= src * n;
+                }
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x26 => {
+                // FSCALE - dst = dst * 2^src
+                let scale = src as i32;
+                self.fpr[dst] *= (2.0_f64).powi(scale);
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            0x30..=0x37 => {
+                // FSINCOS - compute sin and cos simultaneously.
+                // Bottom 3 bits of opmode = cos destination register.
+                let cos_dst = (opmode & 7) as usize;
+                self.fpr[dst] = src.sin();
+                self.fpr[cos_dst] = src.cos();
+                self.fpu_set_cc(self.fpr[dst]);
+                4
+            }
+            _ => 0, // Unimplemented opmode
         }
     }
 
