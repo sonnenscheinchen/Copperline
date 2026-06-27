@@ -253,6 +253,110 @@ fn log1p(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     d.to_x80(ctx, f)
 }
 
+// ============================== trig family ==============================
+
+/// Reduce x = k*(pi/2) + r with |r| <= pi/4, returning (k, r). Accurate while
+/// k*(pi/2) does not exceed the ~128-bit reduction precision (very large
+/// arguments degrade, as they do on real hardware).
+fn reduce_quadrant(x: FloatX80) -> (i64, Df) {
+    let kf = (x.to_f64() * std::f64::consts::FRAC_2_PI).round();
+    let k = kf as i64;
+    let r = dd::sub(Df::from_x80(x), dd::mul_x80(dd::consts().pi_2, fx(kf)));
+    (k, r)
+}
+
+/// sin(r) and cos(r) for |r| <= pi/4 via their Maclaurin series, in Df.
+fn sin_cos_kernel(r: Df) -> (Df, Df) {
+    let neg_r2 = dd::sqr(r).neg();
+    // sin(r) = r - r^3/3! + ...
+    let mut t = r;
+    let mut s = r;
+    let mut k = 1i32;
+    loop {
+        t = dd::div(dd::mul(t, neg_r2), Df::from_i32((2 * k) * (2 * k + 1)));
+        s = dd::add(s, t);
+        if dd::term_negligible(t, s) || k > 30 {
+            break;
+        }
+        k += 1;
+    }
+    // cos(r) = 1 - r^2/2! + ...
+    let mut tc = Df::from_i32(1);
+    let mut c = Df::from_i32(1);
+    let mut k = 1i32;
+    loop {
+        tc = dd::div(dd::mul(tc, neg_r2), Df::from_i32((2 * k - 1) * (2 * k)));
+        c = dd::add(c, tc);
+        if dd::term_negligible(tc, c) || k > 30 {
+            break;
+        }
+        k += 1;
+    }
+    (s, c)
+}
+
+/// (sin x, cos x) as Df, plus quadrant handling; specials return Df NaN/etc.
+fn sin_cos_df(x: FloatX80, f: &mut ExcFlags) -> Option<(Df, Df)> {
+    if x.is_nan() {
+        let n = Df::from_x80(nan_result(x, f));
+        return Some((n, n));
+    }
+    if x.is_inf() {
+        f.raise(ExcFlags::OPERR);
+        let n = Df::from_x80(FloatX80::default_nan());
+        return Some((n, n));
+    }
+    if x.is_zero() {
+        return Some((Df::from_x80(x), Df::from_i32(1))); // sin(+-0)=+-0, cos=1
+    }
+    let (k, r) = reduce_quadrant(x);
+    let (sr, cr) = sin_cos_kernel(r);
+    let q = ((k % 4) + 4) % 4;
+    Some(match q {
+        0 => (sr, cr),
+        1 => (cr, sr.neg()),
+        2 => (sr.neg(), cr.neg()),
+        _ => (cr.neg(), sr),
+    })
+}
+
+fn sin_cos_x80(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> (FloatX80, FloatX80) {
+    let (s, c) = sin_cos_df(x, f).unwrap();
+    (s.to_x80(ctx, f), c.to_x80(ctx, f))
+}
+
+fn sin(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    let (s, _) = sin_cos_df(x, f).unwrap();
+    s.to_x80(ctx, f)
+}
+
+fn cos(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    let (_, c) = sin_cos_df(x, f).unwrap();
+    c.to_x80(ctx, f)
+}
+
+fn tan(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    if x.is_nan() {
+        return nan_result(x, f);
+    }
+    if x.is_inf() {
+        f.raise(ExcFlags::OPERR);
+        return FloatX80::default_nan();
+    }
+    if x.is_zero() {
+        return x; // tan(+-0) = +-0
+    }
+    let (k, r) = reduce_quadrant(x);
+    let (sr, cr) = sin_cos_kernel(r);
+    // tan = sin/cos; with the quadrant this is sr/cr (even q) or -cr/sr (odd q).
+    let t = if k & 1 == 0 {
+        dd::div(sr, cr)
+    } else {
+        dd::div(cr, sr).neg()
+    };
+    t.to_x80(ctx, f)
+}
+
 // ============================== still f64-bridged ========================
 
 #[inline]
@@ -277,10 +381,10 @@ pub fn eval_unary(opmode: u16, src: FloatX80) -> Option<FloatX80> {
         0x06 => log1p(src, ctx, f),
         0x15 => log10(src, ctx, f),
         0x16 => log2(src, ctx, f),
+        0x0E => sin(src, ctx, f),
+        0x1D => cos(src, ctx, f),
+        0x0F => tan(src, ctx, f),
         // Still f64-bridged (converted in later milestones).
-        0x0E => bridge(src, f64::sin),
-        0x1D => bridge(src, f64::cos),
-        0x0F => bridge(src, f64::tan),
         0x0C => bridge(src, f64::asin),
         0x1C => bridge(src, f64::acos),
         0x0A => bridge(src, f64::atan),
@@ -295,8 +399,7 @@ pub fn eval_unary(opmode: u16, src: FloatX80) -> Option<FloatX80> {
 
 /// FSINCOS: sine and cosine of the same operand.
 pub fn sincos(src: FloatX80) -> (FloatX80, FloatX80) {
-    let v = src.to_f64();
-    (FloatX80::from_f64(v.sin()), FloatX80::from_f64(v.cos()))
+    sin_cos_x80(src, RoundCtx::NEAREST_EXT, &mut noflags())
 }
 
 /// FMOD: dst modulo src (truncated quotient).
@@ -372,6 +475,32 @@ mod tests {
             assert!(close(ev(0x08, x), x.exp_m1(), 1e-14), "expm1 {x}");
             assert!(close(ev(0x06, x), x.ln_1p(), 1e-14), "log1p {x}");
         }
+    }
+
+    #[test]
+    fn trig_anchors_and_identities() {
+        assert_eq!(ev(0x0E, 0.0), 0.0); // sin(0)
+        assert_eq!(ev(0x1D, 0.0), 1.0); // cos(0)
+        assert_eq!(ev(0x0F, 0.0), 0.0); // tan(0)
+        // sin^2 + cos^2 == 1 across quadrants and a large argument.
+        for &x in &[0.3_f64, 1.2, 3.0, -2.5, 7.0, 100.0, 1000.0] {
+            let s = ev(0x0E, x);
+            let c = ev(0x1D, x);
+            assert!((s * s + c * c - 1.0).abs() < 1e-15, "sin^2+cos^2 at {x}");
+            // tan == sin/cos.
+            let t = ev(0x0F, x);
+            assert!(close(t, s / c, 1e-14), "tan at {x}");
+            // agreement with libm to ~f64 precision.
+            assert!((s - x.sin()).abs() < 1e-14, "sin {x}");
+            assert!((c - x.cos()).abs() < 1e-14, "cos {x}");
+        }
+    }
+
+    #[test]
+    fn sincos_pair() {
+        let (s, c) = sincos(fx(1.0));
+        assert!((s.to_f64() - 1.0_f64.sin()).abs() < 1e-15);
+        assert!((c.to_f64() - 1.0_f64.cos()).abs() < 1e-15);
     }
 
     #[test]
