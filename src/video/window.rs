@@ -1217,7 +1217,7 @@ impl ApplicationHandler for App {
                         if host_shortcut_modifier_pressed(self.modifiers)
                             && self.modifiers.shift_key() =>
                     {
-                        self.load_state_from_dialog()
+                        self.load_state_from_dialog(Some(event_loop))
                     }
                     (KeyCode::KeyS, ElementState::Pressed)
                         if host_shortcut_modifier_pressed(self.modifiers) =>
@@ -1361,7 +1361,7 @@ impl ApplicationHandler for App {
                         if let Some(control) =
                             self.cursor_pos.and_then(|p| self.main_ui_control_at(p))
                         {
-                            self.activate_ui_control(control);
+                            self.activate_ui_control_with_event_loop(control, Some(event_loop));
                             self.ensure_tool_windows_for_open_panels(event_loop);
                             return;
                         }
@@ -4613,7 +4613,16 @@ impl App {
     }
 
     /// Run the action behind a clicked menu item or panel control.
+    #[cfg(test)]
     fn activate_ui_control(&mut self, control: UiControl) {
+        self.activate_ui_control_with_event_loop(control, None);
+    }
+
+    fn activate_ui_control_with_event_loop(
+        &mut self,
+        control: UiControl,
+        event_loop: Option<&ActiveEventLoop>,
+    ) {
         match control {
             UiControl::MenuItem(item) => {
                 self.ui.menu_open = false;
@@ -4632,7 +4641,7 @@ impl App {
                     ui::MenuItem::Record => self.toggle_recording(),
                     ui::MenuItem::RecordInput => self.toggle_input_recording(),
                     ui::MenuItem::SaveState => self.save_state_interactive(),
-                    ui::MenuItem::LoadState => self.load_state_from_dialog(),
+                    ui::MenuItem::LoadState => self.load_state_from_dialog(event_loop),
                     ui::MenuItem::LoadRom => self.load_rom_from_dialog(),
                     ui::MenuItem::MachineConfig => self.open_launcher(),
                 }
@@ -5547,7 +5556,7 @@ impl App {
     /// success the machine continues from the state's timeline: power is
     /// forced on, any CPU halt is cleared, and the display re-renders from
     /// the restored Bus. On failure the running machine is untouched.
-    fn load_state_from_dialog(&mut self) {
+    fn load_state_from_dialog(&mut self, event_loop: Option<&ActiveEventLoop>) {
         self.suspend_live_audio_for_host_io();
         let picked = rfd::FileDialog::new()
             .set_title("Load save state")
@@ -5558,44 +5567,58 @@ impl App {
         // successful load re-anchors again to the restored timeline inside
         // Emulator::load_state.
         if let Some(path) = picked {
-            match self.emu.load_state(&path) {
-                Ok(outcome) => {
-                    info!(
-                        "save state loaded: {} ({})",
-                        path.display(),
-                        outcome.summary
-                    );
-                    self.powered_on = true;
-                    self.cpu_halted = false;
-                    // Force a fresh presentation: the restored frame counter
-                    // may equal (or precede) the last rendered one.
-                    self.reset_render_pipeline();
-                    if outcome.reconfigured {
-                        // The state was built on a different machine; the host
-                        // has been reconfigured to match it (see log for the
-                        // specifics). The disk-swap playlists are host-side and
-                        // describe the previous machine's drives, so drop them
-                        // rather than let stale swap affordances show in the
-                        // status bar; the restored drives keep whatever disks
-                        // the state embedded.
-                        self.disk_playlists = std::array::from_fn(|_| Vec::new());
-                        self.show_osd(format!(
-                            "Loaded {} (reconfigured to {})",
-                            display_file_name(&path),
-                            outcome.summary
-                        ));
-                    } else {
-                        self.show_osd(format!("Loaded {}", display_file_name(&path)));
-                    }
-                    self.request_redraw();
-                }
-                Err(e) => {
-                    warn!("save state load failed ({}): {e:#}", path.display());
-                    self.show_osd("State load failed (see log)");
+            if self.load_state_from_path(&path) {
+                if let Some(event_loop) = event_loop {
+                    event_loop.set_control_flow(ControlFlow::Poll);
                 }
             }
         }
         self.finish_host_io_pause();
+    }
+
+    fn load_state_from_path(&mut self, path: &std::path::Path) -> bool {
+        match self.emu.load_state(path) {
+            Ok(outcome) => {
+                info!(
+                    "save state loaded: {} ({})",
+                    path.display(),
+                    outcome.summary
+                );
+                self.powered_on = true;
+                self.cpu_halted = false;
+                // Force a fresh presentation: the restored frame counter
+                // may equal (or precede) the last rendered one.
+                self.reset_render_pipeline();
+                if matches!(self.ui.panel, Some(Panel::Launcher(_))) {
+                    self.ui.panel = None;
+                    self.resize_for_active_panel();
+                }
+                if outcome.reconfigured {
+                    // The state was built on a different machine; the host
+                    // has been reconfigured to match it (see log for the
+                    // specifics). The disk-swap playlists are host-side and
+                    // describe the previous machine's drives, so drop them
+                    // rather than let stale swap affordances show in the
+                    // status bar; the restored drives keep whatever disks
+                    // the state embedded.
+                    self.disk_playlists = std::array::from_fn(|_| Vec::new());
+                    self.show_osd(format!(
+                        "Loaded {} (reconfigured to {})",
+                        display_file_name(path),
+                        outcome.summary
+                    ));
+                } else {
+                    self.show_osd(format!("Loaded {}", display_file_name(path)));
+                }
+                self.request_redraw();
+                true
+            }
+            Err(e) => {
+                warn!("save state load failed ({}): {e:#}", path.display());
+                self.show_osd("State load failed (see log)");
+                false
+            }
+        }
     }
 
     /// Pick a Kickstart ROM (and an optional extended ROM) and fit it,
@@ -8789,6 +8812,43 @@ mod tests {
             !app.powered_on,
             "a failed Run must not power the machine on"
         );
+    }
+
+    #[test]
+    fn state_load_closes_launcher_and_powers_restored_machine() {
+        let path = std::env::temp_dir().join(format!(
+            "copperline-launcher-state-load-{}.clstate",
+            std::process::id()
+        ));
+        let mut app = test_app();
+        app.emu.save_state(&path).expect("save test state");
+
+        app.power_off();
+        let parked_present = app.present_fb.clone();
+        app.open_launcher();
+        assert!(matches!(app.ui.panel, Some(Panel::Launcher(_))));
+
+        assert!(app.load_state_from_path(&path));
+        assert!(app.ui.panel.is_none(), "state load should dismiss launcher");
+        assert!(app.powered_on);
+        assert!(!app.cpu_halted);
+        assert!(
+            app.present_fb == parked_present,
+            "load itself should not invent a rendered frame"
+        );
+
+        for _ in 0..3 {
+            app.emu.step_frame().expect("step restored frame");
+            if app.finish_render_for_current_frame() {
+                break;
+            }
+        }
+        assert_ne!(
+            app.present_fb, parked_present,
+            "restored machine should render over the parked test screen"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     struct SuspensionSink {

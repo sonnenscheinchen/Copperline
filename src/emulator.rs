@@ -557,13 +557,16 @@ impl Emulator {
     ///
     /// Call this when resuming after a deliberate pause where wall time
     /// advanced but emulated time did not (e.g. a modal file dialog blocking
-    /// the main thread). Without re-anchoring, the pacer would see emulated
-    /// time far behind the wall-clock target and fast-forward the emulator in
-    /// a catch-up burst, corrupting audio/video pacing. The anchor is placed
-    /// so that the current emulated device target maps exactly to now. No-op
-    /// until the clock has been anchored by the first step_frame.
+    /// the main thread), and after loading a state whose timeline is already
+    /// at a non-zero emulated time. Without re-anchoring, the pacer would see
+    /// emulated time far behind or ahead of the wall-clock target and either
+    /// sprint or sleep to catch up, corrupting audio/video pacing. The anchor
+    /// is placed so that the current emulated device target maps exactly to
+    /// now. For paced emulation this also initializes the anchor before the
+    /// first step_frame; unpaced headless runs still leave statistics anchored
+    /// at their first executed frame.
     pub fn reanchor_realtime_clock(&mut self) {
-        if self.stats.started_at.is_none() {
+        if self.stats.started_at.is_none() && !self.paced {
             return;
         }
         let target_seconds = (self.bus().emulated_seconds()
@@ -1909,6 +1912,36 @@ mod tests {
         assert_eq!(
             super::realtime_device_time_wait(started_at, now, 1.2, 0.2),
             Some(Duration::from_millis(100))
+        );
+    }
+
+    #[test]
+    fn reanchor_initializes_pre_run_restored_timeline() {
+        let mut emu = emulator_with_audio(Box::new(crate::audio::NullSink));
+        emu.paced = true;
+        emu.bus_mut()
+            .advance_devices(crate::chipset::paula::PAULA_CLOCK_HZ / 10);
+        assert!(
+            emu.stats.started_at.is_none(),
+            "fixture should model a loaded state before the first paced frame"
+        );
+
+        let before = Instant::now();
+        emu.reanchor_realtime_clock();
+        let anchor = emu
+            .stats
+            .started_at
+            .expect("reanchor should initialize the pacing clock");
+        let target = super::realtime_device_time_target(anchor, emu.bus().emulated_seconds(), 0.0)
+            .expect("finite target");
+
+        assert!(
+            target >= before,
+            "target {target:?} should not remain before reanchor start {before:?}"
+        );
+        assert!(
+            target <= Instant::now(),
+            "target {target:?} should map the restored timeline to now"
         );
     }
 
