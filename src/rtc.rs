@@ -283,8 +283,7 @@ mod tests {
         // real time zone (offsets are within +-14h), so the local
         // decomposition always lands in that window regardless of the test
         // host.
-        let dt =
-            RtcDateTime::from_system_time_local(UNIX_EPOCH + Duration::from_secs(946_782_245));
+        let dt = RtcDateTime::from_system_time_local(UNIX_EPOCH + Duration::from_secs(946_782_245));
         assert_eq!(dt.year, 2000);
         assert_eq!(dt.month, 1);
         assert!(dt.day == 1 || dt.day == 2);
