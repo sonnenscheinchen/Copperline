@@ -776,17 +776,46 @@ impl Paula {
         v
     }
 
+    /// True when pot pin `index` (0=POT0X, 1=POT0Y, 2=POT1X, 3=POT1Y) is being
+    /// driven HIGH as an output through POTGO -- both its output-enable (OUTxx)
+    /// and data (DATxx) bits set. DATxx live at bits 8/10/12/14 with the
+    /// matching OUTxx one bit above, the same layout `read_potgor` decodes.
+    fn pot_pin_driven_high(potgo: u16, index: usize) -> bool {
+        let dat_bit = 8 + 2 * index as u16;
+        let out_bit = dat_bit + 1;
+        potgo & (1 << dat_bit) != 0 && potgo & (1 << out_bit) != 0
+    }
+
     pub fn tick_pots(&mut self, cck: u32) {
         if !self.pot_running {
             return;
         }
+        let potgo = self.potgo;
         self.pot_acc_cck = self.pot_acc_cck.saturating_add(cck);
         while self.pot_acc_cck >= POT_COUNTER_CCK {
             self.pot_acc_cck -= POT_COUNTER_CCK;
-            for counter in &mut self.pot_counters {
-                *counter = counter.saturating_add(1);
+            for (i, counter) in self.pot_counters.iter_mut().enumerate() {
+                // A pin driven HIGH as an output charges its capacitor through
+                // the low-impedance driver, so the comparator trips on the
+                // first line and the counter never advances past its
+                // START-reset value of 0. Only floating or driven-low pins
+                // charge slowly through the external pot and count up. Games
+                // drive every pin high via POTGO=$FFFF to read POTxDAT back as
+                // ~0 (the Bitmap Brothers input code keys a "no second button"
+                // test on that, so a spuriously counting POT0DAT corrupts it).
+                if !Self::pot_pin_driven_high(potgo, i) {
+                    *counter = counter.saturating_add(1);
+                }
             }
-            if self.pot_counters.iter().all(|&counter| counter == u8::MAX) {
+            // Counting is finished once every pin has either saturated or is
+            // held at its reset value by a high output drive: nothing more can
+            // change until the next START.
+            if self
+                .pot_counters
+                .iter()
+                .enumerate()
+                .all(|(i, &counter)| counter == u8::MAX || Self::pot_pin_driven_high(potgo, i))
+            {
                 self.pot_running = false;
                 break;
             }
@@ -2891,6 +2920,35 @@ mod tests {
         paula.pot_acc_cck = POT_COUNTER_CCK - 1;
         paula.tick_pots(1);
         assert_eq!(paula.next_pot_event_cck(), None);
+    }
+
+    #[test]
+    fn pot_pin_driven_high_holds_counter_at_zero() {
+        // A pot pin driven HIGH as an output (OUTxx + DATxx set) charges its
+        // cap through the low-impedance driver, so the comparator trips at once
+        // and the counter stays at its START-reset value of 0. Software relies
+        // on this to read POTxDAT back as ~0 after POTGO=$FFFF (the Bitmap
+        // Brothers input code keys a "no second button" test on POT0DAT, and a
+        // spuriously counting pin sets a phantom button that breaks controls).
+        let charge = POT_COUNTER_CCK * 0x20;
+
+        // Drive every pin high: both POTxDAT words read back as zero.
+        let (mut paula, _) = paula_with_collect_sink();
+        paula.write_potgo(0xFFFF);
+        paula.tick_pots(charge);
+        assert_eq!(paula.read_potdat(0), 0x0000);
+        assert_eq!(paula.read_potdat(1), 0x0000);
+        // ...and the scan terminates rather than ticking forever.
+        assert_eq!(paula.next_pot_event_cck(), None);
+
+        // Per-pin: driving only the port-0 pins high (DATLX/OUTLX/DATLY/OUTLY =
+        // bits 8..11) holds POT0DAT at zero while the floating port-1 pins still
+        // charge up, proving the gate is per counter and not global.
+        let (mut paula, _) = paula_with_collect_sink();
+        paula.write_potgo(0x0F00 | 0x0001);
+        paula.tick_pots(charge);
+        assert_eq!(paula.read_potdat(0), 0x0000);
+        assert_ne!(paula.read_potdat(1), 0x0000);
     }
 
     #[test]

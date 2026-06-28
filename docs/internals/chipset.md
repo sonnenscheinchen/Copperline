@@ -127,7 +127,12 @@ modelled 68000 recognition latency), serial, and audio:
 - **Disk registers**: DSKLEN/DSKBYTR/DSKSYNC/DSKDAT and the disk-block
   interrupt, fed by the floppy controller below.
 - **Pots**: POTGO/POTGOR counters at the hardware 512-CCK rate (the second
-  mouse/joystick button path).
+  mouse/joystick button path). A pin driven HIGH as an output (its OUTxx and
+  DATxx bits both set) holds the matching POTxDAT counter at 0, modelling the
+  cap charging instantly through the driver; floating/driven-low pins charge
+  up as before. Software that writes POTGO=$FFFF to read POTxDAT back as ~0
+  (e.g. the Bitmap Brothers input poll, which keys a no-second-button test on
+  POT0DAT) depends on this.
 
 ## Denise (`denise.rs`)
 
