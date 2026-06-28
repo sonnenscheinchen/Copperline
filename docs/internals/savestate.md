@@ -18,7 +18,7 @@ This chapter is the implementation and format reference.
 The state is produced by `serde` derives on the live state structs
 themselves -- there is no hand-maintained parallel "snapshot" schema.
 `Bus` and everything it owns derive `Serialize`/`Deserialize`, as does
-the vendored CPU core (`vendor/m68k`'s `CpuCore` is one flat struct of
+the vendored CPU core (`crates/m68k`'s `CpuCore` is one flat struct of
 plain registers and configuration; it has no lazily built decode tables,
 so the whole struct round-trips). New fields are picked up by the
 derives automatically; the cost of that convenience is the versioning

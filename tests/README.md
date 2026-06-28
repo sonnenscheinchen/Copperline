@@ -63,7 +63,7 @@ tests; they follow the same "never committed" rule.
 The tracked `.bin` files are generated test programs, not ROM or disk images:
 
 - `timing-test/boot.bin` is built from `timing-test/boot.asm`.
-- `vendor/m68k/tests/fixtures/extra/**/bin/*.bin` files are built from the
+- `crates/m68k/tests/fixtures/extra/**/bin/*.bin` files are built from the
   adjacent assembly sources under sibling `src/` directories and are used by
   the vendored CPU core's tests.
 

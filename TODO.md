@@ -38,7 +38,7 @@
 - The emulator is no longer purely pragmatic about timing: the 68000
   path has a prefetch-queue model with per-access cycle billing
   (~99.6% timing-exact against SingleStepTests, see
-  `vendor/m68k/CYCLE_TIMING_GAP.md`), interrupt-recognition latency,
+  `crates/m68k/CYCLE_TIMING_GAP.md`), interrupt-recognition latency,
   and chip-bus slot arbitration with CPU/blitter/DMA contention.
   68020+ timing, some Paula disk details, and ECS/AGA behavior remain
   pragmatic and should be tightened only when driven by a concrete

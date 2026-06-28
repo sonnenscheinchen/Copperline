@@ -394,7 +394,7 @@ debits a per-frame instruction budget one of two ways, selected by
   tails, chip-bus grants and contention waits -- so the slice's elapsed bus
   CCK is the true hardware cost (`real_slice_accounting` in
   `src/emulator.rs`). Because the vendored core's 68000 cycle counts are
-  accurate to ~1% (SingleStepTests, `vendor/m68k/CYCLE_TIMING_GAP.md`),
+  accurate to ~1% (SingleStepTests, `crates/m68k/CYCLE_TIMING_GAP.md`),
   this matches a stock PAL 68000.
 - `instructions`: a flat cycles-per-instruction quota
   (`COPPERLINE_REAL_CPU_CPI`, default 4.0), debited by retired

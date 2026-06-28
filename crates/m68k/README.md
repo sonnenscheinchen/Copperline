@@ -27,7 +27,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-m68k = { path = "vendor/m68k" }
+m68k = { path = "crates/m68k" }
 ```
 
 ### Basic Usage

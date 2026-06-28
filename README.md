@@ -3,7 +3,7 @@
 Website: [copperline.dev](https://copperline.dev/)
 
 An Amiga emulator written in Rust, built around a vendored copy of
-the pure-Rust [m68k](vendor/m68k) CPU core, with a
+the pure-Rust [m68k](crates/m68k) CPU core, with a
 [pixels](https://crates.io/crates/pixels) + [winit](https://crates.io/crates/winit)
 window for video and stdout for serial. It started life with the modest
 goal of booting [DiagROM](https://www.diagrom.com/) far enough to show a
@@ -264,7 +264,7 @@ chip-bus timings against the CIA E-clock for cross-emulator comparison.
   m68k nightly build (see [assets/aros/README.md](assets/aros/README.md)).
 - [DiagROM](https://www.diagrom.com/) by John "Chucky" Hertell,
   licensed for free use.
-- The [m68k](vendor/m68k) CPU core vendored under `vendor/m68k`.
+- The [m68k](crates/m68k) CPU core vendored under `crates/m68k`.
 - The public-domain `font8x8` glyphs by Daniel Hepper / Marcel Sondaar
   for the on-screen overlay font.
 - The Amiga Hardware Reference Manual for register-level documentation.
@@ -277,7 +277,7 @@ chip-bus timings against the CIA E-clock for cross-emulator comparison.
 Copperline is free software, released under the GNU General Public
 License version 3 or (at your option) any later version. See
 [LICENSE](LICENSE) for the full text. The vendored
-[m68k](vendor/m68k) CPU core under `vendor/m68k`
+[m68k](crates/m68k) CPU core under `crates/m68k`
 retains its own MIT license.
 
 ## Trademarks

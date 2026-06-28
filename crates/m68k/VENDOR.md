@@ -4,9 +4,27 @@ Vendored from https://github.com/benletchford/m68k-rs
 Commit: 50d1f63 (published as crates.io `m68k` 0.1.5), MIT licensed.
 Fetched: 2026-05-31.
 
-Copperline depends on this via a path dependency (`m68k = { path = "vendor/m68k" }`)
-so we can give it accurate MC68000 cycle timing + a prefetch queue. See
-`CYCLE_TIMING_GAP.md` for the measured baseline gap and the fix plan.
+Copperline depends on this via a path dependency
+(`m68k = { package = "copperline-m68k", path = "crates/m68k" }`) so we can give
+it accurate MC68000 cycle timing + a prefetch queue. See `CYCLE_TIMING_GAP.md`
+for the measured baseline gap and the fix plan.
+
+## Relocation + package rename (2026-06-28)
+
+Moved from `vendor/m68k` to `crates/m68k` and the package renamed from `m68k` to
+`copperline-m68k` (the importable library name is kept as `m68k` via `[lib]
+name`, and the root crate aliases it back with `package = "copperline-m68k"`, so
+no source `use m68k::...` changed). Two reasons, both from issue #57:
+
+- Distro/OBS packaging vendors crates.io deps into a directory named `vendor/`
+  and points `[source.vendored-sources] directory = "vendor"` at it; cargo then
+  demands a `.cargo-checksum.json` for every subdir. Our committed path crate in
+  `vendor/m68k` has no checksum file, so offline builds failed
+  ("failed to load checksum .cargo-checksum.json of m68k v0.1.5"). `crates/`
+  does not collide with the vendoring target.
+- The package name no longer matches the upstream crates.io `m68k`, and the dep
+  carries no version requirement, so no tool, `[patch]`, or future workspace
+  member can ever substitute the unmodified upstream crate for this fork.
 
 ## Local changes vs upstream 50d1f63
 
@@ -98,11 +116,11 @@ gap report, fetch it once:
 
 ```sh
 git clone --depth 1 https://github.com/SingleStepTests/m68000 /tmp/sst-m68000
-mkdir -p vendor/m68k/tests/fixtures/m68000
-cp -R /tmp/sst-m68000/v1 vendor/m68k/tests/fixtures/m68000/
+mkdir -p crates/m68k/tests/fixtures/m68000
+cp -R /tmp/sst-m68000/v1 crates/m68k/tests/fixtures/m68000/
 ```
 
-Then, from `vendor/m68k`:
+Then, from `crates/m68k`:
 
 ```sh
 # functional (final-state) suite
