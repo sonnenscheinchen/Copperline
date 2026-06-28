@@ -20,7 +20,7 @@ resolve that dependency story before attempting a crates.io release.
    - `assets/brand/*.png`
    - `docs/images/*.png`; review provenance before release when these change
    - `timing-test/boot.bin`, built from `timing-test/boot.asm`
-   - `vendor/m68k/tests/fixtures/extra/**/bin/*.bin`, built from the
+   - `crates/m68k/tests/fixtures/extra/**/bin/*.bin`, built from the
      adjacent assembly sources under sibling `src/` directories
 
 3. Confirm local assets are still ignored:

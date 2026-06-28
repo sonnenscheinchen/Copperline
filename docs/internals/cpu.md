@@ -3,7 +3,7 @@
 ## The wrapper and the bus adapter
 
 `M68kMachine` (`src/cpu.rs`) wraps the vendored pure-Rust `m68k` core
-(`vendor/m68k/`). The core sees
+(`crates/m68k/`). The core sees
 the machine through an adapter implementing its `AddressBus` trait, so
 every CPU-visible access -- RAM, ROM, custom registers, CIA, RTC,
 autoconfig, Gayle, Akiko -- routes into the shared `Bus` and is billed in
@@ -21,7 +21,7 @@ Selectable models: 68000, 68EC020, 68020, 68030, 68040. `[cpu] fpu`
 fits a 68881/68882 to any 020/030 (and is on by default for the 68040,
 whose FPU is on-die): the vendored core executes the 6888x instruction
 set in true 80-bit extended precision via a pure-Rust software floating-
-point engine (`vendor/m68k/src/fpu/softfloat.rs`). Arithmetic (add, sub,
+point engine (`crates/m68k/src/fpu/softfloat.rs`). Arithmetic (add, sub,
 mul, div, sqrt), ordered compare, round-to-integer, scale, getexp/getman,
 the format conversions, FMOVE/FMOVEM in every operand format (including
 packed decimal), the constant ROM, FBcc/FScc/FDBcc/FTRAPcc, control
@@ -31,11 +31,11 @@ IDLE once touched) are all modelled. The transcendentals (FSIN/FCOS/FTAN,
 FASIN/FACOS/FATAN, the hyperbolics, FETOX/FETOXM1/FTWOTOX/FTENTOX,
 FLOGN/FLOGNP1/FLOG2/FLOG10) and FSINCOS run in extended precision too: a
 double-`FloatX80` ("double-double", ~128-bit) layer
-(`vendor/m68k/src/fpu/dd.rs`) evaluates Taylor/atanh series over reduced
+(`crates/m68k/src/fpu/dd.rs`) evaluates Taylor/atanh series over reduced
 ranges and rounds the result to extended under the FPCR mode, setting INEX
 and the domain flags (OPERR/DZ). Accuracy is validated against an
 arbitrary-precision oracle (the pure-Rust `astro-float`, a dev-only
-dependency; `vendor/m68k/tests/fpu_accuracy.rs`): every function is within
+dependency; `crates/m68k/tests/fpu_accuracy.rs`): every function is within
 1 ULP across a wide sweep and all four rounding modes, and round-to-nearest
 is correctly rounded in practice. They are not chip-bit-exact -- the real
 6888x uses its own CORDIC/polynomial microcode, and on a bare 68040 these
@@ -44,13 +44,13 @@ quotient byte. This covers Kickstart's
 detection and per-task FPU context switching. The
 68000's per-instruction cycle counts in the vendored core have been
 corrected against the SingleStepTests corpus to ~1% aggregate accuracy
-(see `vendor/m68k/CYCLE_TIMING_GAP.md`), which is what makes
+(see `crates/m68k/CYCLE_TIMING_GAP.md`), which is what makes
 cycle-budgeted pacing trustworthy.
 
 ## Prefetch
 
 The 68000's two-word instruction prefetch queue (IRD/IRC) is modelled in
-the vendored core (`prefetch_queue` in `vendor/m68k/src/core/cpu.rs`): the
+the vendored core (`prefetch_queue` in `crates/m68k/src/core/cpu.rs`): the
 next opcode is fetched before the current instruction finishes, so
 self-modifying code that overwrites the *next* instruction executes the
 stale pre-write word (real MC68000 Class 1 SMC behaviour), while a taken
@@ -100,7 +100,7 @@ per instruction and therefore no widely-trusted reference to generate
 vectors from.
 
 Copperline handles this by approximation rather than precision.
-`scale_cycles_for_cpu_type` (`vendor/m68k/src/core/cpu.rs`) derives 020+
+`scale_cycles_for_cpu_type` (`crates/m68k/src/core/cpu.rs`) derives 020+
 timing from the corrected 68000 counts: the pipeline and cache make most
 instructions cost roughly half their 68000 cycles, with a two-cycle
 floor, and memory-bound work is dominated by the host bus model anyway.

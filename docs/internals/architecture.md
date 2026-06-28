@@ -59,7 +59,7 @@ src/
     window.rs       # winit ApplicationHandler + render worker + main/tool pixels surfaces + status bar
     ui.rs           # pop-up menu, overlay panels, and debugger/analyzer panel drawing
     font.rs         # 8x8 overlay font
-vendor/m68k/        # vendored m68k CPU core
+crates/m68k/        # vendored m68k CPU core
 tests/              # ignored integration tests (need local ROM assets)
 timing-test/        # bootable cross-emulator timing-measurement disk
 ```
