@@ -27,9 +27,11 @@
 //!   edge. A byte takes ~480 us; KCLK idles high.
 //! - After the 8th bit the keyboard releases KDAT and waits for the
 //!   handshake: the Amiga drives KDAT low (CIA-A SPMODE output mode).
-//!   The 6500/1 polls slowly, so the pulse must last at least 85 us;
-//!   shorter pulses are ignored (the replacement firmware polls faster
-//!   and accepts shorter ones -- we model the original part).
+//!   The MCU polls KDAT in a wait loop and accepts the first low level
+//!   it samples -- a few microseconds, well below the HRM's recommended
+//!   75 us *processor* pulse. The replacement firmware (real-hardware
+//!   validated) does the same. So any deliberate pulse counts; only a
+//!   zero-width CRA double-write is ignored (see HANDSHAKE_MIN_CCK).
 //! - No handshake within 143 ms -> lost sync: the keyboard clocks out a
 //!   single logical-1 bit (KDAT low) and waits another 143 ms, repeating
 //!   until a bit is handshaked; it then sends $F9 ("last key code bad")
@@ -58,7 +60,18 @@ const fn us_to_cck(us: u64) -> u64 {
 /// is 20 us (~70 cck); one bit is 60 us, a byte ~480 us.
 const BIT_PHASE_CCK: u64 = us_to_cck(20);
 /// Minimum Amiga-side KDAT-low pulse the MCU accepts as a handshake.
-pub(crate) const HANDSHAKE_MIN_CCK: u64 = us_to_cck(85);
+/// The 6500/1 (and the real-hardware-validated replacement firmware)
+/// detects the handshake by polling KDAT after releasing it and accepts
+/// the first low level it samples -- a few microseconds, far below the
+/// HRM's recommended 75 us *processor* pulse. Fullscreen software that
+/// does its own keyboard reading pulses the line briefly: Pinball Dreams
+/// handshakes in ~13.5 us. A floor of ~1 us only rejects zero-width CRA
+/// double-writes that are not a timed pulse; everything a real driver or
+/// game emits clears it. (An earlier 85 us value modelled the HRM
+/// recommendation as the keyboard's floor and wedged such games into a
+/// permanent resync loop, since CIA-A SP is wired solely to the keyboard
+/// so any SPMODE-output pulse is by definition a deliberate handshake.)
+pub(crate) const HANDSHAKE_MIN_CCK: u64 = us_to_cck(1);
 /// No handshake for this long after a byte -> lost-sync recovery.
 pub(crate) const RESYNC_TIMEOUT_CCK: u64 = us_to_cck(143_000);
 /// MCU firmware latency between an accepted handshake and the first
@@ -520,9 +533,8 @@ impl KeyboardMcu {
     /// The Amiga drove (true) or released (false) KDAT via CIA-A SPMODE.
     /// The pulse is timed on the MCU clock from the actual drive edge,
     /// so a handshake that begins while the byte's final bit cell is
-    /// still clocking out is credited with its full width -- the boot ROM
-    /// pulse is barely over the 85 us minimum, and the 6500/1 samples
-    /// the line level, not the protocol state.
+    /// still clocking out is credited with its full width -- the 6500/1
+    /// samples the line level, not the protocol state.
     pub fn amiga_kdat_edge(&mut self, driven_low: bool) {
         if driven_low {
             self.kdat_low_since = Some(self.now_cck);
@@ -915,7 +927,14 @@ mod tests {
     }
 
     #[test]
-    fn next_byte_waits_for_a_long_enough_handshake() {
+    fn short_handshake_pulse_is_accepted_like_real_hardware() {
+        // The keyboard MCU detects the handshake within microseconds of the
+        // Amiga driving KDAT low -- it does not require the HRM's 75 us
+        // recommended processor pulse. Fullscreen software that reads the
+        // keyboard itself pulses the line briefly: Pinball Dreams handshakes
+        // in ~13.5 us. Such a pulse must be accepted; rejecting it wedges the
+        // keyboard into a permanent resync loop and no further key reaches
+        // the running program.
         let mut cia = unmasked_cia();
         let mut mcu = idle_mcu(&mut cia);
         mcu.key_transition(0x01, true);
@@ -925,13 +944,15 @@ mod tests {
         // Software acknowledges the byte (clears ICR / the IR line).
         cia.read(REG_ICR);
 
-        // 84 us pulse: ignored, the second byte must not transmit.
-        handshake(&mut mcu, &mut cia, (us_to_cck(84)) as u32);
+        // A zero-width CRA double-write (no emulated time between the SPMODE
+        // set and clear) is not a timed pulse and is ignored: no second byte.
+        handshake(&mut mcu, &mut cia, 0);
         assert!(!mcu.tick(2 * BYTE_CCK, &mut cia));
         assert_eq!(cia.read(REG_SDR), 0xFD);
 
-        // 85 us pulse: accepted; the second byte follows.
-        handshake(&mut mcu, &mut cia, HANDSHAKE_MIN_CCK as u32);
+        // A ~13.5 us pulse (Pinball Dreams) is accepted; the second byte
+        // follows immediately.
+        handshake(&mut mcu, &mut cia, us_to_cck(14) as u32);
         assert!(mcu.tick(2 * BYTE_CCK, &mut cia));
         assert_eq!(cia.read(REG_SDR), 0xFB);
     }
@@ -944,9 +965,11 @@ mod tests {
         // Software driving SPMODE output mid-byte puts the CIA shifter
         // in output mode: the KCLK edges that land during the pulse are
         // discarded, so the byte never completes -- the keyboard then
-        // recovers through the resync path (covered separately).
+        // recovers through the resync path (covered separately). The pulse
+        // spans more than a bit cell so it reliably straddles a KCLK
+        // sampling edge.
         mcu.tick(3 * BIT_CCK, &mut cia);
-        handshake(&mut mcu, &mut cia, HANDSHAKE_MIN_CCK as u32 + 10);
+        handshake(&mut mcu, &mut cia, 2 * BIT_CCK);
         assert!(!mcu.tick(8 * BIT_CCK, &mut cia), "byte must not complete");
         assert_ne!(cia.read(REG_SDR), 0xFD);
         // The MCU is now waiting for a handshake that will not come;
@@ -1182,10 +1205,10 @@ mod tests {
 
     #[test]
     fn handshake_pulse_straddling_byte_end_counts_full_width() {
-        // The boot ROM handshake pulse is barely over the 85 us minimum
-        // and its interrupt handler can drive KDAT low while the byte's
+        // A handshake interrupt handler can drive KDAT low while the byte's
         // final bit cell is still clocking out. The 6500/1 measures the
-        // line, not the protocol state: the full pulse width counts.
+        // line, not the protocol state: the full pulse width counts, so a
+        // pulse begun mid-final-bit is credited from its actual drive edge.
         let mut cia = unmasked_cia();
         let mut mcu = idle_mcu(&mut cia);
         mcu.key_transition(0x01, true);

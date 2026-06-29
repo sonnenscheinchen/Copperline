@@ -10940,7 +10940,7 @@ mod tests {
     }
 
     /// Drive the Amiga-side KDAT handshake the way the boot ROM does:
-    /// SPMODE out (KDAT low), >= 85 us of device time, SPMODE back in.
+    /// SPMODE out (KDAT low), a pulse of device time, SPMODE back in.
     fn keyboard_handshake(bus: &mut Bus) {
         let cra = (REG_CRA as u64) << 8;
         let _ = bus.cia_a_write(cra, 1, 0x40);
@@ -19399,15 +19399,15 @@ mod tests {
         bus.advance_devices(2 * KEYBOARD_BYTE_CCK);
         assert_eq!(bus.cia_a.read(crate::chipset::cia::REG_SDR), 0xFD);
 
-        // A too-short KDAT pulse (~28 us) is not a handshake.
+        // A zero-width CRA double-write (SPMODE set then cleared with no
+        // emulated time between) is not a timed pulse and is ignored.
         let cra = (REG_CRA as u64) << 8;
         let _ = bus.cia_a_write(cra, 1, 0x40);
-        bus.advance_devices(100);
         let _ = bus.cia_a_write(cra, 1, 0x00);
         bus.advance_devices(2 * KEYBOARD_BYTE_CCK);
         assert_eq!(bus.cia_a.read(crate::chipset::cia::REG_SDR), 0xFD);
 
-        // A proper >= 85 us pulse releases the next byte.
+        // A brief but real KDAT pulse releases the next byte.
         keyboard_handshake(&mut bus);
         bus.advance_devices(2 * KEYBOARD_BYTE_CCK);
         assert_eq!(bus.cia_a.read(crate::chipset::cia::REG_SDR), 0xFB);

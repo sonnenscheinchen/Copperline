@@ -835,8 +835,9 @@ pub enum CiaSideEffect {
     /// post-byte handshake pulse.
     KeyboardHandshakeStart,
     /// CIA-A CRA.SPMODE went 1 -> 0: SP (KDAT) released. The keyboard
-    /// MCU measures the pulse between Start and End and accepts the
-    /// handshake only if it lasted at least 85 us.
+    /// MCU measures the pulse between Start and End and accepts any
+    /// deliberate handshake (it samples the line within microseconds;
+    /// only a zero-width double-write is ignored).
     KeyboardHandshakeEnd,
 }
 
