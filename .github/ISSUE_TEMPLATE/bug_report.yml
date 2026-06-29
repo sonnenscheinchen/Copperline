@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a hardware-behaviour or host integration problem.
+description: Report a hardware-accuracy or host-integration problem.
 title: "[Bug]: "
 labels: ["bug"]
 body:
@@ -7,6 +7,26 @@ body:
     attributes:
       value: |
         Please do not attach copyrighted ROMs, disks, hard-disk images, CD images, or other third-party assets. Naming the software used to reproduce a problem is fine.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: What kind of problem is this?
+      options:
+        - Emulation accuracy (display, audio, timing, chipset behaviour)
+        - Host integration (keyboard/mouse, window, audio output, UI, save states)
+        - Crash, hang, or freeze
+        - Build or packaging (Flatpak, AppImage, Homebrew, etc.)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A clear one- or two-sentence description of the bug.
+    validations:
+      required: true
   - type: input
     id: version
     attributes:
@@ -26,10 +46,10 @@ body:
     id: config
     attributes:
       label: Machine/configuration
-      description: Machine model, chipset, CPU, memory, and attached device types. Omit private paths.
+      description: Emulated machine model, chipset, CPU, memory, and attached device types. Leave blank for host-integration or packaging bugs where it does not apply. Omit private paths.
       render: toml
     validations:
-      required: true
+      required: false
   - type: textarea
     id: steps
     attributes:
@@ -38,17 +58,17 @@ body:
     validations:
       required: true
   - type: textarea
-    id: expected
-    attributes:
-      label: Expected hardware behaviour
-      description: What real hardware or another reference emulator does.
-    validations:
-      required: true
-  - type: textarea
     id: actual
     attributes:
       label: Actual behaviour
-      description: What Copperline does instead.
+      description: What Copperline does.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What you expected instead. For accuracy bugs, describe what real hardware or another reference emulator does.
     validations:
       required: true
   - type: textarea
