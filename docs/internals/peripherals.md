@@ -115,7 +115,10 @@ affect the emulated latch/control state, never the host clock.
 Host keyboard events translate to Amiga raw codes and feed a 6500/1
 keyboard-MCU model (`chipset/keyboard.rs`) that clocks each event into
 CIA-A bit by bit over the emulated KCLK/KDAT lines: 60 us bit cells,
-the >= 85 us KDAT handshake after every byte, lost-sync recovery
+the KDAT handshake after every byte (the MCU samples the line within
+microseconds and accepts any deliberate pulse, so software that reads
+the keyboard with a brief handshake -- e.g. Pinball Dreams at ~13.5 us
+-- works, not just the boot ROM's longer pulse), lost-sync recovery
 (lone sync bits, $F9, retransmission), the $FD/$FE power-up stream,
 the $78/KCLK-low reset protocol behind Ctrl+Amiga+Amiga, Caps Lock's
 keyboard-owned LED toggle, a 10-event type-ahead buffer with $FA

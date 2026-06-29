@@ -409,6 +409,14 @@ impl Cia {
                     if self.ta_oneshot {
                         self.ta_running = true;
                         started_timer = true;
+                        // The auto-started one-shot reads back as running:
+                        // the 8520 sets the CRA START bit, and clears it on
+                        // underflow (see the tick() underflow path). Without
+                        // this, code that polls CRA bit 0 to time a one-shot
+                        // delay (e.g. the Bitmap Brothers trackloader's motor
+                        // spin-up wait) sees START=0 immediately and skips the
+                        // delay entirely.
+                        self.regs[REG_CRA] |= 0x01;
                     }
                 }
             }
@@ -420,6 +428,9 @@ impl Cia {
                     if self.tb_oneshot {
                         self.tb_running = true;
                         started_timer = true;
+                        // Mirror the CRB START bit for the auto-started
+                        // one-shot, same as timer A above.
+                        self.regs[REG_CRB] |= 0x01;
                     }
                 }
             }
@@ -824,8 +835,9 @@ pub enum CiaSideEffect {
     /// post-byte handshake pulse.
     KeyboardHandshakeStart,
     /// CIA-A CRA.SPMODE went 1 -> 0: SP (KDAT) released. The keyboard
-    /// MCU measures the pulse between Start and End and accepts the
-    /// handshake only if it lasted at least 85 us.
+    /// MCU measures the pulse between Start and End and accepts any
+    /// deliberate handshake (it samples the line within microseconds;
+    /// only a zero-width double-write is ignored).
     KeyboardHandshakeEnd,
 }
 
